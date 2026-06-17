@@ -91,6 +91,56 @@
             this.saveMetaProgression();
         },
 
+        requestStartGame: function () {
+            this.applyLobbySelections();
+            if (this.multiplayer?.roomCode) {
+                if (!this.isRoomHost) {
+                    this.setMultiplayerStatus('Waiting for host to start...', 'offline');
+                    return;
+                }
+                this.setMultiplayerStatus('Host starting game...', 'online');
+                this.multiplayer.sendAction({ kind: 'startGame' });
+                this.enterGameFromLobby();
+                return;
+            }
+            this.enterGameFromLobby();
+        },
+
+        enterGameFromLobby: function () {
+            this.applyLobbySelections();
+            this.roomStarted = true;
+            lobbyScreen.classList.add('hidden');
+            gameContainer.classList.remove('hidden');
+            this.start();
+        },
+
+        isInputBlocked: function () {
+            return Boolean(
+                this.waitingForReward ||
+                this.craftingOpen ||
+                this.shopOpen ||
+                this.workbenchOpen ||
+                this.skillsOpen ||
+                this.zombieIndexOpen ||
+                this.traderOpen ||
+                this.buildingOpen
+            );
+        },
+
+        updateMouseFromEvent: function (event) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = rect.width ? canvas.width / rect.width : 1;
+            const scaleY = rect.height ? canvas.height / rect.height : 1;
+            this.mouse.x = (event.clientX - rect.left) * scaleX;
+            this.mouse.y = (event.clientY - rect.top) * scaleY;
+            this.updateMouseWorld();
+        },
+
+        updateMouseWorld: function () {
+            this.mouse.worldX = this.mouse.x + this.camera.x;
+            this.mouse.worldY = this.mouse.y + this.camera.y;
+        },
+
         getSurvivorRank: function () {
             return 1
                 + Math.floor((this.metaProgression.totalKills || 0) / 50)
@@ -173,8 +223,11 @@
                 onStatus: (text, mode) => this.setMultiplayerStatus(text, mode),
                 onWorld: (world) => this.applyWorldSnapshot(world),
                 onAction: (packet) => this.handleMultiplayerAction(packet),
-                onHostChange: (isHost) => {
-                    this.isRoomHost = isHost;
+                onHostChange: (isHost, source) => {
+                    this.isRoomHost = Boolean(isHost);
+                    if (source === 'server' && !this.isRoomHost && !this.gameStarted) {
+                        this.setMultiplayerStatus('Waiting for host to start...', 'online');
+                    }
                     this.updatePartyList();
                 }
             });
@@ -185,6 +238,7 @@
             roomCodeInput.value = code;
             this.isRoomHost = true;
             this.connectRoom(code);
+            this.setMultiplayerStatus('Host room ready. Start when the party is in.', 'online');
         },
 
         joinRoom: function () {
@@ -192,6 +246,7 @@
             roomCodeInput.value = code;
             this.isRoomHost = false;
             this.connectRoom(code);
+            this.setMultiplayerStatus('Waiting for host to start...', 'online');
         },
 
         connectRoom: function (code) {
@@ -230,7 +285,8 @@
                 maxHealth: this.player.maxHealth,
                 wave: this.wave,
                 level: this.player.level,
-                isHost: this.isWorldHost()
+                isHost: this.isRoomHost,
+                gameStarted: this.gameStarted
             };
         },
 
@@ -256,12 +312,18 @@
                 traps: this.traps,
                 buildings: this.buildings,
                 drops: this.drops,
-                acidPools: this.acidPools
+                acidPools: this.acidPools,
+                gameStarted: this.gameStarted
             };
         },
 
         applyWorldSnapshot: function (world) {
             if (!world || this.isWorldHost()) return;
+            this.serverTime = world.serverTime || this.serverTime;
+            if (world.gameStarted && !this.gameStarted) {
+                this.setMultiplayerStatus(world.wave > 0 ? 'Joining active game...' : 'Host starting game...', 'online');
+                this.enterGameFromLobby();
+            }
             this.wave = world.wave || 0;
             this.zombiesKilled = world.zombiesKilled || 0;
             this.totalZombiesInWave = world.totalZombiesInWave || 0;
@@ -271,12 +333,15 @@
             this.escortsToSpawn = world.escortsToSpawn || 0;
             this.currentWavePlan = world.currentWavePlan || this.currentWavePlan;
             this.techTier = world.techTier || this.techTier;
+            this.bossDefeats = world.bossDefeats || 0;
+            this.killRewards = world.killRewards || [];
             this.preparationActive = Boolean(world.preparationActive);
             this.preparationEvent = world.preparationEvent || null;
             this.preparationEndsAt = this.preparationActive ? performance.now() + (world.preparationEndsIn || 0) : 0;
             this.supplyDrop = world.supplyDrop || null;
             this.trader = world.trader || null;
             this.zombies = world.zombies || [];
+            this.bullets = world.bullets || [];
             this.sentries = world.sentries || [];
             this.walls = world.walls || [];
             this.traps = world.traps || [];
@@ -299,7 +364,14 @@
 
         broadcastBuildAction: function (kind, entity) {
             if (!this.multiplayer || !this.multiplayer.roomCode) return;
-            this.multiplayer.sendAction({ kind: 'build', buildKind: kind, entity });
+            this.multiplayer.sendAction({
+                kind: 'build',
+                buildKind: kind,
+                entity,
+                x: entity.x,
+                y: entity.y,
+                requestedBy: this.localPlayerId
+            });
         },
 
         broadcastShotAction: function (weapon, angle) {
@@ -324,8 +396,14 @@
         },
 
         handleMultiplayerAction: function (packet) {
-            if (!this.isWorldHost() || !packet || !packet.action) return;
+            if (!packet || !packet.action) return;
             const action = packet.action;
+            if (action.kind === 'startGame') {
+                this.setMultiplayerStatus('Host starting game...', 'online');
+                this.enterGameFromLobby();
+                return;
+            }
+            if (!this.isWorldHost()) return;
             if (action.kind === 'build' && action.entity) {
                 const target = action.buildKind === 'turret'
                     ? this.sentries
@@ -338,6 +416,10 @@
                                 : null;
                 if (!target) return;
                 if (target.some((entry) => entry.networkId && entry.networkId === action.entity.networkId)) return;
+                if (this.getPlacementValidation) {
+                    const validation = this.getPlacementValidation(action.buildKind, action.entity, action.entity.x, action.entity.y);
+                    if (!validation.ok) return;
+                }
                 target.push(action.entity);
                 return;
             }
@@ -378,11 +460,128 @@
 
         updatePartyList: function () {
             const localName = playerNameInput.value.trim() || this.player.name || 'The Shopper';
-            const localSlot = `<div class="party-slot active"><b>P1</b><span>${localName}</span><em>${this.isWorldHost() ? 'Host' : 'Client'}</em></div>`;
+            const localSlot = `<div class="party-slot active"><b>P1</b><span>${localName}</span><em>${this.isRoomHost ? 'Host' : this.gameStarted ? 'In Run' : 'Waiting'}</em></div>`;
             const remoteSlots = this.remotePlayers.map((player, index) => `
                 <div class="party-slot"><b>P${index + 2}</b><span>${player.name || 'Shopper'}</span><em>${player.isHost ? 'Host' : `Wave ${player.wave || 0}`}</em></div>
             `).join('');
             partyList.innerHTML = localSlot + remoteSlots;
+        },
+
+        toggleZombieIndex: function (isOpen) {
+            this.zombieIndexOpen = Boolean(isOpen);
+            this.mouse.isDown = false;
+            if (this.zombieIndexOpen) {
+                this.populateZombieIndex();
+                zombieIndexModal.classList.remove('hidden');
+                zombieIndexModal.classList.add('flex');
+                zombieIndexSearch.focus();
+            } else {
+                zombieIndexModal.classList.add('hidden');
+                zombieIndexModal.classList.remove('flex');
+            }
+        },
+
+        setZombieIndexCategory: function (category) {
+            this.zombieIndexCategory = category;
+            this.populateZombieIndex();
+        },
+
+        getZombieIndexEntries: function () {
+            const metadata = {
+                normal: ['Common', 1, 'The baseline parking-lot shambler.', 'No trick: kite and conserve ammo.', 'Cash, XP, common salvage.'],
+                fast: ['Common', 2, 'A faster infected that pressures reload windows.', 'Walls and spike traps buy time.', 'More cash and XP than normal.'],
+                runner: ['Common', 3, 'A sprinting shopper that closes distance fast.', 'Shotgun bursts or early turret focus.', 'Light cash, XP, and ammo drops.'],
+                tank: ['Common', 4, 'Slow heavy infected with a large health pool.', 'Use walls, focus fire, and turret crossfire.', 'Good cash and material drops.'],
+                spitter: ['Special', 5, 'Keeps range and fires acid projectiles.', 'Keep moving sideways and break line pressure.', 'Cash, XP, and ammo chance.'],
+                thrower: ['Special', 14, 'Throws arcing acid over defenses.', 'Spread structures out and push it quickly.', 'Cash and metal chance.'],
+                bomber: ['Special', 7, 'Explodes when it reaches a player or structure.', 'Shoot it before it touches walls or turrets.', 'High cash and explosive salvage.'],
+                sapper: ['Special', 7, 'A volatile demolition runner.', 'Do not let it reach the base.', 'High-risk cash reward.'],
+                shield: ['Special', 8, 'Carries a shield that absorbs damage first.', 'Flank with traps or sustained turret fire.', 'Cash, XP, and shield scrap.'],
+                armored: ['Special', 9, 'Armored plating reduces incoming damage.', 'Upgrade turret damage and use explosives.', 'Metal-heavy rewards.'],
+                acidRanger: ['Special', 9, 'Long-range acid shooter.', 'Close distance or outrange with rifle/turrets.', 'Ammo and cash chance.'],
+                healerZombie: ['Special', 7, 'Restores nearby infected.', 'Kill it before tanks and bosses.', 'Cash, XP, and medkit chance.'],
+                healer: ['Special', 7, 'Legacy healer variant that supports the horde.', 'Prioritize it immediately.', 'Cash and XP.'],
+                engineer: ['Special', 11, 'Adds shields to nearby infected.', 'Break formations with explosives.', 'Metal and rare part chance.'],
+                splitter: ['Special', 11, 'Splits into smaller enemies on death.', 'Finish children before they surround you.', 'Extra XP but extra pressure.'],
+                charger: ['Special', 12, 'Charges at targets in short bursts.', 'Bait charges into strong walls.', 'Good cash and XP.'],
+                leech: ['Special', 12, 'Heals itself when it lands melee hits.', 'Kite it and avoid prolonged contact.', 'Cash and medkit chance.'],
+                disruptor: ['Special', 16, 'EMP infected that threatens electronics.', 'Keep turrets spread and kill it early.', 'Cash, XP, rare electronics.'],
+                eliteRunner: ['Elite', 20, 'Late-wave runner with elite speed and health.', 'Slow it with traps and avoid tunnel vision.', 'Strong cash and XP.'],
+                eliteTank: ['Elite', 20, 'Late-wave tank with armor and huge durability.', 'Explosives and upgraded turrets are the answer.', 'Large cash and metal rewards.'],
+                miniBoss: ['Elite', 15, 'A five-wave captain that mixes boss durability with ranged attacks.', 'Repair before it arrives and focus all turrets.', 'Rare parts, cash, and big XP.'],
+                boss: ['Bosses', 10, 'Basic Brute: a boss-class brawler with ranged pressure.', 'Keep moving and use reinforced walls.', 'Major cash, XP, rare parts.'],
+                burrowKing: ['Bosses', 10, 'Burrows underground, warns with cracked pavement, and emerges near targets.', 'Move away from warning cracks and clear spawned zombies.', 'Major boss rewards and rare parts.'],
+                chargerBrute: ['Bosses', 10, 'Telegraphs a dash that can smash weak walls.', 'Bait it into reinforced or metal walls to stun it.', 'Major boss rewards.'],
+                teslaHorror: ['Bosses', 20, 'Charges EMP pulses that disable turrets and summons disruptors.', 'Back up during the charge and spread turrets.', 'High tech rewards.'],
+                broodMother: ['Bosses', 20, 'Constantly spawns small enemies and opens weak spots while spawning.', 'Burst it during weak-spot windows.', 'Large XP and resource drops.'],
+                toxicButcher: ['Bosses', 30, 'Aggressive boss that leaves toxic puddles and slams in melee.', 'Keep repositioning and do not fight in puddles.', 'Elite boss rewards.'],
+                bossButcher: ['Bosses', 30, 'Elite brute variant with heavier melee pressure.', 'Strong walls and burst damage.', 'Elite boss rewards.'],
+                bossSpitter: ['Bosses', 30, 'Elite toxic manager with long-range acid pressure.', 'Stay mobile and avoid clumped defenses.', 'Elite boss rewards.']
+            };
+            return Object.entries(this.zombieTypes).map(([id, stats]) => {
+                const [category, firstWave, description, tip, reward] = metadata[id] || [
+                    stats.isBoss ? 'Bosses' : stats.isEliteVariant || stats.isMiniBoss ? 'Elite' : 'Special',
+                    stats.isBoss ? 10 : 1,
+                    'Uncatalogued infected variant found in the store perimeter.',
+                    'Inspect its movement and build counters around its role.',
+                    'Cash, XP, and salvage.'
+                ];
+                const damage = stats.contactDamage || stats.explosionDamage || (stats.isBoss ? 28 : 8);
+                const ability = stats.isBoss ? 'Boss mechanics' : stats.isBomber || stats.isSapper ? 'Explodes on contact' : stats.isAcidRanger || stats.shootRange ? 'Ranged attack' : stats.isHealer ? 'Heals allies' : stats.isEngineer ? 'Shields allies' : stats.isDisruptor ? 'EMP disruption' : stats.isSplitter ? 'Splits on death' : stats.isCharger ? 'Charge attack' : stats.isLeech ? 'Life steal' : stats.armor ? 'Armor' : stats.shieldHealth ? 'Shield' : 'Melee pressure';
+                return {
+                    id,
+                    name: stats.name || id.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase()),
+                    category,
+                    firstWave,
+                    description,
+                    tip,
+                    reward,
+                    ability,
+                    color: stats.color || [120, 113, 108],
+                    health: stats.health || 0,
+                    speed: stats.speed || 0,
+                    damage
+                };
+            }).sort((a, b) => a.firstWave - b.firstWave || a.name.localeCompare(b.name));
+        },
+
+        populateZombieIndex: function () {
+            const categories = ['Common', 'Special', 'Elite', 'Bosses'];
+            zombieIndexTabs.innerHTML = '';
+            categories.forEach((category) => {
+                const button = document.createElement('button');
+                button.className = `zombie-index-tab ${this.zombieIndexCategory === category ? 'active' : ''}`;
+                button.textContent = category;
+                button.onclick = () => this.setZombieIndexCategory(category);
+                zombieIndexTabs.appendChild(button);
+            });
+            const filter = this.zombieIndexFilter || '';
+            const entries = this.getZombieIndexEntries().filter((entry) => {
+                const haystack = `${entry.name} ${entry.description} ${entry.ability} ${entry.tip} ${entry.reward}`.toLowerCase();
+                return entry.category === this.zombieIndexCategory && (!filter || haystack.includes(filter));
+            });
+            zombieIndexContent.innerHTML = entries.length ? entries.map((entry) => `
+                <article class="zombie-index-card">
+                    <div class="zombie-index-icon" style="--zombie-color: rgb(${entry.color[0]}, ${entry.color[1]}, ${entry.color[2]})">
+                        <span>${entry.name.slice(0, 1)}</span>
+                    </div>
+                    <div class="zombie-index-main">
+                        <div class="zombie-index-card-header">
+                            <h3>${entry.name}</h3>
+                            <span>First wave ${entry.firstWave}</span>
+                        </div>
+                        <p>${entry.description}</p>
+                        <div class="zombie-index-stats">
+                            <b>HP ${entry.health}</b>
+                            <b>Speed ${Number(entry.speed).toFixed(2)}</b>
+                            <b>Damage ${entry.damage}</b>
+                        </div>
+                        <div class="zombie-index-detail"><strong>Special:</strong> ${entry.ability}</div>
+                        <div class="zombie-index-detail"><strong>Counter:</strong> ${entry.tip}</div>
+                        <div class="zombie-index-detail"><strong>Reward:</strong> ${entry.reward}</div>
+                    </div>
+                </article>
+            `).join('') : '<p class="workbench-empty">No zombies match this filter.</p>';
         },
 
         recordKill: function (zombie) {
@@ -506,6 +705,49 @@
         drawDetailedZombies: function () {
             for (const z of this.zombies) {
                 if (this.isOnScreen && !this.isOnScreen(z.x, z.y, z.size + 140)) continue;
+                const timelineNow = this.serverTime || performance.now();
+                if (z.burrowWarning && (!z.burrowWarning.until || z.burrowWarning.until > timelineNow)) {
+                    ctx.save();
+                    ctx.translate(z.burrowWarning.x, z.burrowWarning.y);
+                    ctx.strokeStyle = '#f97316';
+                    ctx.lineWidth = 3;
+                    ctx.setLineDash([9, 5]);
+                    ctx.beginPath();
+                    ctx.arc(0, 0, z.size * 1.35, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.strokeStyle = '#78350f';
+                    for (let c = 0; c < 7; c++) {
+                        const a = (Math.PI * 2 / 7) * c;
+                        ctx.beginPath();
+                        ctx.moveTo(Math.cos(a) * 8, Math.sin(a) * 8);
+                        ctx.lineTo(Math.cos(a) * (z.size * 1.25), Math.sin(a) * (z.size * 1.25));
+                        ctx.stroke();
+                    }
+                    ctx.restore();
+                }
+                if (z.warningLine && (!z.warningLine.until || z.warningLine.until > timelineNow)) {
+                    ctx.save();
+                    ctx.strokeStyle = 'rgba(248,113,113,.85)';
+                    ctx.lineWidth = 5;
+                    ctx.setLineDash([18, 10]);
+                    ctx.beginPath();
+                    ctx.moveTo(z.warningLine.x1, z.warningLine.y1);
+                    ctx.lineTo(z.warningLine.x2, z.warningLine.y2);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+                if (z.empChargeUntil && z.empChargeUntil > timelineNow) {
+                    ctx.save();
+                    ctx.strokeStyle = 'rgba(34,211,238,.78)';
+                    ctx.lineWidth = 4;
+                    ctx.setLineDash([10, 8]);
+                    ctx.beginPath();
+                    ctx.arc(z.x, z.y, z.empRadius || 240, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+                if (z.hidden) continue;
                 const color = `rgb(${z.color[0]}, ${z.color[1]}, ${z.color[2]})`;
                 const darkColor = `rgb(${z.color[0] * 0.58}, ${z.color[1] * 0.58}, ${z.color[2] * 0.58})`;
                 const type = z.type || 'normal';
@@ -702,6 +944,16 @@
                     ctx.strokeRect(-z.size * 0.72, -z.size * 0.44, z.size * 1.44, z.size * 1.15);
                 }
 
+                if (z.dodgeUntil && z.dodgeUntil > timelineNow) {
+                    ctx.strokeStyle = '#fef3c7';
+                    ctx.lineWidth = 3;
+                    ctx.setLineDash([3, 5]);
+                    ctx.beginPath();
+                    ctx.arc(0, 0, z.size * 1.25, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                }
+
                 ctx.restore();
 
                 const barWidth = z.size * 2.2;
@@ -718,6 +970,22 @@
                     ctx.fillRect(z.x - barWidth / 2, barY - 5, barWidth, 3);
                     ctx.fillStyle = '#38bdf8';
                     ctx.fillRect(z.x - barWidth / 2, barY - 5, barWidth * shieldPercent, 3);
+                }
+                if (z.isBoss) {
+                    const bossBarWidth = Math.max(120, z.size * 3.1);
+                    const bossBarY = z.y - z.size - 30;
+                    ctx.fillStyle = '#0c0a09';
+                    ctx.fillRect(z.x - bossBarWidth / 2, bossBarY, bossBarWidth, 8);
+                    ctx.fillStyle = '#dc2626';
+                    ctx.fillRect(z.x - bossBarWidth / 2, bossBarY, bossBarWidth * hpPercent, 8);
+                    if (z.weakSpotUntil && z.weakSpotUntil > timelineNow) {
+                        ctx.fillStyle = '#fbbf24';
+                        ctx.fillRect(z.x - bossBarWidth / 2, bossBarY + 9, bossBarWidth * hpPercent, 3);
+                    }
+                    ctx.fillStyle = '#fff7ed';
+                    ctx.font = 'bold 12px "Chakra Petch"';
+                    ctx.textAlign = 'center';
+                    ctx.fillText((z.name || 'Boss').toUpperCase(), z.x, bossBarY - 5);
                 }
             }
         },
@@ -1027,6 +1295,7 @@
         },
 
         damageZombie: function (zombie, amount) {
+            if (zombie.weakSpotUntil && performance.now() < zombie.weakSpotUntil) amount *= 1.35;
             let remaining = amount;
             if (zombie.shieldHealth > 0) {
                 const absorbed = Math.min(zombie.shieldHealth, remaining);
@@ -1036,6 +1305,144 @@
             }
             if (remaining <= 0) return;
             zombie.health -= remaining * (1 - (zombie.armor || 0));
+        },
+
+        spawnBossMinion: function (typeKey, x, y, scale = 0.75) {
+            const type = this.zombieTypes[typeKey] || this.zombieTypes.normal;
+            const health = Math.max(35, Math.floor(type.health * scale));
+            this.zombies.push({
+                ...type,
+                type: typeKey,
+                x: Math.max(25, Math.min(this.MAP_WIDTH - 25, x + Math.random() * 70 - 35)),
+                y: Math.max(25, Math.min(this.MAP_HEIGHT - 25, y + Math.random() * 70 - 35)),
+                health,
+                maxHealth: health,
+                reward: Math.max(4, Math.floor((type.reward || 8) * 0.35)),
+                xp: Math.max(4, Math.floor((type.xp || type.reward || 8) * 0.35)),
+                damageScale: this.currentWavePlan?.damageScale || 1,
+                lastShot: 0,
+                lastSlam: 0,
+                lastMelee: 0,
+                lastHeal: 0,
+                lastWeld: 0
+            });
+        },
+
+        updateBossMechanics: function (z, target, now) {
+            if (!z.isBoss || !target) return false;
+            if (z.stunnedUntil && now < z.stunnedUntil) return true;
+
+            if (z.bossKind === 'burrow') {
+                if (z.hidden) {
+                    if (now >= z.emergeAt) {
+                        z.x = z.emergeX;
+                        z.y = z.emergeY;
+                        z.hidden = false;
+                        z.burrowWarning = null;
+                        z.lastBurrow = now;
+                        for (let i = 0; i < 3; i++) this.spawnBossMinion(i === 0 ? 'runner' : 'normal', z.x, z.y, 0.65);
+                    }
+                    return true;
+                }
+                if (now - (z.lastBurrow || 0) > (z.burrowRate || 5600) && target.distance > 140) {
+                    const angle = Math.random() * Math.PI * 2;
+                    z.emergeX = Math.max(50, Math.min(this.MAP_WIDTH - 50, target.x + Math.cos(angle) * (70 + Math.random() * 55)));
+                    z.emergeY = Math.max(50, Math.min(this.MAP_HEIGHT - 50, target.y + Math.sin(angle) * (70 + Math.random() * 55)));
+                    z.emergeAt = now + 1150;
+                    z.hidden = true;
+                    z.burrowWarning = { x: z.emergeX, y: z.emergeY, until: z.emergeAt };
+                    return true;
+                }
+                if (now - (z.lastSpawn || 0) > (z.spawnRate || 4200)) {
+                    z.lastSpawn = now;
+                    this.spawnBossMinion(Math.random() < 0.5 ? 'runner' : 'normal', z.x, z.y, 0.7);
+                }
+            }
+
+            if (z.bossKind === 'chargerBrute') {
+                if (z.chargeWindupUntil && now < z.chargeWindupUntil) return true;
+                if (z.chargeWindupUntil && now >= z.chargeWindupUntil) {
+                    z.chargeWindupUntil = 0;
+                    z.chargeUntil = now + (z.chargeDuration || 800);
+                    z.warningLine = null;
+                }
+                if (z.chargeUntil && now < z.chargeUntil) {
+                    z.x = Math.max(20, Math.min(this.MAP_WIDTH - 20, z.x + Math.cos(z.chargeAngle || 0) * (z.chargeSpeed || 5)));
+                    z.y = Math.max(20, Math.min(this.MAP_HEIGHT - 20, z.y + Math.sin(z.chargeAngle || 0) * (z.chargeSpeed || 5)));
+                    for (const wall of this.walls) {
+                        if (this.dist(z.x, z.y, wall.x, wall.y) < z.size + (wall.radius || 25)) {
+                            if ((wall.wallStage || 0) < 2) wall.health = 0;
+                            else {
+                                z.stunnedUntil = now + 1500;
+                                z.chargeUntil = 0;
+                            }
+                            break;
+                        }
+                    }
+                    return true;
+                }
+                if (z.chargeUntil && now >= z.chargeUntil) z.chargeUntil = 0;
+                if (target.distance < 520 && now - (z.lastCharge || 0) > (z.chargeRate || 4600)) {
+                    z.lastCharge = now;
+                    z.chargeAngle = Math.atan2(target.y - z.y, target.x - z.x);
+                    z.chargeWindupUntil = now + (z.warningDuration || 720);
+                    z.warningLine = { x1: z.x, y1: z.y, x2: target.x, y2: target.y, until: z.chargeWindupUntil };
+                    return true;
+                }
+            }
+
+            if (z.bossKind === 'tesla') {
+                if (z.empChargeUntil) {
+                    if (now >= z.empChargeUntil) {
+                        z.empChargeUntil = 0;
+                        z.empPulseUntil = now + 650;
+                        if (this.createEmpPulse) this.createEmpPulse(z.x, z.y, z.empRadius || 240);
+                        for (const sentry of this.sentries) {
+                            if (this.dist(z.x, z.y, sentry.x, sentry.y) < (z.empRadius || 240)) sentry.isDisabled = now + 5200;
+                        }
+                        for (let i = 0; i < 2; i++) this.spawnBossMinion('disruptor', z.x, z.y, 0.68);
+                    }
+                    return true;
+                }
+                if (z.empPulseUntil && now >= z.empPulseUntil) z.empPulseUntil = 0;
+                if (now - (z.lastEmp || 0) > (z.empRate || 6400)) {
+                    z.lastEmp = now;
+                    z.empChargeUntil = now + (z.empWindup || 1100);
+                    return true;
+                }
+                if (now - (z.lastSpawn || 0) > (z.spawnRate || 7600)) {
+                    z.lastSpawn = now;
+                    this.spawnBossMinion('disruptor', z.x, z.y, 0.65);
+                }
+            }
+
+            if (z.bossKind === 'brood' && now - (z.lastSpawn || 0) > (z.spawnRate || 2900)) {
+                z.lastSpawn = now;
+                z.weakSpotUntil = now + (z.weakSpotDuration || 950);
+                for (let i = 0; i < 2; i++) this.spawnBossMinion(Math.random() < 0.5 ? 'runner' : 'splitter', z.x, z.y, 0.55);
+            }
+
+            if (z.bossKind === 'toxic' && now - (z.lastPuddle || 0) > (z.puddleRate || 1200)) {
+                z.lastPuddle = now;
+                this.acidPools.push({ x: z.x, y: z.y, radius: 42, life: 260, damage: 0.55, toxicBoss: true });
+            }
+
+            return false;
+        },
+
+        tryBossDodge: function (z, bullet) {
+            if (!z.isBoss || !bullet.explosive || bullet.fromZombie) return false;
+            const now = performance.now();
+            const projectileSpeed = Math.sqrt((bullet.vx || 0) ** 2 + (bullet.vy || 0) ** 2);
+            const distance = this.dist(bullet.x, bullet.y, z.x, z.y);
+            if (projectileSpeed > 7 || distance < z.size + 26 || distance > 165 || now - (z.lastDodge || 0) < 4200) return false;
+            z.lastDodge = now;
+            z.dodgeUntil = now + 360;
+            const sign = Math.random() < 0.5 ? -1 : 1;
+            const angle = Math.atan2(bullet.vy || 0, bullet.vx || 1) + Math.PI / 2 * sign;
+            z.x = Math.max(35, Math.min(this.MAP_WIDTH - 35, z.x + Math.cos(angle) * 76));
+            z.y = Math.max(35, Math.min(this.MAP_HEIGHT - 35, z.y + Math.sin(angle) * 76));
+            return true;
         },
 
         getNearestEnemyTarget: function (zombie, includeStructures) {
@@ -1463,6 +1870,61 @@
             this.updateHUD();
         },
 
+        getAmmoPackCost: function (pack, discount = 1) {
+            const cost = { ...(pack.cost || {}) };
+            if (cost.money) cost.money = Math.max(1, Math.floor(cost.money * discount));
+            return cost;
+        },
+
+        getAmmoStoreHtml: function (source = 'shop', discount = 1, packIds = null) {
+            const packs = content.ammoPacks.filter((pack) => !packIds || packIds.includes(pack.id));
+            const sourceLabel = source === 'trader' ? 'DISCOUNT AMMO' : source === 'workbench' ? 'BENCH AMMO' : 'SHOP AMMO';
+            return `
+                <section class="ammo-store-panel">
+                    <div class="ammo-store-header">
+                        <div>
+                            <span class="window-kicker">${sourceLabel}</span>
+                            <h3>Reserve Ammo: ${this.player.reserveAmmo}</h3>
+                        </div>
+                        <p>Ammo purchases go to reserve ammo. Full refill also tops off owned magazines.</p>
+                    </div>
+                    <div class="ammo-pack-grid">
+                        ${packs.map((pack) => {
+                            const cost = this.getAmmoPackCost(pack, discount);
+                            const canAfford = hasCost(this.player, cost);
+                            return `<article class="ammo-pack-card">
+                                <span class="window-kicker">${pack.id === 'full' ? 'FULL REFILL' : `+${pack.ammo} AMMO`}</span>
+                                <div class="workbench-item-title">${pack.name}</div>
+                                <p class="workbench-item-desc">${pack.description}</p>
+                                <div class="workbench-cost-row">${costChips(this.player, cost)}</div>
+                                <button class="btn ${canAfford ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.buyAmmoPack('${pack.id}', '${source}', ${discount})">
+                                    ${canAfford ? 'Buy Ammo' : 'Need Cash'}
+                                </button>
+                            </article>`;
+                        }).join('')}
+                    </div>
+                </section>`;
+        },
+
+        buyAmmoPack: function (id, source = 'shop', discount = 1) {
+            const pack = content.ammoPacks.find((entry) => entry.id === id);
+            if (!pack) return;
+            const cost = this.getAmmoPackCost(pack, discount);
+            if (!hasCost(this.player, cost)) return;
+            payCost(this.player, cost);
+            this.player.reserveAmmo += pack.ammo || 0;
+            if (pack.refillWeapons) {
+                this.weapons.filter((weapon) => weapon.owned).forEach((weapon) => {
+                    weapon.currentAmmo = weapon.maxAmmo;
+                });
+            }
+            if (source === 'trader') this.populateTrader();
+            else if (source === 'workbench') this.populateWorkbench();
+            else this.populateShop();
+            this.updateWeaponUI();
+            this.updateHUD();
+        },
+
         toggleTrader: function (isOpen) {
             this.traderOpen = Boolean(isOpen && this.trader && this.preparationActive);
             this.mouse.isDown = false;
@@ -1477,6 +1939,10 @@
         },
 
         populateTrader: function () {
+            if (this.trader && !this.trader.ammoDeals) {
+                const shuffled = content.ammoPacks.map((pack) => pack.id).sort(() => Math.random() - 0.5);
+                this.trader.ammoDeals = shuffled.slice(0, Math.random() < 0.55 ? 2 : 3);
+            }
             const items = [
                 { id: 'wood', name: 'Salvaged Lumber', description: '+12 wood', cost: 55 },
                 { id: 'metal', name: 'Scrap Bundle', description: '+9 metal', cost: 80 },
@@ -1485,6 +1951,7 @@
                 { id: 'parts', name: 'Rare Turret Parts', description: '+1 part for high-tier machinery', cost: 280 }
             ];
             traderContent.innerHTML = `<p class="window-copy">Boss-wave discount stock. Cash is personal; placed defenses carry owner tags.</p>
+                ${this.getAmmoStoreHtml('trader', 0.72, this.trader?.ammoDeals || ['small', 'medium'])}
                 <div class="trader-stock">${items.map((item) => `
                     <div class="defense-card flex items-center justify-between">
                         <div><h3>${item.name}</h3><p>${item.description}</p></div>
@@ -1858,6 +2325,7 @@
                 ['turrets', 'Turrets'],
                 ['walls', 'Walls'],
                 ['traps', 'Traps'],
+                ['ammo', 'Ammo'],
                 ['repairs', 'Repairs'],
                 ['tech', 'Tech'],
                 ['skills', 'Skills'],
@@ -1899,18 +2367,31 @@
 
             const turretUpgradeHtml = this.sentries.length ? this.sentries.map((sentry, index) => {
                 const levels = sentry.upgradeLevels || { damage: 0, fireRate: 0, range: 0, ammo: 0 };
-                const cap = bench.workbenchLevel * 2 + (this.buildings.some((building) => building.id === 'advancedTurretBench') ? 2 : 0);
+                const cap = this.getTurretUpgradeCap(bench);
+                const hp = `${Math.ceil(sentry.health)} / ${Math.ceil(sentry.maxHealth)}`;
+                const ammo = `${Math.ceil(sentry.ammo || 0)} / ${Math.ceil(sentry.maxAmmo || 0)}`;
                 return `
-                    <article class="workbench-item workbench-upgrade">
-                        <span class="window-kicker">PLACED TURRET / OWNER ${sentry.ownerName || 'P1'}</span>
-                        <div class="workbench-item-title">${sentry.name} #${index + 1}</div>
-                        <p class="workbench-item-desc">${Math.ceil(sentry.health)} / ${Math.ceil(sentry.maxHealth)} HP. Upgrade cap ${cap}. Repair is available from this bench.</p>
-                        <div class="workbench-upgrade-grid">
+                    <article class="turret-upgrade-card">
+                        <header class="turret-upgrade-header">
+                            <div>
+                                <span class="window-kicker">PLACED TURRET / OWNER ${sentry.ownerName || 'P1'}</span>
+                                <h3>${sentry.name} #${index + 1}</h3>
+                            </div>
+                            <b>CAP ${cap}</b>
+                        </header>
+                        <div class="turret-stat-row">
+                            <span>HP <strong>${hp}</strong></span>
+                            <span>Ammo <strong>${ammo}</strong></span>
+                            <span>Damage Lv <strong>${levels.damage}</strong></span>
+                            <span>Fire Rate Lv <strong>${levels.fireRate}</strong></span>
+                            <span>Range Lv <strong>${levels.range}</strong></span>
+                        </div>
+                        <div class="turret-upgrade-grid">
                             ${this.turretUpgradeButton(index, 'damage', levels.damage, cap)}
                             ${this.turretUpgradeButton(index, 'fireRate', levels.fireRate, cap)}
                             ${this.turretUpgradeButton(index, 'range', levels.range, cap)}
                             ${this.turretUpgradeButton(index, 'ammo', levels.ammo, cap)}
-                            <button class="btn btn-secondary text-xs" onclick="game.repairTurret(${index})">Repair</button>
+                            ${this.turretRepairButton(index)}
                         </div>
                     </article>`;
             }).join('') : '<p class="workbench-empty">No turrets placed. Fabricate one, then return here to tune it.</p>';
@@ -2025,6 +2506,7 @@
                 turrets: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Turret Fabrication</h2><div class="workbench-grid">${turretCraftHtml}</div><h2 class="workbench-section-header">Turret Upgrades</h2>${turretUpgradeHtml}</section>`,
                 walls: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Wall Ladder</h2><div class="wall-tier-list">${wallTierHtml}</div><h2 class="workbench-section-header">Placed Wall Upgrades</h2>${placedWallHtml}</section>`,
                 traps: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Trap Crafting</h2><div class="workbench-grid">${trapCraftHtml}</div></section>`,
+                ammo: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Ammo Counter</h2>${this.getAmmoStoreHtml('workbench')}</section>`,
                 repairs: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Repair Counter</h2><div class="workbench-grid">${repairHtml}</div></section>`,
                 tech: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Tech and Bench Upgrades</h2>${techHtml}</section>`,
                 skills: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Skill Counter</h2><div class="workbench-grid">${skillHtml}</div></section>`,
@@ -2051,13 +2533,41 @@
             this.populateWorkbench();
         },
 
+        getTurretUpgradeCap: function (bench = this.getActiveWorkbench()) {
+            return (bench?.workbenchLevel || 1) * 2 + (this.buildings.some((building) => building.id === 'advancedTurretBench') ? 2 : 0);
+        },
+
         turretUpgradeButton: function (index, stat, level, cap) {
-            const labels = { damage: 'DAMAGE', fireRate: 'FIRE RATE', range: 'RANGE', ammo: 'AMMO' };
+            const labels = { damage: 'Damage', fireRate: 'Fire Rate', range: 'Range', ammo: 'Ammo Capacity' };
+            const effects = { damage: '+20% damage', fireRate: '-12% fire delay', range: '+35 range', ammo: '+25% max ammo and refill' };
             const maxed = level >= cap;
             const cost = { money: 80 + level * 80, wood: 2 + level, metal: 3 + level * 2 };
-            return `<button class="btn ${maxed ? 'btn-secondary opacity-50' : 'btn-primary'} text-xs"
-                ${maxed ? 'disabled' : ''} onclick="game.upgradeTurret(${index}, '${stat}')">
-                ${labels[stat]} ${level}/${cap}<br><small>${costLabel(cost)}</small>
+            const canAfford = !maxed && hasCost(this.player, cost);
+            return `<button class="turret-upgrade-button ${canAfford ? '' : 'disabled'}"
+                ${canAfford ? '' : 'disabled'} onclick="game.upgradeTurret(${index}, '${stat}')">
+                <span>${labels[stat]}</span>
+                <b>Lv ${level}/${cap}</b>
+                <small>${effects[stat]}</small>
+                <em>${maxed ? 'Maxed' : costLabel(cost)}</em>
+            </button>`;
+        },
+
+        getTurretRepairCost: function (sentry) {
+            if (!sentry || sentry.health >= sentry.maxHealth) return null;
+            const missing = 1 - sentry.health / sentry.maxHealth;
+            return { wood: Math.max(1, Math.ceil(missing * 4)), metal: Math.max(1, Math.ceil(missing * 5)) };
+        },
+
+        turretRepairButton: function (index) {
+            const sentry = this.sentries[index];
+            const cost = this.getTurretRepairCost(sentry);
+            const canAfford = cost && hasCost(this.player, cost);
+            return `<button class="turret-upgrade-button repair ${canAfford ? '' : 'disabled'}"
+                ${canAfford ? '' : 'disabled'} onclick="game.repairTurret(${index})">
+                <span>Repair</span>
+                <b>${sentry && sentry.maxHealth ? Math.ceil((sentry.health / sentry.maxHealth) * 100) : 100}% HP</b>
+                <small>Restore this turret to full health</small>
+                <em>${cost ? costLabel(cost) : 'Full HP'}</em>
             </button>`;
         },
 
@@ -2121,7 +2631,7 @@
             if (!bench || !sentry) return;
             sentry.upgradeLevels ||= { damage: 0, fireRate: 0, range: 0, ammo: 0 };
             const level = sentry.upgradeLevels[stat];
-            if (level >= bench.workbenchLevel * 2) return;
+            if (level >= this.getTurretUpgradeCap(bench)) return;
             const cost = { money: 80 + level * 80, wood: 2 + level, metal: 3 + level * 2 };
             if (!hasCost(this.player, cost)) return;
             payCost(this.player, cost);
@@ -2139,8 +2649,7 @@
         repairTurret: function (index) {
             const sentry = this.sentries[index];
             if (!sentry || sentry.health >= sentry.maxHealth) return;
-            const missing = 1 - sentry.health / sentry.maxHealth;
-            const cost = { wood: Math.max(1, Math.ceil(missing * 4)), metal: Math.max(1, Math.ceil(missing * 5)) };
+            const cost = this.getTurretRepairCost(sentry);
             if (!hasCost(this.player, cost)) return;
             payCost(this.player, cost);
             sentry.health = sentry.maxHealth;
@@ -2230,6 +2739,14 @@
             placingItemHint.classList.remove('hidden');
         },
 
+        commitPlacedEntity: function (kind, collection, entity) {
+            if (this.isWorldHost()) {
+                collection.push(entity);
+            }
+            this.recordBuild();
+            if (this.broadcastBuildAction) this.broadcastBuildAction(kind, entity);
+        },
+
         placeSentry: function () {
             const validation = this.getPlacementValidation('turret', this.placingSentry, this.mouse.worldX, this.mouse.worldY);
             if (!validation.ok) {
@@ -2253,9 +2770,7 @@
                 health: this.placingSentry.maxHealth * fortify,
                 upgradeLevels: { damage: 0, fireRate: 0, range: 0, ammo: 0 }
             };
-            this.sentries.push(sentry);
-            this.recordBuild();
-            if (this.broadcastBuildAction) this.broadcastBuildAction('turret', sentry);
+            this.commitPlacedEntity('turret', this.sentries, sentry);
             this.placingSentry = null;
             placingItemHint.classList.add('hidden');
         },
@@ -2278,9 +2793,7 @@
             wall.maxHealth = (wall.maxHealth || wall.health) * fortify;
             wall.health = wall.maxHealth;
             if (!wall.isWorkbench && wall.wallStage === undefined) wall.wallStage = 0;
-            this.walls.push(wall);
-            this.recordBuild();
-            if (this.broadcastBuildAction) this.broadcastBuildAction('wall', wall);
+            this.commitPlacedEntity('wall', this.walls, wall);
             this.placingWall = null;
             placingItemHint.classList.add('hidden');
         },
@@ -2314,9 +2827,7 @@
                 ownerId: this.localPlayerId,
                 ownerName: this.player.name || 'P1'
             };
-            this.traps.push(trap);
-            this.recordBuild();
-            if (this.broadcastBuildAction) this.broadcastBuildAction('trap', trap);
+            this.commitPlacedEntity('trap', this.traps, trap);
             this.placingTrap = null;
             placingItemHint.classList.add('hidden');
         },
@@ -2358,9 +2869,7 @@
                 ownerId: this.localPlayerId,
                 ownerName: this.player.name || 'P1'
             };
-            this.buildings.push(building);
-            this.recordBuild();
-            if (this.broadcastBuildAction) this.broadcastBuildAction('building', building);
+            this.commitPlacedEntity('building', this.buildings, building);
             this.placingBuilding = null;
             placingItemHint.classList.add('hidden');
         },

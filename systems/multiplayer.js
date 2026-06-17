@@ -15,6 +15,7 @@
             this.syncTimer = null;
             this.cleanupTimer = null;
             this.isHost = true;
+            this.roomHostId = null;
             this.desiredHost = false;
             this.serverAuthoritative = false;
         }
@@ -74,12 +75,18 @@
             if (!packet) return;
             if (packet.type === 'server' || packet.type === 'host') {
                 this.serverAuthoritative = Boolean(packet.authoritative);
-                this.isHost = this.serverAuthoritative ? false : packet.hostId === this.localId;
-                this.onHostChange(this.isHost, this.serverAuthoritative ? 'server' : packet.hostId);
+                this.roomHostId = packet.hostId || this.roomHostId;
+                const controlsRoom = this.roomHostId === this.localId;
+                this.isHost = this.serverAuthoritative ? false : controlsRoom;
+                this.onHostChange(controlsRoom, this.serverAuthoritative ? 'server' : this.roomHostId);
                 if (packet.clientCount) {
                     this.onStatus(`${this.serverAuthoritative ? 'SERVER' : this.isHost ? 'HOSTING' : 'SYNCED'} ${this.roomCode} (${packet.clientCount})`, 'online');
                 }
                 if (packet.latestWorld && (this.serverAuthoritative || !this.isHost)) this.onWorld(packet.latestWorld);
+                return;
+            }
+            if (packet.type === 'startGame') {
+                this.onAction({ type: 'action', id: packet.id || 'server', room: this.roomCode, action: { kind: 'startGame' } });
                 return;
             }
             if (packet.id === this.localId) return;

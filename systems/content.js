@@ -159,7 +159,7 @@
             isMiniBoss: true
         },
         boss: {
-            name: 'The Last Manager',
+            name: 'Basic Brute',
             color: [145, 12, 12],
             speed: 0.55,
             health: 4200,
@@ -173,6 +173,88 @@
             slamRange: 120,
             slamRate: 4200,
             isBoss: true
+        },
+        burrowKing: {
+            name: 'Burrow King',
+            color: [114, 74, 35],
+            speed: 0.72,
+            health: 4600,
+            reward: 980,
+            xp: 720,
+            size: 44,
+            armor: 0.12,
+            contactDamage: 26,
+            isBoss: true,
+            bossKind: 'burrow',
+            burrowRate: 5600,
+            spawnRate: 4200
+        },
+        chargerBrute: {
+            name: 'Charger Brute',
+            color: [205, 72, 34],
+            speed: 0.7,
+            health: 4800,
+            reward: 1020,
+            xp: 740,
+            size: 47,
+            armor: 0.14,
+            contactDamage: 32,
+            isBoss: true,
+            bossKind: 'chargerBrute',
+            chargeRate: 4600,
+            chargeDuration: 800,
+            chargeSpeed: 5.2,
+            warningDuration: 720,
+            slamRange: 125,
+            slamRate: 3600
+        },
+        teslaHorror: {
+            name: 'Tesla Horror',
+            color: [42, 170, 215],
+            speed: 0.62,
+            health: 5200,
+            reward: 1180,
+            xp: 840,
+            size: 45,
+            armor: 0.1,
+            contactDamage: 24,
+            isBoss: true,
+            bossKind: 'tesla',
+            empRadius: 250,
+            empRate: 6400,
+            empWindup: 1100,
+            spawnRate: 7600
+        },
+        broodMother: {
+            name: 'Brood Mother',
+            color: [115, 155, 65],
+            speed: 0.48,
+            health: 5600,
+            reward: 1220,
+            xp: 880,
+            size: 52,
+            armor: 0.08,
+            contactDamage: 22,
+            isBoss: true,
+            bossKind: 'brood',
+            spawnRate: 2900,
+            weakSpotDuration: 950
+        },
+        toxicButcher: {
+            name: 'Toxic Butcher',
+            color: [95, 190, 55],
+            speed: 0.86,
+            health: 6100,
+            reward: 1400,
+            xp: 980,
+            size: 50,
+            armor: 0.12,
+            contactDamage: 36,
+            isBoss: true,
+            bossKind: 'toxic',
+            puddleRate: 1200,
+            slamRange: 150,
+            slamRate: 3200
         },
         bossButcher: {
             name: 'Meat Aisle Brute',
@@ -444,6 +526,13 @@
         { id: 'infinite_20s', name: 'Temporary Infinite Ammo Potion', cost: { money: 600, wood: 8, metal: 9, parts: 1 }, duration: 20000, type: 'infiniteAmmo', multiplier: 1, description: 'Fires without consuming magazine ammo.' }
     ];
 
+    const ammoPacks = [
+        { id: 'small', name: 'Small Ammo Pack', ammo: 45, cost: { money: 45 }, description: 'Cheap reserve ammo for one bad reload.' },
+        { id: 'medium', name: 'Medium Ammo Pack', ammo: 120, cost: { money: 110 }, description: 'Best early-wave value for pistols, shotgun, and rifle.' },
+        { id: 'large', name: 'Large Ammo Pack', ammo: 320, cost: { money: 260 }, description: 'Stock up before five-wave milestones and boss prep.' },
+        { id: 'full', name: 'Full Refill', ammo: 520, cost: { money: 420, metal: 4 }, refillWeapons: true, description: 'Adds a large reserve stack and tops off owned weapon magazines.' }
+    ];
+
     const skills = [
         { id: 'maxHealth', name: 'Toughness', description: '+20 max health', max: 8 },
         { id: 'moveSpeed', name: 'Cardio', description: '+5% move speed', max: 8 },
@@ -539,6 +628,7 @@
         workbenchLevels,
         buildingTypes,
         potionRecipes,
+        ammoPacks,
         skills,
         runUpgrades,
         skins

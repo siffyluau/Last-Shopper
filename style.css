@@ -326,6 +326,15 @@
 
         .retention-track b { color: #fed7aa; }
         .lobby-start { display: flex; width: min(420px, 100%); margin: 20px auto 0; padding: 16px 22px; font-size: 20px; }
+        .lobby-action-row {
+            display: flex;
+            align-items: stretch;
+            justify-content: center;
+            gap: 12px;
+            margin: 20px auto 0;
+            width: min(680px, 100%);
+        }
+        .lobby-action-row .lobby-start { margin: 0; }
         .lobby-controls { margin: 14px 0 0; text-align: center; color: #a8a29e; font-size: 13px; }
         .lobby-controls p { margin: 3px 0; }
 
@@ -584,6 +593,136 @@
         .window-close { color: #a8a29e; font-size: 12px; font-weight: 700; }
         .window-close:hover { color: #fb923c; }
         .skill-window { max-width: 880px; padding: 26px; }
+        .hud-action-group { display: flex; gap: 6px; align-items: center; }
+
+        .zombie-index-window {
+            width: min(980px, calc(100vw - 40px));
+            max-height: min(780px, calc(100vh - 40px));
+            overflow: hidden;
+        }
+
+        #zombie-index-modal {
+            position: fixed;
+            z-index: 80;
+        }
+
+        .zombie-index-toolbar {
+            display: grid;
+            grid-template-columns: minmax(220px, 0.9fr) 1.4fr;
+            gap: 12px;
+            padding: 14px 18px;
+            border-bottom: 1px solid rgba(120,113,108,.35);
+            background: rgba(12,10,9,.78);
+        }
+
+        .zombie-index-tabs {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 6px;
+        }
+
+        .zombie-index-tab {
+            min-height: 38px;
+            border: 1px solid rgba(120,113,108,.45);
+            color: #d6d3d1;
+            background: rgba(41,37,36,.88);
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: .06em;
+            text-transform: uppercase;
+        }
+
+        .zombie-index-tab.active {
+            border-color: rgba(249,115,22,.85);
+            color: #fff7ed;
+            background: linear-gradient(180deg, rgba(249,115,22,.28), rgba(154,52,18,.24)), rgba(12,10,9,.95);
+            box-shadow: inset 0 -3px #f97316;
+        }
+
+        .zombie-index-content {
+            display: grid;
+            gap: 10px;
+            max-height: min(610px, calc(100vh - 210px));
+            padding: 16px 18px 20px;
+            overflow-y: auto;
+        }
+
+        .zombie-index-card {
+            display: grid;
+            grid-template-columns: 78px 1fr;
+            gap: 14px;
+            padding: 14px;
+            border: 1px solid rgba(120,113,108,.38);
+            background:
+                linear-gradient(90deg, rgba(249,115,22,.08), transparent 35%),
+                rgba(28,25,23,.86);
+            box-shadow: inset 4px 0 #9a3412;
+        }
+
+        .zombie-index-icon {
+            display: grid;
+            place-items: center;
+            width: 64px;
+            height: 64px;
+            border: 2px solid rgba(249,115,22,.72);
+            background: radial-gradient(circle at 55% 30%, #fef3c7 0 6%, transparent 7%), var(--zombie-color);
+            clip-path: polygon(20% 0, 80% 0, 100% 28%, 88% 100%, 12% 100%, 0 28%);
+            color: #0c0a09;
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        .zombie-index-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .zombie-index-card h3 {
+            margin: 0;
+            color: #fff7ed;
+            font-size: 19px;
+            font-weight: 700;
+        }
+
+        .zombie-index-card-header span {
+            color: #fed7aa;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .zombie-index-card p {
+            margin: 4px 0 8px;
+            color: #cbd5e1;
+            font-size: 13px;
+            line-height: 1.35;
+        }
+
+        .zombie-index-stats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .zombie-index-stats b {
+            padding: 4px 7px;
+            border: 1px solid rgba(249,115,22,.35);
+            color: #fed7aa;
+            background: rgba(12,10,9,.55);
+            font-size: 11px;
+            text-transform: uppercase;
+        }
+
+        .zombie-index-detail {
+            color: #a8a29e;
+            font-size: 12px;
+            line-height: 1.35;
+        }
+
+        .zombie-index-detail strong { color: #fb923c; }
 
         .upgrade-card-grid, .skill-grid {
             display: grid;
@@ -648,12 +787,18 @@
             .player-panel { width: 300px; }
             .upgrade-card-grid, .skill-grid { grid-template-columns: 1fr; }
             .lobby-grid { grid-template-columns: 1fr; }
+            .lobby-action-row { flex-direction: column; }
             .player-loadout-card { grid-row: auto; }
             .skin-list, .ledger-grid, .workbench-grid { grid-template-columns: 1fr; }
             .workbench-layout { grid-template-columns: 1fr; }
             .workbench-panel.wide { grid-column: span 1; }
             .workbench-upgrade-grid { grid-template-columns: 1fr; }
             .workbench-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .zombie-index-toolbar { grid-template-columns: 1fr; }
+            .zombie-index-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .zombie-index-card { grid-template-columns: 1fr; }
+            .ammo-store-header { flex-direction: column; }
+            .ammo-pack-grid, .turret-upgrade-grid, .turret-stat-row { grid-template-columns: 1fr; }
         }
 
         /* Workbench-specific styles */
@@ -824,7 +969,7 @@
 
         .workbench-tabs {
             display: grid;
-            grid-template-columns: repeat(7, minmax(0, 1fr));
+            grid-template-columns: repeat(8, minmax(0, 1fr));
             gap: 6px;
             margin-top: 12px;
             padding: 10px;
@@ -871,14 +1016,176 @@
 
         .workbench-upgrade-grid {
             display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
+            grid-template-columns: repeat(5, minmax(135px, 1fr));
             gap: 8px;
+        }
+
+        .ammo-store-panel {
+            margin-bottom: 14px;
+            padding: 14px;
+            border: 1px solid rgba(249,115,22,.32);
+            background:
+                linear-gradient(90deg, rgba(249,115,22,.12), transparent 38%),
+                rgba(12,10,9,.58);
+        }
+
+        .ammo-store-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 12px;
+        }
+
+        .ammo-store-header h3 {
+            margin: 2px 0 0;
+            color: #fff7ed;
+            font-size: 20px;
+            font-weight: 700;
+        }
+
+        .ammo-store-header p {
+            max-width: 380px;
+            margin: 0;
+            color: #a8a29e;
+            font-size: 12px;
+            line-height: 1.35;
+        }
+
+        .ammo-pack-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .ammo-pack-card {
+            padding: 12px;
+            border-left: 4px solid #f97316;
+            background: rgba(41,37,36,.84);
         }
 
         .workbench-actions {
             display: flex;
             flex-wrap: wrap;
             gap: 8px;
+        }
+
+        .turret-upgrade-card {
+            margin-bottom: 12px;
+            padding: 14px;
+            border: 1px solid rgba(249,115,22,.34);
+            border-left: 5px solid #f97316;
+            background:
+                linear-gradient(90deg, rgba(249,115,22,.12), transparent 38%),
+                rgba(28,25,23,.9);
+        }
+
+        .turret-upgrade-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+
+        .turret-upgrade-header h3 {
+            margin: 2px 0 0;
+            color: #fff7ed;
+            font-size: 19px;
+            font-weight: 700;
+        }
+
+        .turret-upgrade-header b {
+            align-self: start;
+            padding: 5px 8px;
+            border: 1px solid rgba(251,146,60,.48);
+            color: #fed7aa;
+            background: rgba(12,10,9,.62);
+            font-size: 12px;
+        }
+
+        .turret-stat-row {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 7px;
+            margin-bottom: 10px;
+        }
+
+        .turret-stat-row span {
+            padding: 7px 8px;
+            border: 1px solid rgba(120,113,108,.35);
+            color: #a8a29e;
+            background: rgba(12,10,9,.58);
+            font-size: 11px;
+            text-transform: uppercase;
+        }
+
+        .turret-stat-row strong {
+            display: block;
+            margin-top: 2px;
+            color: #fff7ed;
+            font-size: 13px;
+        }
+
+        .turret-upgrade-grid {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(128px, 1fr));
+            gap: 8px;
+        }
+
+        .turret-upgrade-button {
+            min-height: 104px;
+            padding: 9px;
+            border: 1px solid rgba(249,115,22,.48);
+            color: #fff7ed;
+            background:
+                linear-gradient(180deg, rgba(249,115,22,.18), rgba(154,52,18,.2)),
+                rgba(12,10,9,.78);
+            text-align: left;
+        }
+
+        .turret-upgrade-button span,
+        .turret-upgrade-button b,
+        .turret-upgrade-button small,
+        .turret-upgrade-button em {
+            display: block;
+        }
+
+        .turret-upgrade-button span {
+            color: #fb923c;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .turret-upgrade-button b {
+            margin-top: 4px;
+            font-size: 15px;
+        }
+
+        .turret-upgrade-button small {
+            min-height: 30px;
+            margin-top: 4px;
+            color: #cbd5e1;
+            font-size: 11px;
+            line-height: 1.25;
+        }
+
+        .turret-upgrade-button em {
+            margin-top: 6px;
+            color: #fed7aa;
+            font-size: 11px;
+            font-style: normal;
+            font-weight: 700;
+        }
+
+        .turret-upgrade-button.repair {
+            border-color: rgba(74,222,128,.45);
+            box-shadow: inset 0 -3px rgba(34,197,94,.28);
+        }
+
+        .turret-upgrade-button.disabled {
+            cursor: not-allowed;
+            opacity: .48;
+            filter: grayscale(.25);
         }
 
         .workbench-empty {
@@ -948,7 +1255,10 @@
             .workbench-grid,
             .ledger-grid,
             .skin-list,
-            .workbench-upgrade-grid {
+            .workbench-upgrade-grid,
+            .ammo-pack-grid,
+            .turret-upgrade-grid,
+            .turret-stat-row {
                 grid-template-columns: 1fr;
             }
 

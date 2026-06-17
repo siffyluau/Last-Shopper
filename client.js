@@ -82,6 +82,12 @@
         const metaBosses = document.getElementById('meta-bosses');
         const metaBuilds = document.getElementById('meta-builds');
         const nextUnlockLabel = document.getElementById('next-unlock-label');
+        const zombieIndexLobbyButton = document.getElementById('zombie-index-lobby-button');
+        const zombieIndexHudButton = document.getElementById('zombie-index-hud-button');
+        const zombieIndexModal = document.getElementById('zombie-index-modal');
+        const zombieIndexSearch = document.getElementById('zombie-index-search');
+        const zombieIndexTabs = document.getElementById('zombie-index-tabs');
+        const zombieIndexContent = document.getElementById('zombie-index-content');
         const progression = new ProgressionSystem(LastShopperContent);
 
         // --- Game State Object ---
@@ -138,6 +144,8 @@
             team: {
                 playerCount: 1
             },
+            isRoomHost: true,
+            roomStarted: false,
             
             // Map
             MAP_WIDTH: 2000,
@@ -251,6 +259,9 @@
             workbenchOpen: false,
             workbenchTab: 'turrets',
             skillsOpen: false,
+            zombieIndexOpen: false,
+            zombieIndexCategory: 'Common',
+            zombieIndexFilter: '',
             placingSentry: null,
             placingWall: null,
             placingTrap: null, 
@@ -318,6 +329,10 @@
                 
                 // Input Listeners
                 window.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape' && this.zombieIndexOpen) {
+                        this.toggleZombieIndex(false);
+                        return;
+                    }
                     if (!this.gameStarted || this.gameOver || this.waitingForReward) return;
                     if (e.key === 'Escape') {
                         if (this.placingSentry || this.placingWall || this.placingTrap || this.placingBuilding) { 
@@ -335,6 +350,8 @@
                         } else if (this.buildingOpen) {
                             this.toggleBuilding(false);
                         }
+                    } else if (e.key.toLowerCase() === 'i') {
+                        this.toggleZombieIndex(!this.zombieIndexOpen);
                     } else if (e.key.toLowerCase() === 'c') {
                         if (!this.shopOpen && !(this.placingSentry || this.placingWall || this.placingTrap || this.placingBuilding) && !this.workbenchOpen && !this.skillsOpen && !this.waitingForReward && !this.buildingOpen) { 
                             this.toggleCrafting(!this.craftingOpen);
@@ -377,6 +394,8 @@
                 
                 // --- MODIFIED: Mousedown handler ---
                 canvas.addEventListener('mousedown', (e) => {
+                    if (this.updateMouseFromEvent) this.updateMouseFromEvent(e);
+                    if (e.button !== 0) return;
                     // Check for placing *first*
                     if (this.placingSentry) {
                         this.placeSentry();
@@ -404,19 +423,24 @@
                 });
                 
                 canvas.addEventListener('mousemove', (e) => {
-                    this.mouse.x = e.clientX;
-                    this.mouse.y = e.clientY;
+                    if (this.updateMouseFromEvent) {
+                        this.updateMouseFromEvent(e);
+                    } else {
+                        this.mouse.x = e.clientX;
+                        this.mouse.y = e.clientY;
+                    }
                 });
                 
                 // Button Listeners
-                startGameButton.onclick = () => {
-                    this.applyLobbySelections();
-                    lobbyScreen.classList.add('hidden');
-                    gameContainer.classList.remove('hidden');
-                    this.start();
-                };
+                startGameButton.onclick = () => this.requestStartGame();
                 hostRoomButton.onclick = () => this.hostRoom();
                 joinRoomButton.onclick = () => this.joinRoom();
+                zombieIndexLobbyButton.onclick = () => this.toggleZombieIndex(true);
+                zombieIndexHudButton.onclick = () => this.toggleZombieIndex(true);
+                zombieIndexSearch.oninput = () => {
+                    this.zombieIndexFilter = zombieIndexSearch.value.trim().toLowerCase();
+                    this.populateZombieIndex();
+                };
                 playerNameInput.oninput = () => {
                     this.metaProgression.playerName = playerNameInput.value.trim() || 'The Shopper';
                     this.updateSkinPreview();
@@ -444,6 +468,7 @@
             },
             
             start: function() {
+                if (this.gameStarted) return;
                 this.gameStarted = true;
                 this.gameOver = false;
                 this.startWave();
@@ -583,27 +608,30 @@
             update: function() {
                 this.updatePotions();
                 this.updatePreparationEvent();
-                if (this.waitingForReward || this.craftingOpen || this.shopOpen || this.workbenchOpen || this.skillsOpen || this.traderOpen || this.buildingOpen) {
+                if (this.updateMouseWorld) this.updateMouseWorld();
+                const inputBlocked = this.isInputBlocked ? this.isInputBlocked() : false;
+                if (inputBlocked) {
                     this.mouse.isDown = false;
-                    this.updateCamera();
-                    this.updateHUD();
-                    return;
+                    this.keys = {};
                 }
-                this.updatePlayer();
+                if (!inputBlocked) this.updatePlayer();
                 if (this.syncMultiplayer) this.syncMultiplayer();
                 if (!this.isWorldHost || this.isWorldHost()) {
-                    this.updateZombies(); 
-                    this.updateBullets();
-                    this.updateSentries();
-                    this.updateDrops();
-                    this.updateAcidPools();
-                    this.updateWalls(); 
-                    this.updateEmpPulses(); 
-                    this.updateHealParticles(); 
+                    if (!this.waitingForReward) {
+                        this.updateZombies(); 
+                        this.updateBullets();
+                        this.updateSentries();
+                        this.updateDrops();
+                        this.updateAcidPools();
+                        this.updateWalls(); 
+                        this.updateEmpPulses(); 
+                        this.updateHealParticles(); 
+                    }
                 }
                 this.updateExplosions();
                 this.updateParticles();
                 this.updateCamera();
+                if (this.updateMouseWorld) this.updateMouseWorld();
                 this.updateHUD();
                 
                 if (this.player.health <= 0 && !this.gameOver) {
@@ -630,7 +658,7 @@
             
             updatePlayer: function() {
                 // Don't move if a menu is open
-                if (this.craftingOpen || this.placingSentry || this.placingWall || this.placingTrap || this.placingBuilding || this.shopOpen || this.workbenchOpen || this.skillsOpen || this.waitingForReward || this.buildingOpen) { 
+                if (this.craftingOpen || this.shopOpen || this.workbenchOpen || this.skillsOpen || this.waitingForReward || this.buildingOpen || this.traderOpen || this.zombieIndexOpen) {
                     this.keys = {};
                 }
                 
@@ -669,8 +697,7 @@
                 this.player.x = Math.max(20, Math.min(this.MAP_WIDTH - 20, this.player.x));
                 this.player.y = Math.max(20, Math.min(this.MAP_HEIGHT - 20, this.player.y));
                 
-                this.mouse.worldX = this.mouse.x + this.camera.x;
-                this.mouse.worldY = this.mouse.y + this.camera.y;
+                if (this.updateMouseWorld) this.updateMouseWorld();
                 this.player.angle = Math.atan2(this.mouse.worldY - this.player.y, this.mouse.worldX - this.player.x);
                 
                 // Shooting
@@ -730,6 +757,10 @@
                     const nearestTarget = this.getNearestEnemyTarget(z, true);
                     const playerDist = this.dist(z.x, z.y, this.player.x, this.player.y);
                     const targetDist = nearestTarget.distance;
+                    if (this.updateBossMechanics && this.updateBossMechanics(z, nearestTarget, now)) {
+                        didAction = true;
+                    }
+                    if (z.hidden) continue;
                     if (z.isCharger && now - (z.lastCharge || 0) > z.chargeRate && targetDist < 330) {
                         z.lastCharge = now;
                         z.chargeUntil = now + z.chargeDuration;
@@ -933,6 +964,7 @@
                     } else {
                         for (let j = 0; j < this.zombies.length; j++) {
                             const z = this.zombies[j];
+                            if (this.tryBossDodge && this.tryBossDodge(z, b)) continue;
                             if (this.dist(b.x, b.y, z.x, z.y) < z.size) { 
                                 if (b.explosive) {
                                     this.createExplosion(b.x, b.y, b.damage);
@@ -1827,7 +1859,11 @@
             // --- UI Functions ---
             
             populateShop: function() {
-                shopContent.innerHTML = '';
+                shopContent.innerHTML = this.getAmmoStoreHtml ? this.getAmmoStoreHtml('shop') : '';
+                const weaponHeader = document.createElement('h2');
+                weaponHeader.className = 'shop-section';
+                weaponHeader.textContent = 'WEAPON COUNTER';
+                shopContent.appendChild(weaponHeader);
                 
                 this.weapons.forEach((w, i) => {
                     const canAfford = this.player.money >= w.cost;

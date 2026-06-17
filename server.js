@@ -23,6 +23,16 @@ const spawnGates = [
   { x: 100, y: 100 }, { x: 1900, y: 100 }, { x: 100, y: 1300 },
   { x: 1900, y: 1300 }, { x: 1000, y: 100 }, { x: 1000, y: 1300 }
 ];
+const MAP_WIDTH = 2000;
+const MAP_HEIGHT = 1400;
+const SHOP_RECT = { x: 980, y: 615, width: 390, height: 260 };
+const WORKBENCH_RECT = { x: 1285, y: 820, width: 118, height: 62 };
+const SERVER_PLACEMENT_LIMITS = {
+  turrets: 12,
+  walls: 60,
+  traps: 24,
+  buildings: 6
+};
 
 const enemyTypes = {
   normal: { color: [45, 80, 22], speed: 1, health: 100, reward: 10, xp: 10, size: 15, contactDamage: 8 },
@@ -44,9 +54,14 @@ const enemyTypes = {
   eliteRunner: { color: [255, 105, 70], speed: 2.75, health: 155, reward: 58, xp: 55, size: 14, isEliteVariant: true, contactDamage: 12 },
   eliteTank: { color: [95, 125, 45], speed: 0.78, health: 760, reward: 84, xp: 80, size: 28, armor: 0.2, isEliteVariant: true, contactDamage: 18 },
   miniBoss: { color: [175, 45, 115], speed: 0.68, health: 1500, reward: 300, xp: 240, size: 32, armor: 0.18, contactDamage: 20, shootRange: 330, shootRate: 1750, isMiniBoss: true },
-  boss: { color: [145, 12, 12], speed: 0.55, health: 4200, reward: 900, xp: 650, size: 46, armor: 0.22, contactDamage: 28, shootRange: 440, shootRate: 900, slamRange: 120, slamRate: 4200, isBoss: true },
-  bossButcher: { color: [170, 35, 35], speed: 0.66, health: 5100, reward: 1050, xp: 760, size: 48, armor: 0.16, contactDamage: 34, slamRange: 145, slamRate: 3800, isBoss: true },
-  bossSpitter: { color: [105, 190, 45], speed: 0.58, health: 4550, reward: 1000, xp: 720, size: 45, armor: 0.12, contactDamage: 24, shootRange: 520, shootRate: 720, isBoss: true, isAcidRanger: true }
+  boss: { name: 'Basic Brute', color: [145, 12, 12], speed: 0.55, health: 4200, reward: 900, xp: 650, size: 46, armor: 0.22, contactDamage: 28, shootRange: 440, shootRate: 900, slamRange: 120, slamRate: 4200, isBoss: true },
+  burrowKing: { name: 'Burrow King', color: [114, 74, 35], speed: 0.72, health: 4600, reward: 980, xp: 720, size: 44, armor: 0.12, contactDamage: 26, isBoss: true, bossKind: 'burrow', burrowRate: 5600, spawnRate: 4200 },
+  chargerBrute: { name: 'Charger Brute', color: [205, 72, 34], speed: 0.7, health: 4800, reward: 1020, xp: 740, size: 47, armor: 0.14, contactDamage: 32, isBoss: true, bossKind: 'chargerBrute', chargeRate: 4600, chargeDuration: 800, chargeSpeed: 5.2, warningDuration: 720, slamRange: 125, slamRate: 3600 },
+  teslaHorror: { name: 'Tesla Horror', color: [42, 170, 215], speed: 0.62, health: 5200, reward: 1180, xp: 840, size: 45, armor: 0.1, contactDamage: 24, isBoss: true, bossKind: 'tesla', empRadius: 250, empRate: 6400, empWindup: 1100, spawnRate: 7600 },
+  broodMother: { name: 'Brood Mother', color: [115, 155, 65], speed: 0.48, health: 5600, reward: 1220, xp: 880, size: 52, armor: 0.08, contactDamage: 22, isBoss: true, bossKind: 'brood', spawnRate: 2900, weakSpotDuration: 950 },
+  toxicButcher: { name: 'Toxic Butcher', color: [95, 190, 55], speed: 0.86, health: 6100, reward: 1400, xp: 980, size: 50, armor: 0.12, contactDamage: 36, isBoss: true, bossKind: 'toxic', puddleRate: 1200, slamRange: 150, slamRate: 3200 },
+  bossButcher: { name: 'Meat Aisle Brute', color: [170, 35, 35], speed: 0.66, health: 5100, reward: 1050, xp: 760, size: 48, armor: 0.16, contactDamage: 34, slamRange: 145, slamRate: 3800, isBoss: true },
+  bossSpitter: { name: 'Toxic Store Manager', color: [105, 190, 45], speed: 0.58, health: 4550, reward: 1000, xp: 720, size: 45, armor: 0.12, contactDamage: 24, shootRange: 520, shootRate: 720, isBoss: true, isAcidRanger: true }
 };
 
 const rooms = new Map();
@@ -59,6 +74,83 @@ function distance(a, b, x2, y2) {
   const dx = a - x2;
   const dy = b - y2;
   return Math.sqrt(dx * dx + dy * dy);
+}
+
+function buildRadius(entity) {
+  return Number(entity.radius) || Math.max(Number(entity.width) || 0, Number(entity.height) || 0) / 2 || 20;
+}
+
+function rectBlocked(x, y, radius, rect) {
+  const halfW = rect.width / 2 + radius;
+  const halfH = rect.height / 2 + radius;
+  return x > rect.x - halfW && x < rect.x + halfW && y > rect.y - halfH && y < rect.y + halfH;
+}
+
+function nearbyAny(x, y, radius, list, minDistance, skipNetworkId) {
+  return list.some((item) => {
+    if (skipNetworkId && item.networkId === skipNetworkId) return false;
+    const itemRadius = buildRadius(item);
+    return distance(x, y, item.x, item.y) < minDistance + radius + itemRadius;
+  });
+}
+
+function validateBuildPlacement(kind, entity, world) {
+  if (!entity) return false;
+  const x = Number(entity.x);
+  const y = Number(entity.y);
+  const radius = buildRadius(entity);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(radius)) return false;
+  if (x < radius + 20 || y < radius + 20 || x > MAP_WIDTH - radius - 20 || y > MAP_HEIGHT - radius - 20) return false;
+  if (rectBlocked(x, y, radius, SHOP_RECT)) return false;
+  if (rectBlocked(x, y, radius, WORKBENCH_RECT)) return false;
+  if (kind !== 'building' && world.buildings.some((building) => rectBlocked(x, y, radius, building))) return false;
+
+  if (kind === 'turret') {
+    if (world.sentries.length >= SERVER_PLACEMENT_LIMITS.turrets) return false;
+    if (nearbyAny(x, y, radius, world.sentries, 78, entity.networkId)) return false;
+    if (nearbyAny(x, y, radius, world.walls, 26)) return false;
+  } else if (kind === 'wall') {
+    if (world.walls.length >= SERVER_PLACEMENT_LIMITS.walls) return false;
+    if (nearbyAny(x, y, radius, world.walls, 5, entity.networkId)) return false;
+    if (nearbyAny(x, y, radius, world.sentries, 20)) return false;
+  } else if (kind === 'trap') {
+    if (world.traps.length >= SERVER_PLACEMENT_LIMITS.traps) return false;
+    if (nearbyAny(x, y, radius, world.traps, 34, entity.networkId)) return false;
+    if (nearbyAny(x, y, radius, world.sentries, 20) || nearbyAny(x, y, radius, world.walls, 12)) return false;
+  } else if (kind === 'building') {
+    if (world.buildings.length >= SERVER_PLACEMENT_LIMITS.buildings) return false;
+    if (world.buildings.some((building) => building.id === entity.id)) return false;
+    if (nearbyAny(x, y, radius, world.buildings, 82, entity.networkId)) return false;
+    if (nearbyAny(x, y, radius, world.sentries, 44) || nearbyAny(x, y, radius, world.walls, 24)) return false;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+function sanitizeBuildEntity(kind, entity, ownerId) {
+  const clean = { ...entity };
+  clean.x = Number(entity.x);
+  clean.y = Number(entity.y);
+  clean.radius = buildRadius(entity);
+  clean.networkId = String(entity.networkId || `${kind}-${ownerId || 'player'}-${nowMs()}-${Math.random().toString(36).slice(2, 6)}`);
+  clean.ownerId = String(entity.ownerId || ownerId || 'player');
+  clean.ownerName = String(entity.ownerName || 'P1').slice(0, 24);
+  if (kind === 'turret') {
+    clean.angle = Number(clean.angle) || 0;
+    clean.lastShot = 0;
+    clean.isDisabled = 0;
+    clean.health = Number(clean.health || clean.maxHealth || 180);
+    clean.maxHealth = Number(clean.maxHealth || clean.health || 180);
+    clean.ammo = Number(clean.ammo || clean.maxAmmo || 0);
+    clean.maxAmmo = Number(clean.maxAmmo || clean.ammo || 0);
+    clean.upgradeLevels = clean.upgradeLevels || { damage: 0, fireRate: 0, range: 0, ammo: 0 };
+  }
+  if (kind === 'wall') {
+    clean.maxHealth = Number(clean.maxHealth || clean.health || 240);
+    clean.health = Number(clean.health || clean.maxHealth);
+  }
+  return clean;
 }
 
 function wavePlan(wave, playerCount) {
@@ -98,15 +190,16 @@ function enemyPool(wave) {
 }
 
 function bossPool(wave) {
-  const pool = ['boss'];
-  if (wave >= 20) pool.push('bossButcher');
-  if (wave >= 30) pool.push('bossSpitter');
+  const pool = ['boss', 'burrowKing', 'chargerBrute'];
+  if (wave >= 20) pool.push('teslaHorror', 'broodMother');
+  if (wave >= 30) pool.push('toxicButcher', 'bossButcher', 'bossSpitter');
   return pool;
 }
 
 function createWorld() {
   return {
     serverTime: nowMs(),
+    gameStarted: false,
     wave: 0,
     waveActive: false,
     zombiesKilled: 0,
@@ -130,7 +223,9 @@ function createWorld() {
     traps: [],
     buildings: [],
     drops: [],
-    acidPools: []
+    acidPools: [],
+    bossDefeats: 0,
+    killRewards: []
   };
 }
 
@@ -142,6 +237,7 @@ function getRoom(code) {
       clients: new Map(),
       players: new Map(),
       hostId: null,
+      gameStarted: false,
       latestWorld: createWorld(),
       lastTick: nowMs(),
       lastSnapshot: 0
@@ -164,6 +260,7 @@ function worldSnapshot(room) {
   const world = room.latestWorld;
   return {
     ...world,
+    gameStarted: room.gameStarted,
     preparationEndsIn: world.preparationActive ? Math.max(0, world.preparationEndsAt - nowMs()) : 0,
     players: [...room.players.values()]
   };
@@ -179,6 +276,7 @@ function announceRoom(room) {
     room: room.code,
     hostId: room.hostId,
     clientCount: room.clients.size,
+    roomStarted: room.gameStarted,
     latestWorld: worldSnapshot(room)
   });
 }
@@ -198,6 +296,7 @@ function registerClient(room, ws, packet) {
     room: room.code,
     hostId: room.hostId,
     clientCount: room.clients.size,
+    roomStarted: room.gameStarted,
     latestWorld: worldSnapshot(room)
   });
   announceRoom(room);
@@ -312,6 +411,7 @@ function getTargets(room, zombie, includeStructures = true) {
 }
 
 function damageZombie(zombie, amount) {
+  if (zombie.weakSpotUntil && nowMs() < zombie.weakSpotUntil) amount *= 1.35;
   let remaining = amount;
   if (zombie.shieldHealth > 0) {
     const absorbed = Math.min(zombie.shieldHealth, remaining);
@@ -319,6 +419,150 @@ function damageZombie(zombie, amount) {
     remaining -= absorbed;
   }
   if (remaining > 0) zombie.health -= remaining * (1 - (zombie.armor || 0));
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function spawnBossMinion(world, typeKey, x, y, scale = 0.75) {
+  const type = enemyTypes[typeKey] || enemyTypes.normal;
+  const health = Math.max(35, Math.floor(type.health * scale));
+  world.zombies.push({
+    ...type,
+    type: typeKey,
+    id: `z-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    x: clamp(x + Math.random() * 70 - 35, 25, 1975),
+    y: clamp(y + Math.random() * 70 - 35, 25, 1375),
+    health,
+    maxHealth: health,
+    reward: Math.max(4, Math.floor((type.reward || 8) * 0.35)),
+    xp: Math.max(4, Math.floor((type.xp || type.reward || 8) * 0.35)),
+    damageScale: world.currentWavePlan?.damageScale || 1,
+    lastShot: 0,
+    lastSlam: 0,
+    lastMelee: 0,
+    lastHeal: 0,
+    lastWeld: 0
+  });
+}
+
+function runBossMechanics(room, z, target, dt, now) {
+  if (!z.isBoss || !target) return false;
+  const world = room.latestWorld;
+  if (z.stunnedUntil && now < z.stunnedUntil) return true;
+
+  if (z.bossKind === 'burrow') {
+    if (z.hidden) {
+      if (now >= z.emergeAt) {
+        z.x = z.emergeX;
+        z.y = z.emergeY;
+        z.hidden = false;
+        z.burrowWarning = null;
+        z.lastBurrow = now;
+        for (let i = 0; i < 3; i++) spawnBossMinion(world, i === 0 ? 'runner' : 'normal', z.x, z.y, 0.65);
+      }
+      return true;
+    }
+    if (now - (z.lastBurrow || 0) > (z.burrowRate || 5600) && target.distance > 140) {
+      const angle = Math.random() * Math.PI * 2;
+      z.emergeX = clamp(target.x + Math.cos(angle) * (70 + Math.random() * 55), 50, 1950);
+      z.emergeY = clamp(target.y + Math.sin(angle) * (70 + Math.random() * 55), 50, 1350);
+      z.emergeAt = now + 1150;
+      z.hidden = true;
+      z.burrowWarning = { x: z.emergeX, y: z.emergeY, until: z.emergeAt };
+      return true;
+    }
+    if (now - (z.lastSpawn || 0) > (z.spawnRate || 4200)) {
+      z.lastSpawn = now;
+      spawnBossMinion(world, Math.random() < 0.5 ? 'runner' : 'normal', z.x, z.y, 0.7);
+    }
+  }
+
+  if (z.bossKind === 'chargerBrute') {
+    if (z.chargeWindupUntil && now < z.chargeWindupUntil) return true;
+    if (z.chargeWindupUntil && now >= z.chargeWindupUntil) {
+      z.chargeWindupUntil = 0;
+      z.chargeUntil = now + (z.chargeDuration || 800);
+      z.warningLine = null;
+    }
+    if (z.chargeUntil && now < z.chargeUntil) {
+      const speed = (z.chargeSpeed || 5) * (dt / 16.67);
+      z.x = clamp(z.x + Math.cos(z.chargeAngle || 0) * speed, 20, 1980);
+      z.y = clamp(z.y + Math.sin(z.chargeAngle || 0) * speed, 20, 1380);
+      for (const wall of world.walls) {
+        if (distance(z.x, z.y, wall.x, wall.y) < z.size + (wall.radius || 25)) {
+          if ((wall.wallStage || 0) < 2) {
+            wall.health = 0;
+          } else {
+            z.stunnedUntil = now + 1500;
+            z.chargeUntil = 0;
+          }
+          break;
+        }
+      }
+      return true;
+    }
+    if (z.chargeUntil && now >= z.chargeUntil) z.chargeUntil = 0;
+    if (target.distance < 520 && now - (z.lastCharge || 0) > (z.chargeRate || 4600)) {
+      z.lastCharge = now;
+      z.chargeAngle = Math.atan2(target.y - z.y, target.x - z.x);
+      z.chargeWindupUntil = now + (z.warningDuration || 720);
+      z.warningLine = { x1: z.x, y1: z.y, x2: target.x, y2: target.y, until: z.chargeWindupUntil };
+      return true;
+    }
+  }
+
+  if (z.bossKind === 'tesla') {
+    if (z.empChargeUntil) {
+      if (now >= z.empChargeUntil) {
+        z.empChargeUntil = 0;
+        z.empPulseUntil = now + 650;
+        for (const sentry of world.sentries) {
+          if (distance(z.x, z.y, sentry.x, sentry.y) < (z.empRadius || 240)) sentry.isDisabled = now + 5200;
+        }
+        for (let i = 0; i < 2; i++) spawnBossMinion(world, 'disruptor', z.x, z.y, 0.68);
+      }
+      return true;
+    }
+    if (z.empPulseUntil && now >= z.empPulseUntil) z.empPulseUntil = 0;
+    if (now - (z.lastEmp || 0) > (z.empRate || 6400)) {
+      z.lastEmp = now;
+      z.empChargeUntil = now + (z.empWindup || 1100);
+      return true;
+    }
+    if (now - (z.lastSpawn || 0) > (z.spawnRate || 7600)) {
+      z.lastSpawn = now;
+      spawnBossMinion(world, 'disruptor', z.x, z.y, 0.65);
+    }
+  }
+
+  if (z.bossKind === 'brood' && now - (z.lastSpawn || 0) > (z.spawnRate || 2900)) {
+    z.lastSpawn = now;
+    z.weakSpotUntil = now + (z.weakSpotDuration || 950);
+    for (let i = 0; i < 2; i++) spawnBossMinion(world, Math.random() < 0.5 ? 'runner' : 'splitter', z.x, z.y, 0.55);
+  }
+
+  if (z.bossKind === 'toxic' && now - (z.lastPuddle || 0) > (z.puddleRate || 1200)) {
+    z.lastPuddle = now;
+    world.acidPools.push({ x: z.x, y: z.y, radius: 42, life: 260, damage: 0.55, toxicBoss: true });
+  }
+
+  return false;
+}
+
+function tryBossDodge(world, z, bullet, now) {
+  if (!z.isBoss || !bullet.explosive || bullet.fromZombie) return false;
+  const projectileSpeed = Math.sqrt((bullet.vx || 0) ** 2 + (bullet.vy || 0) ** 2);
+  const d = distance(bullet.x, bullet.y, z.x, z.y);
+  if (projectileSpeed > 7 || d < z.size + 26 || d > 165 || now - (z.lastDodge || 0) < 4200) return false;
+  z.lastDodge = now;
+  z.dodgeUntil = now + 360;
+  const sign = Math.random() < 0.5 ? -1 : 1;
+  const angle = Math.atan2(bullet.vy || 0, bullet.vx || 1) + Math.PI / 2 * sign;
+  z.x = clamp(z.x + Math.cos(angle) * 76, 35, 1965);
+  z.y = clamp(z.y + Math.sin(angle) * 76, 35, 1365);
+  return true;
 }
 
 function pushBullet(world, x, y, angle, speed, damage, options = {}) {
@@ -386,6 +630,8 @@ function updateZombies(room, dt) {
     if (!target) continue;
     const targetDist = target.distance;
     let didAction = false;
+    if (runBossMechanics(room, z, target, dt, now)) didAction = true;
+    if (z.hidden) continue;
     if ((z.type === 'spitter' || z.type === 'boss' || z.type === 'miniBoss' || z.isAcidRanger || z.isBoss || z.isMiniBoss) && z.shootRange && targetDist < z.shootRange) {
       didAction = true;
       if (now - z.lastShot > z.shootRate) {
@@ -437,6 +683,7 @@ function updateZombies(room, dt) {
 
     if (z.health <= 0) {
       world.zombiesKilled += 1;
+      recordKillReward(room, z);
       if (z.isSplitter) spawnSplitChildren(world, z);
       if (z.isBoss || z.isMiniBoss) {
         for (let d = 0; d < 5; d++) dropLoot(world, z.x + Math.random() * 60 - 30, z.y + Math.random() * 60 - 30);
@@ -474,6 +721,7 @@ function spawnSplitChildren(world, zombie) {
 
 function updateBullets(room, dt) {
   const world = room.latestWorld;
+  const now = nowMs();
   for (let i = world.bullets.length - 1; i >= 0; i--) {
     const b = world.bullets[i];
     b.x += b.vx * (dt / 16.67);
@@ -521,10 +769,15 @@ function updateBullets(room, dt) {
       if (hit) world.bullets.splice(i, 1);
     } else {
       for (const z of world.zombies) {
+        if (tryBossDodge(world, z, b, now)) continue;
         if (distance(b.x, b.y, z.x, z.y) < z.size) {
+          z.lastHitBy = b.ownerId || z.lastHitBy || null;
           if (b.explosive) {
             for (const nearby of world.zombies) {
-              if (distance(b.x, b.y, nearby.x, nearby.y) < 95) damageZombie(nearby, b.damage * 0.5);
+              if (distance(b.x, b.y, nearby.x, nearby.y) < 95) {
+                nearby.lastHitBy = b.ownerId || nearby.lastHitBy || null;
+                damageZombie(nearby, b.damage * 0.5);
+              }
             }
           } else {
             damageZombie(z, b.damage);
@@ -587,10 +840,35 @@ function dropLoot(world, x, y) {
   world.drops.push({ x, y, type, life: 600 });
 }
 
+function recordKillReward(room, zombie) {
+  const world = room.latestWorld;
+  if (zombie.isBoss) world.bossDefeats = (world.bossDefeats || 0) + 1;
+  const reward = {
+    id: `reward-${nowMs()}-${Math.random().toString(36).slice(2, 6)}`,
+    zombieId: zombie.id,
+    zombieType: zombie.type,
+    boss: Boolean(zombie.isBoss),
+    miniBoss: Boolean(zombie.isMiniBoss),
+    ownerId: zombie.lastHitBy || null,
+    money: zombie.reward || 0,
+    xp: zombie.xp || 0,
+    parts: zombie.isBoss ? 1 : 0,
+    createdAt: nowMs()
+  };
+  world.killRewards.push(reward);
+  if (world.killRewards.length > 40) {
+    world.killRewards.splice(0, world.killRewards.length - 40);
+  }
+}
+
 function cleanupWorld(world, dt) {
   world.walls = world.walls.filter((wall) => wall.health > 0);
   world.sentries = world.sentries.filter((sentry) => sentry.health > 0);
   world.buildings = world.buildings.filter((building) => building.health > 0);
+  for (let i = world.acidPools.length - 1; i >= 0; i--) {
+    world.acidPools[i].life -= dt / 16.67;
+    if (world.acidPools[i].life <= 0) world.acidPools.splice(i, 1);
+  }
   for (let i = world.drops.length - 1; i >= 0; i--) {
     world.drops[i].life -= dt / 16.67;
     if (world.drops[i].life <= 0) world.drops.splice(i, 1);
@@ -600,6 +878,7 @@ function cleanupWorld(world, dt) {
 function updateWaveState(room) {
   const world = room.latestWorld;
   const now = nowMs();
+  if (!room.gameStarted) return;
   if (!room.players.size) return;
   if (world.wave === 0 && !world.waveActive && !world.preparationActive) {
     startWave(room);
@@ -654,6 +933,14 @@ function tickRoom(room) {
 function handleAction(room, packet) {
   const action = packet.action || {};
   const world = room.latestWorld;
+  if (action.kind === 'startGame') {
+    if (packet.id && packet.id !== room.hostId) return;
+    room.gameStarted = true;
+    world.gameStarted = true;
+    broadcast(room, { type: 'startGame', id: 'server', room: room.code, hostId: room.hostId });
+    announceRoom(room);
+    return;
+  }
   if (action.kind === 'build' && action.entity) {
     const target = action.buildKind === 'turret'
       ? world.sentries
@@ -666,7 +953,14 @@ function handleAction(room, packet) {
             : null;
     if (!target) return;
     if (target.some((entry) => entry.networkId && entry.networkId === action.entity.networkId)) return;
-    target.push(action.entity);
+    const entity = sanitizeBuildEntity(action.buildKind, {
+      ...action.entity,
+      x: action.x ?? action.entity.x,
+      y: action.y ?? action.entity.y
+    }, packet.id);
+    if (!validateBuildPlacement(action.buildKind, entity, world)) return;
+    target.push(entity);
+    broadcast(room, { type: 'world', id: 'server', authoritative: true, room: room.code, world: worldSnapshot(room) });
     return;
   }
   if (action.kind === 'shot' && action.player && action.weapon) {

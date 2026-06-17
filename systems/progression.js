@@ -64,9 +64,9 @@
         }
 
         bossPool(wave) {
-            const pool = ['boss'];
-            if (wave >= 20) pool.push('bossButcher');
-            if (wave >= 30) pool.push('bossSpitter');
+            const pool = ['boss', 'burrowKing', 'chargerBrute'];
+            if (wave >= 20) pool.push('teslaHorror', 'broodMother');
+            if (wave >= 30) pool.push('toxicButcher', 'bossButcher', 'bossSpitter');
             return pool;
         }
     }

@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Last Shopper</title>
+    <link rel="icon" href="data:,">
     <!-- Loading Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Loading Google Font 'Chakra Petch' for a gamey feel -->
@@ -96,12 +97,33 @@
                 </section>
             </div>
 
-            <button id="start-game-button" class="btn btn-primary lobby-start">Start Run</button>
+            <div class="lobby-action-row">
+                <button id="zombie-index-lobby-button" class="btn btn-secondary">Zombie Index</button>
+                <button id="start-game-button" class="btn btn-primary lobby-start">Start Run</button>
+            </div>
 
             <div class="lobby-controls">
                 <p>WASD move / Mouse aim / Click shoot / 1-5 weapons</p>
-                <p>R reload / G service defense / C field craft / E shop or workbench / K skills</p>
+                <p>R reload / G service defense / C field craft / E shop or workbench / K skills / I zombie index</p>
             </div>
+        </div>
+    </div>
+
+    <!-- Zombie Index / Bestiary -->
+    <div id="zombie-index-modal" class="game-overlay hidden items-center justify-center">
+        <div class="game-window zombie-index-window">
+            <div class="station-header">
+                <div>
+                    <span class="window-kicker">INFECTED STORE DIRECTORY</span>
+                    <h2>Zombie Index</h2>
+                </div>
+                <button class="window-close" onclick="game.toggleZombieIndex(false)">CLOSE (ESC)</button>
+            </div>
+            <div class="zombie-index-toolbar">
+                <input id="zombie-index-search" class="retail-input" placeholder="Search zombies, counters, rewards...">
+                <div id="zombie-index-tabs" class="zombie-index-tabs"></div>
+            </div>
+            <div id="zombie-index-content" class="zombie-index-content"></div>
         </div>
     </div>
 
@@ -136,7 +158,10 @@
             <div class="hud-panel player-panel">
                 <div class="hud-row compact">
                     <span class="hud-kicker">SHOPPER <b id="hud-level">LV 1</b></span>
-                    <button id="skill-menu-button" class="hud-action pointer-events-auto">SKILLS <b id="hud-skill-points">0</b></button>
+                    <div class="hud-action-group pointer-events-auto">
+                        <button id="zombie-index-hud-button" class="hud-action">INDEX</button>
+                        <button id="skill-menu-button" class="hud-action">SKILLS <b id="hud-skill-points">0</b></button>
+                    </div>
                 </div>
                 <div class="meter meter-health">
                     <div id="hud-health-bar" class="meter-fill"></div>
