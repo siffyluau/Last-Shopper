@@ -171,15 +171,15 @@ function wavePlan(wave, playerCount) {
   const completed = wave - 1;
   const playerScale = 1 + Math.max(0, playerCount - 1) * 0.35;
   const healthPlayerScale = 1 + Math.max(0, playerCount - 1) * 0.12;
-  const baseCount = Math.floor(4 + wave * 1.25 + Math.pow(wave, 0.72));
+  const baseCount = Math.floor(6 + wave * 1.35 + Math.pow(wave, 0.72));
   return {
     bossWave,
     miniBossWave,
     bossCount: bossWave ? Math.max(1, Math.floor(wave / 30) + 1) : 0,
     miniBossCount: miniBossWave ? Math.max(1, Math.floor(wave / 20) + 1) : 0,
     enemyCount: Math.ceil((bossWave ? 8 + Math.floor(wave * 0.85) : baseCount) * playerScale),
-    healthScale: (1 + completed * 0.045 + completed * completed * 0.0009) * healthPlayerScale,
-    damageScale: 1 + completed * 0.018,
+    healthScale: (1.1 + completed * 0.047 + completed * completed * 0.0009) * healthPlayerScale,
+    damageScale: 1.05 + completed * 0.019,
     rewardScale: 1 + completed * 0.055
   };
 }
@@ -215,7 +215,7 @@ function createWorld(seed) {
     mapStructures: [],
     lootEvents: [],
     lootBeacon: null,
-    nextWorldDropAt: nowMs() + 18000,
+    nextWorldDropAt: nowMs() + 45000,
     serverTime: nowMs(),
     cycleStartedAt: nowMs(),
     dayTime: 0.34,
@@ -885,9 +885,11 @@ function updateZombies(room, dt) {
       world.zombiesKilled += 1;
       recordKillReward(room, z);
       if (z.isSplitter) spawnSplitChildren(world, z);
-      if (z.isBoss || z.isMiniBoss) {
-        for (let d = 0; d < 5; d++) dropLoot(world, z.x + Math.random() * 60 - 30, z.y + Math.random() * 60 - 30);
-      } else {
+      if (z.isBoss) {
+        for (let d = 0; d < 4; d++) dropLoot(world, z.x + Math.random() * 60 - 30, z.y + Math.random() * 60 - 30);
+      } else if (z.isMiniBoss) {
+        for (let d = 0; d < 2; d++) dropLoot(world, z.x + Math.random() * 45 - 22, z.y + Math.random() * 45 - 22);
+      } else if (Math.random() < 0.3) {
         dropLoot(world, z.x, z.y);
       }
       world.zombies.splice(i, 1);
@@ -1131,8 +1133,8 @@ function spawnWorldDrop(room) {
   const x = player.x + Math.cos(angle) * range;
   const y = player.y + Math.sin(angle) * range;
   world.lootBeacon = { id: `beacon-${nowMs()}`, x, y, expiresAt: nowMs() + 90000 };
-  for (let i = 0; i < 5; i += 1) dropLoot(world, x + Math.random() * 50 - 25, y + Math.random() * 50 - 25);
-  world.nextWorldDropAt = nowMs() + 60000 + Math.random() * 30000;
+  for (let i = 0; i < 3; i += 1) dropLoot(world, x + Math.random() * 50 - 25, y + Math.random() * 50 - 25);
+  world.nextWorldDropAt = nowMs() + 90000 + Math.random() * 50000;
 }
 
 function collectNearbyDrops(room) {

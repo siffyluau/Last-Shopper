@@ -595,8 +595,17 @@
         .reward-window h2, .skill-window h2 { margin: 4px 0 8px; font-size: 32px; font-weight: 700; }
         .window-copy { color: #aeb8c5; }
         .window-header { display: flex; align-items: center; justify-content: space-between; }
-        .window-close { color: #a8a29e; font-size: 12px; font-weight: 700; }
-        .window-close:hover { color: #fb923c; }
+        .window-close {
+            padding: 8px 11px;
+            border: 1px solid rgba(120,113,108,.55);
+            background: #1c1917;
+            color: #d6d3d1;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: .05em;
+            text-transform: uppercase;
+        }
+        .window-close:hover { border-color: #f97316; color: #fb923c; background: #292524; }
         .skill-window { max-width: 880px; padding: 26px; }
         .hud-action-group { display: flex; gap: 6px; align-items: center; }
 
@@ -1069,6 +1078,53 @@
 
         .workbench-console p { margin: 0; color: #a8a29e; font-size: 13px; }
 
+        .bench-progression {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr auto 1.15fr;
+            align-items: stretch;
+            gap: 8px;
+            padding: 12px;
+            border: 1px solid rgba(249,115,22,.42);
+            background: linear-gradient(90deg, rgba(124,45,18,.18), transparent 55%), rgba(12,10,9,.78);
+        }
+
+        .bench-stage {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: 0;
+            padding: 14px;
+            border: 1px solid rgba(120,113,108,.35);
+            background: rgba(28,25,23,.8);
+        }
+
+        .bench-stage.current { border-left: 4px solid #f97316; }
+        .bench-stage.required { border-color: rgba(239,68,68,.55); background: rgba(69,10,10,.22); }
+        .bench-stage.complete { border-color: rgba(34,197,94,.35); }
+        .bench-stage-number { color: #78716c; font: 800 22px "Chakra Petch"; }
+        .bench-stage h3 { margin: 2px 0; color: #fafaf9; font-size: 17px; }
+        .bench-stage p { margin: 0; color: #a8a29e; font-size: 11px; }
+        .bench-progress-arrow { align-self: center; color: #78716c; font-size: 9px; font-weight: 800; letter-spacing: .1em; }
+        .bench-stage-action { display: grid; width: 100%; gap: 5px; }
+
+        .bench-action {
+            display: grid;
+            gap: 2px;
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid rgba(120,113,108,.55);
+            background: #292524;
+            color: #d6d3d1;
+            text-align: left;
+            text-transform: uppercase;
+        }
+        .bench-action span { font-size: 12px; font-weight: 800; }
+        .bench-action small { color: #a8a29e; font-size: 9px; }
+        .bench-action.ready { border-color: #f97316; background: linear-gradient(180deg, #c2410c, #7c2d12); color: #fff7ed; }
+        .bench-action.locked { border-color: rgba(249,115,22,.55); color: #fb923c; cursor: pointer; }
+        .bench-action.locked:hover { background: rgba(124,45,18,.42); }
+        .bench-action:disabled { cursor: not-allowed; opacity: .55; }
+
         .workbench-layout {
             display: grid;
             grid-template-columns: 1.1fr .9fr;
@@ -1082,7 +1138,7 @@
 
         .workbench-tabs {
             display: grid;
-            grid-template-columns: repeat(8, minmax(0, 1fr));
+            grid-template-columns: repeat(4, minmax(0, 1fr));
             gap: 6px;
             margin-top: 12px;
             padding: 10px;
@@ -1091,7 +1147,11 @@
         }
 
         .workbench-tab {
-            min-height: 42px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-height: 54px;
+            padding: 8px 12px;
             border: 1px solid rgba(120,113,108,.45);
             color: #d6d3d1;
             background:
@@ -1101,7 +1161,12 @@
             font-weight: 700;
             letter-spacing: .06em;
             text-transform: uppercase;
+            text-align: left;
         }
+
+        .workbench-tab > b { color: #78716c; font-size: 10px; }
+        .workbench-tab > span { display: grid; gap: 2px; }
+        .workbench-tab small { color: #78716c; font-size: 9px; letter-spacing: .02em; text-transform: none; }
 
         .workbench-tab.active {
             border-color: rgba(249,115,22,.85);
@@ -1111,6 +1176,7 @@
                 rgba(12,10,9,.95);
             box-shadow: inset 0 -3px #f97316;
         }
+        .workbench-tab.active > b, .workbench-tab.active small { color: #fdba74; }
 
         .workbench-panel {
             min-width: 0;
@@ -1382,6 +1448,9 @@
             .workbench-tabs {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
             }
+
+            .bench-progression { grid-template-columns: 1fr; }
+            .bench-progress-arrow { display: none; }
         }
         .absolute { position: absolute; }
         .fixed { position: fixed; }

@@ -117,7 +117,7 @@
             lootEvents: [],
             appliedLootEvents: new Set(),
             lootBeacon: null,
-            nextLocalWorldDropAt: performance.now() + 18000,
+            nextLocalWorldDropAt: performance.now() + 45000,
             traps: [], 
             buildings: [],
             empPulses: [], 
@@ -567,7 +567,7 @@
                 this.lootEvents = [];
                 this.appliedLootEvents = new Set();
                 this.lootBeacon = null;
-                this.nextLocalWorldDropAt = performance.now() + 18000;
+                this.nextLocalWorldDropAt = performance.now() + 45000;
                 this.empPulses = []; 
                 this.healParticles = []; 
                 this.wave = 0;
@@ -941,11 +941,15 @@
                             z.exploded = true;
                             this.createExplosion(z.x, z.y, z.explosionDamage * 0.65);
                         }
-                        if (z.type === 'boss' || z.type === 'miniBoss' || z.isBoss || z.isMiniBoss) {
-                            for (let j = 0; j < 5; j++) {
+                        if (z.isBoss || z.type === 'boss') {
+                            for (let j = 0; j < 4; j++) {
                                 this.dropLoot(z.x + Math.random() * 60 - 30, z.y + Math.random() * 60 - 30);
                             }
-                        } else {
+                        } else if (z.isMiniBoss || z.type === 'miniBoss') {
+                            for (let j = 0; j < 2; j++) {
+                                this.dropLoot(z.x + Math.random() * 45 - 22, z.y + Math.random() * 45 - 22);
+                            }
+                        } else if (Math.random() < 0.3) {
                             this.dropLoot(z.x, z.y);
                         }
                         if (z.isSplitter && this.spawnSplitChildren) {
@@ -1444,6 +1448,7 @@
                 
                 ctx.restore();
                 if (this.drawDayNight) this.drawDayNight();
+                if (this.drawNavigationHud) this.drawNavigationHud();
             },
 
             drawMap: function() {

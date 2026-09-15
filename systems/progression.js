@@ -11,10 +11,10 @@
         wavePlan(wave) {
             const bossWave = wave % 10 === 0;
             const miniBossWave = wave > 5 && wave % 5 === 0 && !bossWave;
-            const baseCount = Math.floor(4 + wave * 1.25 + Math.pow(wave, 0.72));
+            const baseCount = Math.floor(6 + wave * 1.35 + Math.pow(wave, 0.72));
             const completed = wave - 1;
-            const healthScale = 1 + completed * 0.045 + completed * completed * 0.0009;
-            const damageScale = 1 + completed * 0.018;
+            const healthScale = 1.1 + completed * 0.047 + completed * completed * 0.0009;
+            const damageScale = 1.05 + completed * 0.019;
             const rewardScale = 1 + completed * 0.055;
 
             return {

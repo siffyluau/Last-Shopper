@@ -625,6 +625,105 @@
             }
         },
 
+        drawNavigationHud: function () {
+            const enemies = this.zombies || [];
+            if (!this.gameStarted || !enemies.length || this.player.downed) return;
+
+            const radarX = 18;
+            const radarY = 18;
+            const radarSize = 126;
+            const radarRange = 820;
+            const center = radarSize / 2;
+            ctx.save();
+            ctx.fillStyle = 'rgba(12,10,9,.88)';
+            ctx.strokeStyle = 'rgba(249,115,22,.72)';
+            ctx.lineWidth = 2;
+            ctx.fillRect(radarX, radarY, radarSize, radarSize);
+            ctx.strokeRect(radarX, radarY, radarSize, radarSize);
+            ctx.beginPath();
+            ctx.rect(radarX + 4, radarY + 4, radarSize - 8, radarSize - 8);
+            ctx.clip();
+            ctx.strokeStyle = 'rgba(120,113,108,.28)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(radarX + center, radarY + 7);
+            ctx.lineTo(radarX + center, radarY + radarSize - 7);
+            ctx.moveTo(radarX + 7, radarY + center);
+            ctx.lineTo(radarX + radarSize - 7, radarY + center);
+            ctx.stroke();
+
+            for (const enemy of enemies) {
+                const dx = enemy.x - this.player.x;
+                const dy = enemy.y - this.player.y;
+                const distance = Math.hypot(dx, dy);
+                const scale = Math.min(1, distance / radarRange);
+                const angle = Math.atan2(dy, dx);
+                const px = radarX + center + Math.cos(angle) * scale * (center - 10);
+                const py = radarY + center + Math.sin(angle) * scale * (center - 10);
+                ctx.fillStyle = enemies.length === 1 ? '#fb923c' : enemy.isBoss ? '#fbbf24' : '#ef4444';
+                ctx.beginPath();
+                ctx.arc(px, py, enemies.length === 1 ? 4.5 : enemy.isBoss ? 4 : 2.3, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            ctx.fillStyle = '#fafaf9';
+            ctx.beginPath();
+            ctx.moveTo(radarX + center, radarY + center - 6);
+            ctx.lineTo(radarX + center - 5, radarY + center + 5);
+            ctx.lineTo(radarX + center + 5, radarY + center + 5);
+            ctx.closePath();
+            ctx.fill();
+            ctx.restore();
+
+            ctx.save();
+            ctx.fillStyle = '#a8a29e';
+            ctx.font = '700 10px "Chakra Petch"';
+            ctx.textAlign = 'left';
+            ctx.fillText(`THREAT RADAR  ${enemies.length}`, radarX + 7, radarY + radarSize + 15);
+            ctx.restore();
+
+            if (enemies.length !== 1) return;
+            const target = enemies[0];
+            const targetX = target.x - this.camera.x;
+            const targetY = target.y - this.camera.y;
+            const margin = 72;
+            if (targetX >= margin && targetX <= canvas.width - margin && targetY >= margin && targetY <= canvas.height - margin) return;
+
+            const playerX = this.player.x - this.camera.x;
+            const playerY = this.player.y - this.camera.y;
+            const dx = targetX - playerX;
+            const dy = targetY - playerY;
+            const angle = Math.atan2(dy, dx);
+            const cos = Math.cos(angle);
+            const sin = Math.sin(angle);
+            const tx = cos > 0 ? (canvas.width - margin - playerX) / cos : cos < 0 ? (margin - playerX) / cos : Infinity;
+            const ty = sin > 0 ? (canvas.height - margin - playerY) / sin : sin < 0 ? (margin - playerY) / sin : Infinity;
+            const travel = Math.max(0, Math.min(tx, ty));
+            const arrowX = playerX + cos * travel;
+            const arrowY = playerY + sin * travel;
+            const pulse = 1 + Math.sin(performance.now() / 150) * 0.12;
+            ctx.save();
+            ctx.translate(arrowX, arrowY);
+            ctx.rotate(angle);
+            ctx.scale(pulse, pulse);
+            ctx.fillStyle = '#f97316';
+            ctx.shadowColor = '#f97316';
+            ctx.shadowBlur = 12;
+            ctx.beginPath();
+            ctx.moveTo(18, 0);
+            ctx.lineTo(-10, -12);
+            ctx.lineTo(-4, 0);
+            ctx.lineTo(-10, 12);
+            ctx.closePath();
+            ctx.fill();
+            ctx.shadowBlur = 0;
+            ctx.rotate(-angle);
+            ctx.fillStyle = '#fff7ed';
+            ctx.font = '800 11px "Chakra Petch"';
+            ctx.textAlign = 'center';
+            ctx.fillText(`LAST INFECTED  ${Math.round(Math.hypot(dx, dy) / 10)}m`, 0, -22);
+            ctx.restore();
+        },
+
         updateLocalDayNight: function () {
             if (this.multiplayer?.serverAuthoritative) return;
             const now = performance.now();
@@ -1041,11 +1140,11 @@
             const x = this.player.x + Math.cos(angle) * range;
             const y = this.player.y + Math.sin(angle) * range;
             this.lootBeacon = { x, y, expiresAt: now + 90000 };
-            const types = ['money', 'ammo', 'wood', 'metal', 'medkit'];
-            for (let i = 0; i < 5; i++) {
+            const types = ['ammo', 'wood', 'metal'];
+            for (let i = 0; i < 3; i++) {
                 this.drops.push({ x: x + Math.random() * 50 - 25, y: y + Math.random() * 50 - 25, type: types[i], life: 1800 });
             }
-            this.nextLocalWorldDropAt = now + 60000 + Math.random() * 30000;
+            this.nextLocalWorldDropAt = now + 90000 + Math.random() * 50000;
         },
 
         toggleWorldDoor: function (structureId) {
@@ -3121,27 +3220,32 @@
             const nextLevel = content.workbenchLevels[bench.workbenchLevel];
             workbenchTitle.textContent = `WORKBENCH LEVEL ${bench.workbenchLevel}`;
             this.workbenchTab ||= 'turrets';
+            const nextTechCost = this.techTier < 3 ? { money: 1800 * this.techTier, wood: 25 * this.techTier, metal: 30 * this.techTier, parts: this.techTier } : null;
 
             const nextLevelButton = nextLevel ? (() => {
                 const techReady = this.techTier >= nextLevel.level;
                 const canAfford = techReady && hasCost(this.player, nextLevel.cost);
+                if (!techReady) return `
+                    <button class="bench-action locked" onclick="game.setWorkbenchTab('tech')">
+                        <span>Unlock Tech ${roman(nextLevel.level)} First</span><small>Open Tech Counter</small>
+                    </button>`;
                 return `
-                    <button class="btn ${canAfford ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.upgradeWorkbench()">
-                        Upgrade Bench<br><small>${techReady ? costLabel(nextLevel.cost) : `Requires Tech ${roman(nextLevel.level)}`}</small>
+                    <button class="bench-action ${canAfford ? 'ready' : ''}" ${canAfford ? '' : 'disabled'} onclick="game.upgradeWorkbench()">
+                        <span>Upgrade to Bench ${nextLevel.level}</span><small>${costLabel(nextLevel.cost)}</small>
                     </button>`;
             })() : '<span class="bench-maxed">MAX BENCH</span>';
 
             const tabButtons = [
-                ['turrets', 'Turrets'],
-                ['walls', 'Walls'],
-                ['traps', 'Traps'],
-                ['ammo', 'Ammo'],
-                ['repairs', 'Repairs'],
-                ['tech', 'Tech'],
-                ['skills', 'Skills'],
-                ['buildings', 'Buildings']
-            ].map(([id, label]) => `
-                <button class="workbench-tab ${this.workbenchTab === id ? 'active' : ''}" onclick="game.setWorkbenchTab('${id}')">${label}</button>
+                ['turrets', '01', 'Turrets', 'Build and tune'],
+                ['walls', '02', 'Walls', 'Defense tiers'],
+                ['traps', '03', 'Traps', 'Area control'],
+                ['buildings', '04', 'Buildings', 'Store stations'],
+                ['ammo', '05', 'Ammo', 'Restock'],
+                ['repairs', '06', 'Repairs', 'Restore defenses'],
+                ['tech', '07', 'Tech', 'Unlock tiers'],
+                ['skills', '08', 'Skills', 'Spend points']
+            ].map(([id, number, label, detail]) => `
+                <button class="workbench-tab ${this.workbenchTab === id ? 'active' : ''}" onclick="game.setWorkbenchTab('${id}')"><b>${number}</b><span>${label}<small>${detail}</small></span></button>
             `).join('');
 
             const turretCraftHtml = this.sentryTypes
@@ -3253,7 +3357,6 @@
                     </article>`;
             }).join('');
 
-            const nextTechCost = this.techTier < 3 ? { money: 1800 * this.techTier, wood: 25 * this.techTier, metal: 30 * this.techTier, parts: this.techTier } : null;
             const techHtml = `
                 <article class="workbench-item workbench-upgrade">
                     <span class="window-kicker">TECH TIER</span>
@@ -3324,13 +3427,21 @@
             };
 
             workbenchContent.innerHTML = `
-                <div class="workbench-console">
-                    <div>
-                        <span class="window-kicker">CURRENT BENCH</span>
-                        <h3>${levelDefinition.name}</h3>
-                        <p>Tech ${roman(this.techTier)} unlocked / Bench Level ${bench.workbenchLevel} / ${Math.ceil(bench.health)} HP</p>
+                <div class="bench-progression">
+                    <div class="bench-stage current">
+                        <span class="bench-stage-number">01</span>
+                        <div><span class="window-kicker">CURRENT BENCH</span><h3>${levelDefinition.name}</h3><p>Level ${bench.workbenchLevel} / ${Math.ceil(bench.health)} HP</p></div>
                     </div>
-                    ${nextLevelButton}
+                    <div class="bench-progress-arrow">THEN</div>
+                    <div class="bench-stage ${nextLevel && this.techTier < nextLevel.level ? 'required' : 'complete'}">
+                        <span class="bench-stage-number">02</span>
+                        <div><span class="window-kicker">TECH GATE</span><h3>Store Tech ${roman(this.techTier)}</h3><p>${nextLevel ? `Bench ${nextLevel.level} requires Tech ${roman(nextLevel.level)}` : 'All bench tiers unlocked'}</p></div>
+                    </div>
+                    <div class="bench-progress-arrow">THEN</div>
+                    <div class="bench-stage action-stage">
+                        <span class="bench-stage-number">03</span>
+                        <div class="bench-stage-action"><span class="window-kicker">NEXT ACTION</span>${nextLevelButton}</div>
+                    </div>
                 </div>
                 <div class="workbench-tabs">${tabButtons}</div>
                 <div class="workbench-layout single">
