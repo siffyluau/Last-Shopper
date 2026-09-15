@@ -9,6 +9,8 @@ const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
 const TICK_MS = 25;
 const SNAPSHOT_MS = 50;
+const DAY_CYCLE_MS = 8 * 60 * 1000;
+const REVIVE_DURATION_MS = 2500;
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -215,6 +217,9 @@ function createWorld(seed) {
     lootBeacon: null,
     nextWorldDropAt: nowMs() + 18000,
     serverTime: nowMs(),
+    cycleStartedAt: nowMs(),
+    dayTime: 0.34,
+    dayNumber: 1,
     gameStarted: false,
     wave: 0,
     waveActive: false,
@@ -399,7 +404,7 @@ function startBossPreparation(room, seconds = 35) {
 function spawnZombie(room) {
   const world = room.latestWorld;
   const activePlayers = [...room.players.values()].filter((player) =>
-    Number.isFinite(player.x) && Number.isFinite(player.y) && nowMs() - player.lastSeen < 5000);
+    Number.isFinite(player.x) && Number.isFinite(player.y) && !player.downed && nowMs() - player.lastSeen < 5000);
   const anchor = activePlayers[Math.floor(Math.random() * activePlayers.length)] || { x: 1100, y: 720 };
   let spawnX = anchor.x;
   let spawnY = anchor.y;
@@ -454,7 +459,7 @@ function spawnZombie(room) {
 function getTargets(room, zombie, includeStructures = true) {
   const world = room.latestWorld;
   const playerTargets = [...room.players.values()]
-    .filter((player) => nowMs() - player.lastSeen < 5000 && (player.health ?? 100) > 0)
+    .filter((player) => nowMs() - player.lastSeen < 5000 && !player.downed && (player.health ?? 100) > 0)
     .map((player) => ({ entity: player, x: player.x, y: player.y, radius: 12, kind: 'player' }));
   const structureTargets = [];
   if (includeStructures) {
@@ -819,13 +824,13 @@ function updateZombies(room, dt) {
       } else if (!breachPlan && targetDist <= z.size + target.radius) {
         if (z.isBomber) {
           if (target.kind === 'structure') target.entity.health -= z.explosionDamage;
-          else target.entity.health = Math.max(0, (target.entity.health || 100) - z.explosionDamage * 0.35);
+          else if (now >= (target.entity.invulnerableUntil || 0)) target.entity.health = Math.max(0, (target.entity.health || 100) - z.explosionDamage * 0.35);
           z.health = 0;
         } else if (now - (z.lastMelee || 0) > (z.attackRate || 700)) {
           z.lastMelee = now;
           const amount = (z.contactDamage || 8) * (z.damageScale || 1);
           if (target.kind === 'structure') target.entity.health -= amount;
-          else target.entity.health = Math.max(0, (target.entity.health || 100) - amount);
+          else if (now >= (target.entity.invulnerableUntil || 0)) target.entity.health = Math.max(0, (target.entity.health || 100) - amount);
           if (z.isLeech) z.health = Math.min(z.maxHealth, z.health + (z.leechAmount || 6));
           if (target.entity.isElectric) damageZombie(z, target.entity.shockDamage || 20);
         }
@@ -967,7 +972,7 @@ function updateBullets(room, dt) {
           if (distance(b.x, b.y, player.x, player.y) < 12) {
             const sheltered = (world.mapStructures || []).some((structure) =>
               WorldMap.pointInside(structure, player.x, player.y, 2));
-            if (!sheltered) player.health = Math.max(0, (player.health || 100) - b.damage);
+            if (!sheltered && now >= (player.invulnerableUntil || 0)) player.health = Math.max(0, (player.health || 100) - b.damage);
             hit = true;
             break;
           }
@@ -1211,15 +1216,61 @@ function updateWaveState(room) {
   }
 }
 
+function revivePlayer(player, healthPercent = 0.45) {
+  player.health = Math.max(1, Math.ceil((player.maxHealth || 100) * healthPercent));
+  player.downed = false;
+  player.downedAt = 0;
+  player.respawnAt = 0;
+  player.giveUpAt = 0;
+  player.reviveProgress = 0;
+  player.reviverId = null;
+  player.lastReviveTick = 0;
+  player.invulnerableUntil = nowMs() + 2200;
+}
+
+function updatePlayerLifeStates(room, now) {
+  const activeCount = [...room.players.values()].filter((player) => !player.downed && (player.health ?? 100) > 0).length;
+  for (const player of room.players.values()) {
+    if ((player.health ?? 100) <= 0 && !player.downed) {
+      player.health = 0;
+      player.downed = true;
+      player.downedAt = now;
+      player.respawnAt = now + (room.players.size > 1 ? 15000 : 6000);
+      player.giveUpAt = now + (room.players.size > 1 ? 5000 : 3000);
+      player.reviveProgress = 0;
+      player.reviverId = null;
+      player.lastReviveTick = 0;
+    }
+    if (!player.downed) continue;
+    if (player.lastReviveTick && now - player.lastReviveTick > 420) {
+      player.reviveProgress = Math.max(0, (player.reviveProgress || 0) - 180);
+      if (player.reviveProgress === 0) player.reviverId = null;
+    }
+    if (now >= player.respawnAt || (activeCount === 0 && now - player.downedAt >= 6000)) {
+      player.x = 980;
+      player.y = 850;
+      revivePlayer(player, 0.45);
+    }
+  }
+}
+
+function updateDayNight(world, now) {
+  const elapsed = Math.max(0, now - (world.cycleStartedAt || now));
+  world.dayNumber = 1 + Math.floor(elapsed / DAY_CYCLE_MS);
+  world.dayTime = (0.34 + (elapsed % DAY_CYCLE_MS) / DAY_CYCLE_MS) % 1;
+}
+
 function tickRoom(room) {
   const now = nowMs();
   const dt = Math.min(200, Math.max(1, now - room.lastTick));
   room.lastTick = now;
   room.latestWorld.serverTime = now;
+  updateDayNight(room.latestWorld, now);
 
   for (const [id, player] of room.players) {
     if (now - player.lastSeen > 15000) room.players.delete(id);
   }
+  updatePlayerLifeStates(room, now);
 
   ensureWorldChunks(room);
   if (now >= room.latestWorld.nextWorldDropAt) spawnWorldDrop(room);
@@ -1284,6 +1335,27 @@ function handleAction(room, packet) {
   }
   if (action.kind === 'shot' && action.player && action.weapon) {
     spawnRemoteShot(room, action.player, action.weapon);
+    return;
+  }
+  if (action.kind === 'revive') {
+    const reviver = room.players.get(packet.id);
+    const target = room.players.get(String(action.targetId || ''));
+    const now = nowMs();
+    if (!reviver || !target || reviver.downed || !target.downed) return;
+    if (distance(reviver.x, reviver.y, target.x, target.y) > 82) return;
+    const continued = target.reviverId === packet.id && target.lastReviveTick && now - target.lastReviveTick <= 420;
+    target.reviverId = packet.id;
+    target.reviveProgress = (continued ? target.reviveProgress || 0 : 0) + Math.min(180, Math.max(90, now - (target.lastReviveTick || now - 110)));
+    target.lastReviveTick = now;
+    if (target.reviveProgress >= REVIVE_DURATION_MS) revivePlayer(target, 0.5);
+    return;
+  }
+  if (action.kind === 'requestRespawn') {
+    const player = room.players.get(packet.id);
+    if (!player || !player.downed || nowMs() < (player.giveUpAt || player.respawnAt)) return;
+    player.x = 980;
+    player.y = 850;
+    revivePlayer(player, 0.45);
     return;
   }
   if (action.kind === 'toggleDoor') {
@@ -1377,6 +1449,14 @@ wss.on('connection', (ws, req, room) => {
         ...packet.state,
         health: previous.health ?? packet.state.health ?? 100,
         maxHealth: packet.state.maxHealth ?? previous.maxHealth ?? 100,
+        downed: Boolean(previous.downed),
+        downedAt: previous.downedAt || 0,
+        respawnAt: previous.respawnAt || 0,
+        giveUpAt: previous.giveUpAt || 0,
+        reviveProgress: previous.reviveProgress || 0,
+        reviverId: previous.reviverId || null,
+        lastReviveTick: previous.lastReviveTick || 0,
+        invulnerableUntil: previous.invulnerableUntil || 0,
         lastSeen: nowMs()
       });
       broadcast(room, packet, ws);

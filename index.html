@@ -211,6 +211,25 @@
             </div>
 
             <div id="wave-status-toast" class="wave-status-toast hidden">WAVE CLEARED</div>
+
+            <div class="session-controls pointer-events-auto">
+                <span id="world-clock" class="world-clock">DAY 1 / 08:00</span>
+                <button id="leave-run-button" class="hud-action danger">LEAVE RUN</button>
+            </div>
+        </div>
+
+        <div id="downed-overlay" class="downed-overlay hidden">
+            <div class="downed-card">
+                <span class="window-kicker">SURVIVOR DOWN</span>
+                <h2>DON'T CLOCK OUT YET</h2>
+                <p id="downed-status">A teammate can hold [E] near you to revive.</p>
+                <div class="revive-meter"><div id="revive-progress"></div></div>
+                <p id="downed-respawn-text">Emergency recovery available soon.</p>
+                <div class="downed-actions">
+                    <button id="respawn-button" class="btn btn-primary" disabled>Respawn at Shop</button>
+                    <button id="downed-leave-button" class="btn btn-secondary">Leave Run</button>
+                </div>
+            </div>
         </div>
 
         <!-- Wave Reward / Upgrade Cards -->
@@ -251,12 +270,12 @@
 
         <!-- Shop Modal -->
         <div id="shop-modal" class="game-overlay hidden items-center justify-center">
-            <div class="game-window max-w-3xl">
+            <div class="game-window station-window shop-window">
                 <div class="station-header">
                     <div><span class="window-kicker">SALVAGED RETAIL COUNTER</span><h2>WEAPON SHOP</h2></div>
                     <button class="window-close" onclick="game.closeShop()">&times; CLOSE (ESC)</button>
                 </div>
-                <div id="shop-content" class="p-6 space-y-3 modal-content max-h-[60vh] overflow-y-auto">
+                <div id="shop-content" class="station-content modal-content">
                     <!-- Shop items will be injected here -->
                 </div>
             </div>
@@ -277,7 +296,7 @@
 
         <!-- Workbench Modal -->
         <div id="workbench-modal" class="game-overlay hidden items-center justify-center">
-            <div class="game-window max-w-4xl">
+            <div class="game-window station-window workbench-window">
                 <div class="station-header">
                     <div>
                         <span class="window-kicker">DEFENSE ENGINEERING</span>
@@ -285,7 +304,7 @@
                     </div>
                     <button class="window-close" onclick="game.closeWorkbench()">&times; CLOSE (E or ESC)</button>
                 </div>
-                <div id="workbench-content" class="p-6 modal-content max-h-[60vh] overflow-y-auto">
+                <div id="workbench-content" class="station-content modal-content">
                     <!-- Workbench items will be injected here -->
                 </div>
             </div>
@@ -323,6 +342,7 @@
 
 
     <script src="systems/world.js"></script>
+    <script src="systems/audio.js"></script>
     <script src="systems/content.js"></script>
     <script src="systems/progression.js"></script>
     <script src="systems/multiplayer.js"></script>

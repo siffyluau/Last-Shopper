@@ -55,6 +55,9 @@
     }
 
     Object.assign(game, {
+        playSfx: function (name) {
+            this.audio?.play(name);
+        },
         loadMetaProgression: function () {
             try {
                 const stored = JSON.parse(localStorage.getItem('lastShopperMeta') || '{}');
@@ -129,6 +132,7 @@
 
         isInputBlocked: function () {
             return Boolean(
+                this.player.downed ||
                 this.waitingForReward ||
                 this.craftingOpen ||
                 this.shopOpen ||
@@ -229,6 +233,7 @@
                 localId: this.localPlayerId,
                 getState: () => this.getMultiplayerState(),
                 onPeers: (peers) => {
+                    if (this.gameStarted && this.multiplayer?.serverAuthoritative) return;
                     this.remotePlayers = peers;
                     this.team.playerCount = 1 + peers.length;
                     this.updatePartyList();
@@ -287,7 +292,6 @@
 
         syncMultiplayer: function () {
             if (!this.multiplayer || !this.gameStarted) return;
-            this.multiplayer.sendState();
             if (this.isWorldHost()) {
                 const now = performance.now();
                 if (!this.lastWorldSync || now - this.lastWorldSync > 120) {
@@ -311,6 +315,7 @@
                 angle: this.player.angle,
                 health: this.player.health,
                 maxHealth: this.player.maxHealth,
+                downed: Boolean(this.player.downed),
                 wave: this.wave,
                 level: this.player.level,
                 weapons: this.weapons.map((weapon) => ({
@@ -398,11 +403,15 @@
             };
             smooth(this.zombies, 0.34);
             smooth(this.bullets, 0.58);
+            smooth(this.remotePlayers, 0.42);
         },
 
         applyWorldSnapshot: function (world) {
             if (!world || this.isWorldHost()) return;
+            const wasDowned = Boolean(this.player.downed);
             this.serverTime = world.serverTime || this.serverTime;
+            this.dayTime = Number.isFinite(world.dayTime) ? world.dayTime : this.dayTime;
+            this.dayNumber = world.dayNumber || this.dayNumber;
             if (world.gameStarted && !this.gameStarted) {
                 this.setMultiplayerStatus(world.wave > 0 ? 'Joining active game...' : 'Host starting game...', 'online');
                 this.enterGameFromLobby();
@@ -447,13 +456,184 @@
                 if (localServerPlayer) {
                     this.player.health = localServerPlayer.health ?? this.player.health;
                     this.player.maxHealth = localServerPlayer.maxHealth ?? this.player.maxHealth;
+                    this.player.downed = Boolean(localServerPlayer.downed);
+                    this.player.downedAt = localServerPlayer.downedAt || 0;
+                    this.player.respawnAt = localServerPlayer.respawnAt || 0;
+                    this.player.giveUpAt = localServerPlayer.giveUpAt || 0;
+                    this.player.reviveProgress = localServerPlayer.reviveProgress || 0;
+                    this.player.reviverId = localServerPlayer.reviverId || null;
                 }
-                this.remotePlayers = world.players
-                    .filter((player) => player.id !== this.localPlayerId)
-                    .map((player) => ({ ...player, lastSeen: performance.now() }));
+                this.remotePlayers = this.mergeNetworkEntities(
+                    this.remotePlayers,
+                    world.players.filter((player) => player.id !== this.localPlayerId)
+                ).map((player) => ({ ...player, lastSeen: performance.now() }));
                 this.team.playerCount = Math.max(1, world.players.length);
-                this.updatePartyList();
+                const partySignature = world.players.map((player) => `${player.id}:${player.name}:${player.health}:${player.downed}`).join('|');
+                if (partySignature !== this.lastPartySignature) {
+                    this.lastPartySignature = partySignature;
+                    this.updatePartyList();
+                }
             }
+            this.updateDownedUi();
+            if (!wasDowned && this.player.downed) this.playSfx?.('downed');
+            if (wasDowned && !this.player.downed) this.playSfx?.('revive');
+        },
+
+        getNearbyDownedTeammate: function () {
+            let nearest = null;
+            for (const teammate of this.remotePlayers || []) {
+                if (!teammate.downed) continue;
+                const distance = this.dist(this.player.x, this.player.y, teammate.x, teammate.y);
+                if (distance <= 78 && (!nearest || distance < nearest.distance)) nearest = { ...teammate, distance };
+            }
+            return nearest;
+        },
+
+        requestReviveTick: function (targetId) {
+            if (!targetId || this.player.downed || !this.multiplayer?.roomCode) return;
+            const now = performance.now();
+            if (now - (this.lastReviveRequest || 0) < 110) return;
+            this.lastReviveRequest = now;
+            this.multiplayer.sendAction({ kind: 'revive', targetId });
+        },
+
+        updateRevival: function () {
+            if (this.player.downed) {
+                this.keys = {};
+                this.mouse.isDown = false;
+                this.updateDownedUi();
+                if (!this.multiplayer?.serverAuthoritative && this.player.respawnAt && Date.now() >= this.player.respawnAt) {
+                    this.reviveLocalPlayer();
+                }
+                return;
+            }
+            const teammate = this.getNearbyDownedTeammate();
+            if (teammate && this.keys.e) this.requestReviveTick(teammate.id);
+        },
+
+        updateDownedUi: function () {
+            if (!this.player.downed) {
+                downedOverlay.classList.add('hidden');
+                downedOverlay.classList.remove('flex');
+                return;
+            }
+            const seconds = Math.max(0, Math.ceil(((this.player.giveUpAt || this.player.respawnAt || Date.now()) - Date.now()) / 1000));
+            const progress = Math.min(100, ((this.player.reviveProgress || 0) / 2500) * 100);
+            downedStatus.textContent = this.player.reviverId
+                ? 'A teammate is pulling you back up. Stay with them.'
+                : 'A teammate can hold [E] beside you to revive.';
+            reviveProgress.style.width = `${progress}%`;
+            downedRespawnText.textContent = seconds > 0
+                ? `Emergency shop recovery available in ${seconds}s.`
+                : 'Emergency recovery is ready.';
+            respawnButton.disabled = seconds > 0;
+            downedOverlay.classList.remove('hidden');
+            downedOverlay.classList.add('flex');
+        },
+
+        enterLocalDownedState: function () {
+            if (this.player.downed) return;
+            this.player.health = 0;
+            this.player.downed = true;
+            this.player.downedAt = Date.now();
+            this.player.respawnAt = Date.now() + 6000;
+            this.player.reviveProgress = 0;
+            this.updateDownedUi();
+            if (this.playSfx) this.playSfx('downed');
+        },
+
+        reviveLocalPlayer: function () {
+            this.player.health = Math.max(45, Math.ceil(this.player.maxHealth * 0.45));
+            this.player.downed = false;
+            this.player.downedAt = 0;
+            this.player.respawnAt = 0;
+            this.player.reviveProgress = 0;
+            this.player.x = this.shop.interactionX;
+            this.player.y = this.shop.interactionY + 70;
+            this.updateDownedUi();
+            if (this.playSfx) this.playSfx('revive');
+        },
+
+        requestRespawn: function () {
+            if (!this.player.downed) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'requestRespawn' });
+            } else {
+                this.reviveLocalPlayer();
+            }
+        },
+
+        leaveToLobby: function () {
+            this.gameStarted = false;
+            this.gameOver = false;
+            this.roomStarted = false;
+            this.keys = {};
+            this.mouse.isDown = false;
+            this.cancelPlacing?.();
+            this.toggleCrafting(false);
+            this.toggleShop(false);
+            this.toggleWorkbench(false);
+            this.toggleSkills(false);
+            this.toggleTrader(false);
+            this.toggleBuilding(false);
+            this.multiplayer?.disconnect();
+            this.resetGame();
+            downedOverlay.classList.add('hidden');
+            downedOverlay.classList.remove('flex');
+            gameOverModal.classList.add('hidden');
+            gameOverModal.classList.remove('flex');
+            gameContainer.classList.add('hidden');
+            lobbyScreen.classList.remove('hidden');
+            this.setMultiplayerStatus('LOCAL READY', 'offline');
+            this.updatePartyList();
+        },
+
+        drawDayNight: function () {
+            const time = Number.isFinite(this.dayTime) ? this.dayTime : 0.34;
+            const daylight = Math.max(0, Math.sin((time - 0.25) * Math.PI * 2));
+            const darkness = Math.min(0.68, (1 - daylight) * 0.68);
+            if (darkness > 0.03) {
+                const dusk = Math.abs(time - 0.25) < 0.08 || Math.abs(time - 0.75) < 0.08;
+                ctx.save();
+                ctx.fillStyle = dusk
+                    ? `rgba(48,24,30,${darkness * 0.72})`
+                    : `rgba(4,10,24,${darkness})`;
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                const addLight = (x, y, radius, color) => {
+                    const screenX = x - this.camera.x;
+                    const screenY = y - this.camera.y;
+                    const glow = ctx.createRadialGradient(screenX, screenY, 0, screenX, screenY, radius);
+                    glow.addColorStop(0, color);
+                    glow.addColorStop(0.35, color.replace(/[^,]+\)$/, '0.12)'));
+                    glow.addColorStop(1, 'rgba(0,0,0,0)');
+                    ctx.globalCompositeOperation = 'lighter';
+                    ctx.fillStyle = glow;
+                    ctx.beginPath();
+                    ctx.arc(screenX, screenY, radius, 0, Math.PI * 2);
+                    ctx.fill();
+                };
+                addLight(this.player.x, this.player.y, 150, 'rgba(255,232,170,0.30)');
+                addLight(this.shop.x, this.shop.y + 30, 260, 'rgba(255,154,55,0.22)');
+                for (const sentry of this.sentries || []) addLight(sentry.x, sentry.y, 80, 'rgba(255,120,45,0.12)');
+                ctx.restore();
+            }
+            if (worldClock) {
+                const totalMinutes = Math.floor(time * 24 * 60);
+                const hour = String(Math.floor(totalMinutes / 60) % 24).padStart(2, '0');
+                const minute = String(totalMinutes % 60).padStart(2, '0');
+                worldClock.textContent = `DAY ${this.dayNumber || 1} / ${hour}:${minute}`;
+            }
+        },
+
+        updateLocalDayNight: function () {
+            if (this.multiplayer?.serverAuthoritative) return;
+            const now = performance.now();
+            if (!this.lastDayNightTick) this.lastDayNightTick = now;
+            const elapsed = Math.min(100, now - this.lastDayNightTick);
+            this.lastDayNightTick = now;
+            this.dayTime = (this.dayTime + elapsed / 480000) % 1;
+            if (this.dayTime < (this.previousDayTime || this.dayTime)) this.dayNumber = (this.dayNumber || 1) + 1;
+            this.previousDayTime = this.dayTime;
         },
 
         applyLootEvents: function (events) {
@@ -2885,6 +3065,7 @@
         toggleWorkbench: function (isOpen) {
             this.workbenchOpen = isOpen;
             this.mouse.isDown = false;
+            this.playSfx?.('menu');
             if (isOpen) {
                 this.activeWorkbench = this.getActiveWorkbench();
                 if (!this.activeWorkbench) {
@@ -3373,6 +3554,7 @@
                 collection.push(entity);
             }
             this.recordBuild();
+            this.playSfx?.('build');
             if (this.broadcastBuildAction) this.broadcastBuildAction(kind, entity);
         },
 

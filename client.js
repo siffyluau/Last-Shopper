@@ -89,6 +89,14 @@
         const zombieIndexSearch = document.getElementById('zombie-index-search');
         const zombieIndexTabs = document.getElementById('zombie-index-tabs');
         const zombieIndexContent = document.getElementById('zombie-index-content');
+        const leaveRunButton = document.getElementById('leave-run-button');
+        const downedOverlay = document.getElementById('downed-overlay');
+        const downedStatus = document.getElementById('downed-status');
+        const downedRespawnText = document.getElementById('downed-respawn-text');
+        const reviveProgress = document.getElementById('revive-progress');
+        const respawnButton = document.getElementById('respawn-button');
+        const downedLeaveButton = document.getElementById('downed-leave-button');
+        const worldClock = document.getElementById('world-clock');
         const progression = new ProgressionSystem(LastShopperContent);
 
         // --- Game State Object ---
@@ -120,6 +128,8 @@
             waveActive: false,
             gameStarted: false,
             gameOver: false,
+            dayTime: 0.34,
+            dayNumber: 1,
             
             bossesToSpawn: 0,
             miniBossesToSpawn: 0,
@@ -187,6 +197,11 @@
                 xp: 0,
                 xpToNext: progression.xpToNext(1),
                 skillPoints: 0,
+                downed: false,
+                downedAt: 0,
+                respawnAt: 0,
+                giveUpAt: 0,
+                reviveProgress: 0,
                 skillLevels: {
                     maxHealth: 0,
                     moveSpeed: 0,
@@ -324,6 +339,10 @@
             // --- Game Functions ---
             
             init: function() {
+                this.audio = window.LastShopperAudio ? new LastShopperAudio() : null;
+                const unlockAudio = () => this.audio?.unlock();
+                window.addEventListener('pointerdown', unlockAudio, { once: true });
+                window.addEventListener('keydown', unlockAudio, { once: true });
                 this.loadMetaProgression();
                 this.setupLobby();
                 this.setupMultiplayer();
@@ -372,8 +391,11 @@
                         this.reloadWeapon();
                     } else if (e.key.toLowerCase() === 'e') {
                         if (!this.craftingOpen && !this.skillsOpen) {
+                            const teammate = this.getNearbyDownedTeammate ? this.getNearbyDownedTeammate() : null;
                             const station = this.getNearbyStation ? this.getNearbyStation() : null;
-                            if (station === 'workbench' && !this.shopOpen) {
+                            if (teammate) {
+                                this.requestReviveTick(teammate.id);
+                            } else if (station === 'workbench' && !this.shopOpen) {
                                 this.toggleWorkbench(!this.workbenchOpen);
                             } else if (station === 'shop' && !this.workbenchOpen) {
                                 this.toggleShop(!this.shopOpen);
@@ -469,6 +491,9 @@
 
                 skillMenuButton.onclick = () => this.toggleSkills(true);
                 waveContinueButton.onclick = () => this.continueAfterReward();
+                leaveRunButton.onclick = () => this.leaveToLobby();
+                downedLeaveButton.onclick = () => this.leaveToLobby();
+                respawnButton.onclick = () => this.requestRespawn();
                 
                 // Finish loading
                 setTimeout(() => {
@@ -583,6 +608,7 @@
                     name: this.metaProgression.playerName || 'The Shopper',
                     skinId: this.selectedSkinId || 'shopper',
                     level: 1, xp: 0, xpToNext: progression.xpToNext(1), skillPoints: 0,
+                    downed: false, downedAt: 0, respawnAt: 0, giveUpAt: 0, reviveProgress: 0, reviverId: null,
                     skillLevels: {
                         maxHealth: 0, moveSpeed: 0, reloadSpeed: 0,
                         bulletDamage: 0, pickupRange: 0, resourceMultiplier: 0
@@ -614,7 +640,7 @@
             },
             
             gameLoop: function(timestamp) {
-                if (this.gameOver) return;
+                if (this.gameOver || !this.gameStarted) return;
                 
                 this.update();
                 this.draw();
@@ -628,13 +654,15 @@
             update: function() {
                 this.updatePotions();
                 this.updatePreparationEvent();
+                if (this.updateLocalDayNight) this.updateLocalDayNight();
+                if (this.updateRevival) this.updateRevival();
                 if (this.updateMouseWorld) this.updateMouseWorld();
                 const inputBlocked = this.isInputBlocked ? this.isInputBlocked() : false;
                 if (inputBlocked) {
                     this.mouse.isDown = false;
                     this.keys = {};
                 }
-                if (!inputBlocked) this.updatePlayer();
+                if (!inputBlocked && !this.player.downed) this.updatePlayer();
                 if (this.syncMultiplayer) this.syncMultiplayer();
                 if (!this.isWorldHost || this.isWorldHost()) {
                     if (this.ensureLocalWorldChunks) this.ensureLocalWorldChunks();
@@ -655,10 +683,18 @@
                 this.updateParticles();
                 this.updateCamera();
                 if (this.updateMouseWorld) this.updateMouseWorld();
-                this.updateHUD();
+                const now = performance.now();
+                if (!this.lastHudUpdate || now - this.lastHudUpdate >= 80) {
+                    this.lastHudUpdate = now;
+                    this.updateHUD();
+                }
                 
                 if (this.player.health <= 0 && !this.gameOver) {
-                    this.triggerGameOver();
+                    if (this.multiplayer?.serverAuthoritative) {
+                        this.player.downed = true;
+                    } else if (this.enterLocalDownedState) {
+                        this.enterLocalDownedState();
+                    }
                 }
             },
             
@@ -1407,6 +1443,7 @@
                 if (this.placingBuilding && this.drawBuildingPreview) this.drawBuildingPreview();
                 
                 ctx.restore();
+                if (this.drawDayNight) this.drawDayNight();
             },
 
             drawMap: function() {
@@ -1812,6 +1849,7 @@
                 if (now - this.lastShot < fireRate) return;
                 
                 this.lastShot = now;
+                this.playSfx?.('shoot');
                 if (!(this.activePotions.infiniteAmmo > performance.now())) {
                     weapon.currentAmmo--;
                 }
@@ -1870,6 +1908,7 @@
                 const weapon = this.weapons[this.selectedWeapon];
                 if (!weapon || weapon.isReloading || weapon.currentAmmo === weapon.maxAmmo) return;
                 const reloadDuration = weapon.reloadTime * Math.pow(0.92, this.player.skillLevels.reloadSpeed);
+                this.playSfx?.('reload');
                 
                 if (weapon.ammoCost) {
                     if (this.player.reserveAmmo < weapon.ammoCost) return;
@@ -1920,22 +1959,23 @@
                 this.weapons.forEach((w, i) => {
                     const canAfford = this.player.money >= w.cost;
                     const item = document.createElement('div');
-                    item.className = `p-4 rounded-lg flex items-center justify-between ${w.owned ? 'bg-gray-700' : 'bg-gray-800 border border-gray-700'}`;
+                    item.className = `shop-weapon-card ${w.owned ? 'owned' : ''}`;
                     item.innerHTML = `
-                        <div>
-                            <h3 class="text-xl font-bold ${w.owned ? 'text-green-400' : 'text-white'}">${w.name}</h3>
-                            <p class="text-sm text-gray-400">
-                                Damage: ${w.damage}${w.pellets ? ' x' + w.pellets : ''} | 
-                                Rate: ${w.fireRate}ms | 
-                                Ammo: ${w.maxAmmo} |
-                                Reload: ${w.reloadTime/1000}s
-                                ${w.explosive ? ' | <span class="font-bold text-red-500">EXPLOSIVE</span>' : ''}
-                            </p>
+                        <div class="weapon-silhouette"><span>${i + 1}</span><i></i></div>
+                        <div class="shop-weapon-copy">
+                            <span class="window-kicker">${w.explosive ? 'HEAVY ORDNANCE' : i < 2 ? 'AISLE SECURITY' : 'SURVIVOR ARMORY'}</span>
+                            <h3>${w.name}</h3>
+                            <div class="weapon-stat-strip">
+                                <span>DMG <b>${w.damage}${w.pellets ? ' x' + w.pellets : ''}</b></span>
+                                <span>CYCLING <b>${w.fireRate}ms</b></span>
+                                <span>MAG <b>${w.maxAmmo}</b></span>
+                                <span>RELOAD <b>${w.reloadTime/1000}s</b></span>
+                            </div>
                         </div>
                         ${w.owned ? 
-                            '<span class="text-2xl font-bold text-green-500">OWNED</span>' :
+                            '<span class="stock-stamp">IN LOCKER</span>' :
                             `<button class="btn ${canAfford ? 'btn-success' : 'btn-danger opacity-50'}" ${!canAfford ? 'disabled' : ''} onclick="game.buyWeapon(${i})">
-                                BUY ($${w.cost})
+                                CLAIM<br><small>$${w.cost}</small>
                             </button>`
                         }
                     `;
@@ -1954,6 +1994,7 @@
                 if (weapon.owned || this.player.money < weapon.cost) return;
                 
                 this.player.money -= weapon.cost;
+                this.playSfx?.('buy');
                 weapon.owned = true;
                 weapon.currentAmmo = weapon.maxAmmo;
                 
@@ -1973,6 +2014,7 @@
                     return;
                 }
                 this.shopOpen = isOpen;
+                this.playSfx?.('menu');
                 if (isOpen) {
                     this.populateShop();
                     shopModal.classList.remove('hidden');
