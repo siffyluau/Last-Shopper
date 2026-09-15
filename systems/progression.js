@@ -27,7 +27,7 @@
                 damageScale,
                 rewardScale,
                 waveReward: {
-                    money: Math.floor(48 * Math.pow(wave, 1.15)),
+                    money: Math.floor(28 * Math.pow(wave, 1.12)),
                     wood: Math.max(2, Math.floor(1 + wave * 0.55)),
                     metal: Math.max(1, Math.floor(wave * 0.36))
                 }
@@ -58,6 +58,7 @@
             if (wave >= 11) pool.push('engineer', 'splitter');
             if (wave >= 12) pool.push('charger', 'leech');
             if (wave >= 14) pool.push('thrower');
+            if (wave >= 15) pool.push('riftWarden');
             if (wave >= 16) pool.push('disruptor');
             if (wave >= 20) pool.push('eliteRunner', 'eliteTank', 'bomber', 'acidRanger');
             return pool;

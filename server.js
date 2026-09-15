@@ -52,6 +52,7 @@ const enemyTypes = {
   leech: { color: [125, 30, 60], speed: 1.28, health: 150, reward: 42, xp: 40, size: 15, isLeech: true, leechAmount: 9, contactDamage: 10 },
   eliteRunner: { color: [255, 105, 70], speed: 2.75, health: 155, reward: 58, xp: 55, size: 14, isEliteVariant: true, contactDamage: 12 },
   eliteTank: { color: [95, 125, 45], speed: 0.78, health: 760, reward: 84, xp: 80, size: 28, armor: 0.2, isEliteVariant: true, contactDamage: 18 },
+  riftWarden: { name: 'Rift Warden', color: [126, 54, 190], speed: 0.82, health: 880, reward: 115, xp: 105, size: 27, armor: 0.12, contactDamage: 15, isDomainWarden: true, domainRange: 480 },
   miniBoss: { color: [175, 45, 115], speed: 0.68, health: 1500, reward: 300, xp: 240, size: 32, armor: 0.18, contactDamage: 20, shootRange: 330, shootRate: 1750, isMiniBoss: true },
   boss: { name: 'Basic Brute', color: [145, 12, 12], speed: 0.55, health: 4200, reward: 900, xp: 650, size: 46, armor: 0.22, contactDamage: 28, shootRange: 440, shootRate: 900, slamRange: 120, slamRate: 4200, isBoss: true },
   burrowKing: { name: 'Burrow King', color: [114, 74, 35], speed: 0.72, health: 4600, reward: 980, xp: 720, size: 44, armor: 0.12, contactDamage: 26, isBoss: true, bossKind: 'burrow', burrowRate: 5600, spawnRate: 4200 },
@@ -65,13 +66,13 @@ const enemyTypes = {
 
 const weaponTypes = {
   pistol: { damage: 35, fireRate: 300, speed: 8, bulletSize: 4 },
-  shotgun: { damage: 12.5, fireRate: 600, speed: 6, pellets: 16, bulletSize: 3 },
-  smg: { damage: 17, fireRate: 78, speed: 10, bulletSize: 3 },
-  rifle: { damage: 29, fireRate: 115, speed: 11, bulletSize: 3 },
-  marksman: { damage: 118, fireRate: 560, speed: 16, bulletSize: 5, pierce: 1 },
-  minigun: { damage: 32, fireRate: 30, speed: 12, bulletSize: 2 },
-  grenadeLauncher: { damage: 300, fireRate: 1250, speed: 6, explosive: true, bulletSize: 7 },
-  rpg: { damage: 760, fireRate: 2100, speed: 5, explosive: true, bulletSize: 8 }
+  shotgun: { damage: 12.5, fireRate: 600, speed: 6, pellets: 16, bulletSize: 3, requiredWave: 2 },
+  smg: { damage: 17, fireRate: 78, speed: 10, bulletSize: 3, requiredWave: 4 },
+  rifle: { damage: 29, fireRate: 115, speed: 11, bulletSize: 3, requiredWave: 6 },
+  marksman: { damage: 118, fireRate: 560, speed: 16, bulletSize: 5, pierce: 1, requiredWave: 9 },
+  minigun: { damage: 32, fireRate: 30, speed: 12, bulletSize: 2, requiredWave: 12 },
+  grenadeLauncher: { damage: 300, fireRate: 1250, speed: 6, explosive: true, bulletSize: 7, requiredWave: 15 },
+  rpg: { damage: 760, fireRate: 2100, speed: 5, explosive: true, bulletSize: 8, requiredWave: 20 }
 };
 
 const rooms = new Map();
@@ -197,6 +198,7 @@ function enemyPool(wave) {
   if (wave >= 11) pool.push('engineer', 'splitter');
   if (wave >= 12) pool.push('charger', 'leech');
   if (wave >= 14) pool.push('thrower');
+  if (wave >= 15) pool.push('riftWarden');
   if (wave >= 16) pool.push('disruptor');
   if (wave >= 20) pool.push('eliteRunner', 'eliteTank', 'bomber', 'acidRanger');
   return pool;
@@ -245,6 +247,7 @@ function createWorld(seed) {
     buildings: [],
     drops: [],
     acidPools: [],
+    domainEvent: null,
     bossDefeats: 0,
     killRewards: [],
     mapRevision: 0,
@@ -366,6 +369,7 @@ function startWave(room) {
   world.nextWaveAt = 0;
   world.preparationActive = false;
   world.preparationEvent = null;
+  world.domainEvent = null;
   world.supplyDrop = null;
   world.trader = null;
   world.techTier = Math.max(world.techTier, Math.min(3, 1 + Math.floor((world.wave - 1) / 10)));
@@ -388,7 +392,7 @@ function startBossPreparation(room, seconds = 35) {
       interactionRadius: 72,
       collected: false,
       rewards: {
-        money: Math.floor(120 * waveScale),
+        money: Math.floor(65 * waveScale),
         wood: Math.ceil(12 * waveScale),
         metal: Math.ceil(9 * waveScale),
         ammo: Math.ceil(70 * waveScale)
@@ -510,6 +514,45 @@ function spawnBossMinion(world, typeKey, x, y, scale = 0.75) {
     lastHeal: 0,
     lastWeld: 0
   });
+}
+
+function startDomainEvent(room, warden, target, now) {
+  const world = room.latestWorld;
+  if (world.domainEvent || !target || target.kind !== 'player') return false;
+  world.domainEvent = {
+    id: `domain-${now}-${Math.random().toString(36).slice(2, 6)}`,
+    casterId: warden.id,
+    targetPlayerId: target.entity.id,
+    x: target.x,
+    y: target.y,
+    radius: 260,
+    startedAt: now,
+    endsAt: now + 12000,
+    nextSpawnAt: now + 650,
+    spawned: 0,
+    maxSpawns: 6
+  };
+  warden.domainCastUsed = true;
+  warden.domainCastingUntil = now + 1200;
+  return true;
+}
+
+function updateDomainEvent(room, now) {
+  const world = room.latestWorld;
+  const event = world.domainEvent;
+  if (!event) return;
+  if (now >= event.endsAt) {
+    world.domainEvent = null;
+    return;
+  }
+  if (event.spawned >= event.maxSpawns || now < event.nextSpawnAt) return;
+  const angle = (event.spawned / event.maxSpawns) * Math.PI * 2 + Math.random() * 0.35;
+  const range = event.radius * (0.62 + Math.random() * 0.18);
+  const type = event.spawned >= 4 ? 'runner' : (Math.random() < 0.35 ? 'spitter' : 'normal');
+  spawnBossMinion(world, type, event.x + Math.cos(angle) * range, event.y + Math.sin(angle) * range, 0.72);
+  event.spawned += 1;
+  event.nextSpawnAt = now + 1150;
+  world.totalZombiesInWave += 1;
 }
 
 function runBossMechanics(room, z, target, dt, now) {
@@ -656,7 +699,7 @@ function spawnRemoteShot(room, player, weapon) {
   const shooter = room.players.get(player.id);
   const type = weaponTypes[weapon.id];
   const ownedWeapon = shooter?.weapons?.find((entry) => entry.id === weapon.id && entry.owned);
-  if (!shooter || !type || !ownedWeapon || !world.waveActive) return;
+  if (!shooter || !type || !ownedWeapon || !world.waveActive || world.wave < (type.requiredWave || 0)) return;
   const now = nowMs();
   const level = clamp(Math.floor(Number(ownedWeapon.upgradeLevel) || 0), 0, 5);
   const cooldown = type.fireRate * Math.pow(0.92, level);
@@ -763,6 +806,7 @@ function damageShelterEntry(world, zombie, breachPlan, now) {
 function updateZombies(room, dt) {
   const world = room.latestWorld;
   const now = nowMs();
+  updateDomainEvent(room, now);
   for (const z of world.zombies) {
     if (z.isHealer && now - z.lastHeal > z.healRate) {
       z.lastHeal = now;
@@ -791,6 +835,10 @@ function updateZombies(room, dt) {
     const targetDist = target.distance;
     const breachPlan = getShelterBreachPlan(world, z, target);
     let didAction = false;
+    if (z.isDomainWarden && !z.domainCastUsed && !world.domainEvent && target.kind === 'player' && targetDist < (z.domainRange || 480)) {
+      didAction = startDomainEvent(room, z, target, now);
+    }
+    if (z.domainCastingUntil && now < z.domainCastingUntil) didAction = true;
     if (runBossMechanics(room, z, target, dt, now)) didAction = true;
     if (z.hidden) continue;
     if (!breachPlan && (z.type === 'spitter' || z.type === 'boss' || z.type === 'miniBoss' || z.isAcidRanger || z.isBoss || z.isMiniBoss) && z.shootRange && targetDist < z.shootRange) {
@@ -1144,7 +1192,7 @@ function collectNearbyDrops(room) {
     const player = [...room.players.values()].find((candidate) =>
       Number.isFinite(candidate.x) && distance(drop.x, drop.y, candidate.x, candidate.y) < 30);
     if (!player) continue;
-    const amount = drop.type === 'ammo' ? 24 : drop.type === 'money' ? 18 : drop.type === 'medkit' ? 30 : 1;
+    const amount = drop.type === 'ammo' ? 24 : drop.type === 'money' ? 8 : drop.type === 'medkit' ? 30 : 1;
     world.lootEvents.push({ id: `loot-${drop.id}-${player.id}`, playerId: player.id, type: drop.type, amount, createdAt: nowMs() });
     world.drops.splice(i, 1);
   }
@@ -1162,7 +1210,7 @@ function recordKillReward(room, zombie) {
     boss: Boolean(zombie.isBoss),
     miniBoss: Boolean(zombie.isMiniBoss),
     ownerId: zombie.lastHitBy || null,
-    money: zombie.reward || 0,
+    money: Math.max(1, Math.floor((zombie.reward || 0) * 0.55)),
     xp: zombie.xp || 0,
     parts: zombie.isBoss ? 1 : 0,
     createdAt: nowMs()
@@ -1249,11 +1297,17 @@ function updatePlayerLifeStates(room, now) {
       if (player.reviveProgress === 0) player.reviverId = null;
     }
     if (now >= player.respawnAt || (activeCount === 0 && now - player.downedAt >= 6000)) {
+      worldScrapPlayerTurrets(room.latestWorld, player.id);
+      player.emergencyRespawns = (player.emergencyRespawns || 0) + 1;
       player.x = 980;
       player.y = 850;
       revivePlayer(player, 0.45);
     }
   }
+}
+
+function worldScrapPlayerTurrets(world, playerId) {
+  world.sentries = world.sentries.filter((sentry) => sentry.ownerId !== playerId);
 }
 
 function updateDayNight(world, now) {
@@ -1355,6 +1409,8 @@ function handleAction(room, packet) {
   if (action.kind === 'requestRespawn') {
     const player = room.players.get(packet.id);
     if (!player || !player.downed || nowMs() < (player.giveUpAt || player.respawnAt)) return;
+    worldScrapPlayerTurrets(world, player.id);
+    player.emergencyRespawns = (player.emergencyRespawns || 0) + 1;
     player.x = 980;
     player.y = 850;
     revivePlayer(player, 0.45);
@@ -1377,7 +1433,7 @@ function handleAction(room, packet) {
     if (distance(player.x, player.y, structure.loot.x, structure.loot.y) > 75) return;
     structure.loot.claimed = true;
     world.structureStateRevision = (world.structureStateRevision || 0) + 1;
-    for (let i = 0; i < 4; i += 1) {
+    for (let i = 0; i < 2; i += 1) {
       dropLoot(world, structure.loot.x + Math.random() * 35 - 17, structure.loot.y + Math.random() * 35 - 17);
     }
     return;

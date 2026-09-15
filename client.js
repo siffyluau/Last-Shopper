@@ -118,6 +118,7 @@
             appliedLootEvents: new Set(),
             lootBeacon: null,
             nextLocalWorldDropAt: performance.now() + 45000,
+            domainEvent: null,
             traps: [], 
             buildings: [],
             empPulses: [], 
@@ -518,6 +519,7 @@
                 if (this.isWorldHost && !this.isWorldHost()) return;
                 this.wave++;
                 this.waveActive = true;
+                this.domainEvent = null;
                 this.waitingForReward = false;
                 this.selectedReward = false;
                 this.zombiesKilled = 0;
@@ -568,6 +570,7 @@
                 this.appliedLootEvents = new Set();
                 this.lootBeacon = null;
                 this.nextLocalWorldDropAt = performance.now() + 45000;
+                this.domainEvent = null;
                 this.empPulses = []; 
                 this.healParticles = []; 
                 this.wave = 0;
@@ -609,6 +612,7 @@
                     skinId: this.selectedSkinId || 'shopper',
                     level: 1, xp: 0, xpToNext: progression.xpToNext(1), skillPoints: 0,
                     downed: false, downedAt: 0, respawnAt: 0, giveUpAt: 0, reviveProgress: 0, reviverId: null,
+                    emergencyRespawns: 0,
                     skillLevels: {
                         maxHealth: 0, moveSpeed: 0, reloadSpeed: 0,
                         bulletDamage: 0, pickupRange: 0, resourceMultiplier: 0
@@ -668,6 +672,7 @@
                     if (this.ensureLocalWorldChunks) this.ensureLocalWorldChunks();
                     if (this.updateLocalWorldEvents) this.updateLocalWorldEvents();
                     if (!this.waitingForReward) {
+                        if (this.updateLocalDomainEvent) this.updateLocalDomainEvent();
                         this.updateZombies(); 
                         this.updateBullets();
                         this.updateSentries();
@@ -819,6 +824,9 @@
                     if (this.updateBossMechanics && this.updateBossMechanics(z, nearestTarget, now)) {
                         didAction = true;
                     }
+                    if (this.updateDomainWarden && this.updateDomainWarden(z, nearestTarget, now)) {
+                        didAction = true;
+                    }
                     if (z.hidden) continue;
                     if (z.isCharger && now - (z.lastCharge || 0) > z.chargeRate && targetDist < 330) {
                         z.lastCharge = now;
@@ -934,7 +942,7 @@
                     if (z.health <= 0) {
                         this.zombiesKilled++;
                         if (this.recordKill) this.recordKill(z);
-                        this.player.money += Math.floor(z.reward * this.getResourceMultiplier());
+                        this.player.money += Math.max(1, Math.floor(z.reward * 0.55 * this.getResourceMultiplier()));
                         this.gainXp(z.xp || Math.max(8, Math.floor(z.reward * 0.8)));
                         this.createDeath(z);
                         if (z.isBomber && !z.exploded) {
@@ -1270,7 +1278,7 @@
                         }
                         else if (drop.type === 'wood') this.player.wood += Math.max(1, Math.round(multiplier));
                         else if (drop.type === 'metal') this.player.metal += Math.max(1, Math.round(multiplier));
-                        else if (drop.type === 'money') this.player.money += Math.floor(15 * multiplier);
+                        else if (drop.type === 'money') this.player.money += Math.floor(8 * multiplier);
                         else if (drop.type === 'medkit') this.player.health = Math.min(this.player.maxHealth, this.player.health + 30);
 
                         this.drops.splice(i, 1);
@@ -1424,6 +1432,7 @@
                 ctx.translate(-this.camera.x + this.camera.shake, -this.camera.y + this.camera.shake);
                 
                 this.drawMap();
+                if (this.drawDomainWorld) this.drawDomainWorld();
                 if (this.drawWorldStructures) this.drawWorldStructures();
                 this.drawTraps(); 
                 if (this.drawBuildings) this.drawBuildings();
@@ -1448,6 +1457,7 @@
                 
                 ctx.restore();
                 if (this.drawDayNight) this.drawDayNight();
+                if (this.drawDomainOverlay) this.drawDomainOverlay();
                 if (this.drawNavigationHud) this.drawNavigationHud();
             },
 
@@ -1955,16 +1965,17 @@
             // --- UI Functions ---
             
             populateShop: function() {
-                shopContent.innerHTML = this.getAmmoStoreHtml ? this.getAmmoStoreHtml('shop') : '';
+                shopContent.innerHTML = `<div class="shop-ledger"><div><span>RUN CLEARANCE</span><b>WAVE ${this.wave}</b></div><p>Weapons unlock by surviving. Cash alone cannot skip the armory ladder.</p></div>${this.getAmmoStoreHtml ? this.getAmmoStoreHtml('shop') : ''}`;
                 const weaponHeader = document.createElement('h2');
                 weaponHeader.className = 'shop-section';
                 weaponHeader.textContent = 'WEAPON COUNTER';
                 shopContent.appendChild(weaponHeader);
                 
                 this.weapons.forEach((w, i) => {
-                    const canAfford = this.player.money >= w.cost;
+                    const waveReady = this.wave >= (w.requiredWave || 0);
+                    const canAfford = waveReady && this.player.money >= w.cost;
                     const item = document.createElement('div');
-                    item.className = `shop-weapon-card ${w.owned ? 'owned' : ''}`;
+                    item.className = `shop-weapon-card ${w.owned ? 'owned' : ''} ${!waveReady && !w.owned ? 'locked' : ''}`;
                     item.innerHTML = `
                         <div class="weapon-silhouette"><span>${i + 1}</span><i></i></div>
                         <div class="shop-weapon-copy">
@@ -1979,8 +1990,8 @@
                         </div>
                         ${w.owned ? 
                             '<span class="stock-stamp">IN LOCKER</span>' :
-                            `<button class="btn ${canAfford ? 'btn-success' : 'btn-danger opacity-50'}" ${!canAfford ? 'disabled' : ''} onclick="game.buyWeapon(${i})">
-                                CLAIM<br><small>$${w.cost}</small>
+                            `<button class="btn ${canAfford ? 'btn-success' : 'btn-secondary opacity-50'}" ${!canAfford ? 'disabled' : ''} onclick="game.buyWeapon(${i})">
+                                <span>${!waveReady ? `WAVE ${w.requiredWave}` : this.player.money < w.cost ? 'NEED CASH' : 'CLAIM'}</span><small>$${w.cost}</small>
                             </button>`
                         }
                     `;
@@ -1996,7 +2007,7 @@
                 let weapon = this.weapons[index];
                 if (!weapon) return;
 
-                if (weapon.owned || this.player.money < weapon.cost) return;
+                if (weapon.owned || this.wave < (weapon.requiredWave || 0) || this.player.money < weapon.cost) return;
                 
                 this.player.money -= weapon.cost;
                 this.playSfx?.('buy');

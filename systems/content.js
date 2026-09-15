@@ -168,6 +168,19 @@
             isEliteVariant: true,
             contactDamage: 18
         },
+        riftWarden: {
+            name: 'Rift Warden',
+            color: [126, 54, 190],
+            speed: 0.82,
+            health: 880,
+            reward: 115,
+            xp: 105,
+            size: 27,
+            armor: 0.12,
+            contactDamage: 15,
+            isDomainWarden: true,
+            domainRange: 480
+        },
         miniBoss: {
             name: 'Store Captain',
             color: [175, 45, 115],
@@ -313,13 +326,13 @@
 
     const weaponTypes = [
         { id: 'pistol', name: 'Pistol', cost: 0, damage: 35, fireRate: 300, maxAmmo: 12, owned: true, speed: 8, bulletSize: 4, reloadTime: 1500 },
-        { id: 'shotgun', name: 'Shotgun', cost: 100, damage: 12.5, fireRate: 600, maxAmmo: 8, owned: false, speed: 6, pellets: 16, bulletSize: 3, reloadTime: 2500 },
-        { id: 'smg', name: 'Checkout SMG', cost: 275, damage: 17, fireRate: 78, maxAmmo: 45, owned: false, speed: 10, bulletSize: 3, reloadTime: 2100 },
-        { id: 'rifle', name: 'Assault Rifle', cost: 520, damage: 29, fireRate: 115, maxAmmo: 32, owned: false, speed: 11, bulletSize: 3, reloadTime: 2050 },
-        { id: 'marksman', name: 'Marksman Rifle', cost: 950, damage: 118, fireRate: 560, maxAmmo: 8, owned: false, speed: 16, bulletSize: 5, pierce: 1, reloadTime: 2700 },
-        { id: 'minigun', name: 'Mini Gun', cost: 1650, damage: 32, fireRate: 30, maxAmmo: 120, owned: false, speed: 12, bulletSize: 2, reloadTime: 4200 },
-        { id: 'grenadeLauncher', name: 'Grenade Launcher', cost: 2900, damage: 300, fireRate: 1250, maxAmmo: 5, owned: false, speed: 6, explosive: true, bulletSize: 7, reloadTime: 3100, ammoCost: 85 },
-        { id: 'rpg', name: 'RPG', cost: 5600, damage: 760, fireRate: 2100, maxAmmo: 3, owned: false, speed: 5, explosive: true, bulletSize: 8, reloadTime: 3500, ammoCost: 250 }
+        { id: 'shotgun', name: 'Shotgun', cost: 170, requiredWave: 2, damage: 12.5, fireRate: 600, maxAmmo: 8, owned: false, speed: 6, pellets: 16, bulletSize: 3, reloadTime: 2500 },
+        { id: 'smg', name: 'Checkout SMG', cost: 480, requiredWave: 4, damage: 17, fireRate: 78, maxAmmo: 45, owned: false, speed: 10, bulletSize: 3, reloadTime: 2100 },
+        { id: 'rifle', name: 'Assault Rifle', cost: 950, requiredWave: 6, damage: 29, fireRate: 115, maxAmmo: 32, owned: false, speed: 11, bulletSize: 3, reloadTime: 2050 },
+        { id: 'marksman', name: 'Marksman Rifle', cost: 1700, requiredWave: 9, damage: 118, fireRate: 560, maxAmmo: 8, owned: false, speed: 16, bulletSize: 5, pierce: 1, reloadTime: 2700 },
+        { id: 'minigun', name: 'Mini Gun', cost: 3300, requiredWave: 12, damage: 32, fireRate: 30, maxAmmo: 120, owned: false, speed: 12, bulletSize: 2, reloadTime: 4200 },
+        { id: 'grenadeLauncher', name: 'Grenade Launcher', cost: 5600, requiredWave: 15, damage: 300, fireRate: 1250, maxAmmo: 5, owned: false, speed: 6, explosive: true, bulletSize: 7, reloadTime: 3100, ammoCost: 85 },
+        { id: 'rpg', name: 'RPG', cost: 9000, requiredWave: 20, damage: 760, fireRate: 2100, maxAmmo: 3, owned: false, speed: 5, explosive: true, bulletSize: 8, reloadTime: 3500, ammoCost: 250 }
     ];
 
     const turretTypes = [

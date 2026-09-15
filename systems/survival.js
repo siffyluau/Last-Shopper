@@ -355,6 +355,7 @@
                 lootBeacon: this.lootBeacon,
                 drops: this.drops,
                 acidPools: this.acidPools,
+                domainEvent: this.domainEvent,
                 gameStarted: this.gameStarted
             };
         },
@@ -451,9 +452,16 @@
             this.applyLootEvents(this.lootEvents);
             this.drops = world.drops || [];
             this.acidPools = world.acidPools || [];
+            this.domainEvent = world.domainEvent || null;
             if (world.players) {
                 const localServerPlayer = world.players.find((player) => player.id === this.localPlayerId);
                 if (localServerPlayer) {
+                    const emergencyRespawns = localServerPlayer.emergencyRespawns || 0;
+                    if (emergencyRespawns > (this.player.emergencyRespawns || 0)) {
+                        this.player.money = Math.floor(this.player.money * 0.8);
+                        this.showWaveStatus?.('EMERGENCY LOSS: owned turrets scrapped / 20% cash lost', 3800);
+                    }
+                    this.player.emergencyRespawns = emergencyRespawns;
                     this.player.health = localServerPlayer.health ?? this.player.health;
                     this.player.maxHealth = localServerPlayer.maxHealth ?? this.player.maxHealth;
                     this.player.downed = Boolean(localServerPlayer.downed);
@@ -543,6 +551,9 @@
         },
 
         reviveLocalPlayer: function () {
+            this.sentries = this.sentries.filter((sentry) => sentry.ownerId && sentry.ownerId !== this.localPlayerId);
+            this.player.money = Math.floor(this.player.money * 0.8);
+            this.player.emergencyRespawns = (this.player.emergencyRespawns || 0) + 1;
             this.player.health = Math.max(45, Math.ceil(this.player.maxHealth * 0.45));
             this.player.downed = false;
             this.player.downedAt = 0;
@@ -551,6 +562,7 @@
             this.player.x = this.shop.interactionX;
             this.player.y = this.shop.interactionY + 70;
             this.updateDownedUi();
+            this.showWaveStatus?.('EMERGENCY LOSS: owned turrets scrapped / 20% cash lost', 3800);
             if (this.playSfx) this.playSfx('revive');
         },
 
@@ -917,6 +929,7 @@
                 disruptor: ['Special', 16, 'EMP infected that threatens electronics.', 'Keep turrets spread and kill it early.', 'Cash, XP, rare electronics.'],
                 eliteRunner: ['Elite', 20, 'Late-wave runner with elite speed and health.', 'Slow it with traps and avoid tunnel vision.', 'Strong cash and XP.'],
                 eliteTank: ['Elite', 20, 'Late-wave tank with armor and huge durability.', 'Explosives and upgraded turrets are the answer.', 'Large cash and metal rewards.'],
+                riftWarden: ['Special', 15, 'Opens the Dead Aisle around one survivor and calls a timed ambush.', 'Focus the Warden, hold the purple boundary, and clear the summoned pack.', 'Rare threat with strong XP and cash.'],
                 miniBoss: ['Elite', 15, 'A five-wave captain that mixes boss durability with ranged attacks.', 'Repair before it arrives and focus all turrets.', 'Rare parts, cash, and big XP.'],
                 boss: ['Bosses', 10, 'Basic Brute: a boss-class brawler with ranged pressure.', 'Keep moving and use reinforced walls.', 'Major cash, XP, rare parts.'],
                 burrowKing: ['Bosses', 10, 'Burrows underground, warns with cracked pavement, and emerges near targets.', 'Move away from warning cracks and clear spawned zombies.', 'Major boss rewards and rare parts.'],
@@ -1164,9 +1177,9 @@
             const structure = (this.mapStructures || []).find((entry) => entry.id === structureId);
             if (!structure || structure.loot.claimed) return;
             structure.loot.claimed = true;
-            const types = ['money', 'ammo', 'wood', 'metal'];
-            for (let i = 0; i < types.length; i++) {
-                this.drops.push({ x: structure.loot.x + Math.random() * 34 - 17, y: structure.loot.y + Math.random() * 34 - 17, type: types[i], life: 1800 });
+            const types = ['money', 'ammo', 'wood', 'metal'].sort(() => Math.random() - 0.5).slice(0, 2);
+            for (const type of types) {
+                this.drops.push({ x: structure.loot.x + Math.random() * 34 - 17, y: structure.loot.y + Math.random() * 34 - 17, type, life: 1800 });
             }
         },
 
@@ -1520,6 +1533,7 @@
                     ctx.restore();
                 }
                 if (z.hidden) continue;
+                if (z.isBoss || z.isMiniBoss || z.isDomainWarden) this.drawBossAura(z, timelineNow);
                 const color = `rgb(${z.color[0]}, ${z.color[1]}, ${z.color[2]})`;
                 const darkColor = `rgb(${z.color[0] * 0.58}, ${z.color[1] * 0.58}, ${z.color[2] * 0.58})`;
                 const type = z.type || 'normal';
@@ -1535,6 +1549,7 @@
                 const isCharger = z.isCharger;
                 const isLeech = z.isLeech;
                 const isEliteVariant = z.isEliteVariant;
+                const isDomainWarden = z.isDomainWarden;
                 const facing = Math.atan2(this.player.y - z.y, this.player.x - z.x);
 
                 ctx.save();
@@ -1617,6 +1632,23 @@
                     ctx.beginPath();
                     ctx.arc(0, -z.size * 0.18, Math.max(2, z.size * 0.13), 0, Math.PI * 2);
                     ctx.fill();
+                }
+
+                if (isDomainWarden) {
+                    ctx.strokeStyle = '#d8b4fe';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(0, -z.size * 0.08, z.size * 0.72, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.beginPath();
+                    for (let rune = 0; rune < 6; rune++) {
+                        const a = rune * Math.PI / 3;
+                        ctx.moveTo(Math.cos(a) * z.size * 0.42, Math.sin(a) * z.size * 0.42 - z.size * 0.08);
+                        ctx.lineTo(Math.cos(a) * z.size * 0.72, Math.sin(a) * z.size * 0.72 - z.size * 0.08);
+                    }
+                    ctx.stroke();
+                    ctx.fillStyle = '#f5d0fe';
+                    ctx.fillRect(z.size * 0.17, -z.size * 0.88, z.size * 0.16, z.size * 0.13);
                 }
 
                 if (z.isSapper) {
@@ -1779,6 +1811,107 @@
                     ctx.fillText((z.name || 'Boss').toUpperCase(), z.x, bossBarY - 5);
                 }
             }
+        },
+
+        drawBossAura: function (z, now) {
+            const time = now / 1000;
+            const kind = z.bossKind || (z.isDomainWarden ? 'domain' : z.isMiniBoss ? 'mini' : z.type);
+            const palettes = {
+                boss: ['#ef4444', '#f97316'], mini: ['#ec4899', '#a855f7'], burrow: ['#92400e', '#f59e0b'],
+                chargerBrute: ['#f97316', '#facc15'], tesla: ['#22d3ee', '#60a5fa'], brood: ['#84cc16', '#bef264'],
+                toxic: ['#4ade80', '#a3e635'], bossButcher: ['#dc2626', '#fca5a5'], bossSpitter: ['#65a30d', '#bef264'],
+                domain: ['#9333ea', '#e879f9']
+            };
+            const palette = palettes[kind] || palettes[z.type] || palettes.boss;
+            ctx.save();
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.strokeStyle = palette[0];
+            ctx.lineWidth = z.isBoss ? 3 : 2;
+            ctx.globalAlpha = 0.28 + Math.sin(time * 4 + z.x * 0.01) * 0.08;
+            ctx.beginPath();
+            ctx.arc(z.x, z.y, z.size * (1.45 + Math.sin(time * 3) * 0.08), 0, Math.PI * 2);
+            ctx.stroke();
+            const count = z.isBoss ? 9 : 6;
+            for (let i = 0; i < count; i++) {
+                const phase = time * (kind === 'chargerBrute' ? 4.5 : kind === 'tesla' ? 3.8 : 1.8) + i * Math.PI * 2 / count;
+                const radius = z.size * (1.15 + ((i * 17) % 7) / 10);
+                const px = z.x + Math.cos(phase) * radius;
+                const py = z.y + Math.sin(phase * (kind === 'brood' ? 0.72 : 1)) * radius;
+                ctx.fillStyle = i % 2 ? palette[0] : palette[1];
+                ctx.globalAlpha = 0.34 + (i % 3) * 0.12;
+                if (kind === 'tesla') {
+                    ctx.strokeStyle = ctx.fillStyle;
+                    ctx.beginPath();
+                    ctx.moveTo(z.x, z.y);
+                    ctx.lineTo(px + Math.sin(time * 11 + i) * 8, py);
+                    ctx.stroke();
+                } else if (kind === 'burrow') {
+                    ctx.fillRect(px - 3, py - 2, 7, 4);
+                } else if (kind === 'chargerBrute') {
+                    ctx.fillRect(px - 14, py - 2, 22, 4);
+                } else {
+                    ctx.beginPath();
+                    ctx.arc(px, py, kind === 'toxic' || kind === 'bossSpitter' ? 5 : 3, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+            ctx.restore();
+        },
+
+        drawDomainWorld: function () {
+            const event = this.domainEvent;
+            if (!event) return;
+            const now = this.multiplayer?.serverAuthoritative ? (this.serverTime || Date.now()) : performance.now();
+            const pulse = 0.5 + Math.sin(now / 170) * 0.12;
+            ctx.save();
+            const gradient = ctx.createRadialGradient(event.x, event.y, 20, event.x, event.y, event.radius);
+            gradient.addColorStop(0, 'rgba(46,16,101,.3)');
+            gradient.addColorStop(.68, 'rgba(88,28,135,.45)');
+            gradient.addColorStop(1, 'rgba(15,3,28,.88)');
+            ctx.fillStyle = gradient;
+            ctx.beginPath();
+            ctx.arc(event.x, event.y, event.radius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = `rgba(232,121,249,${pulse})`;
+            ctx.lineWidth = 7;
+            ctx.setLineDash([18, 11]);
+            ctx.beginPath();
+            ctx.arc(event.x, event.y, event.radius - 4, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            for (let i = 0; i < 14; i++) {
+                const angle = i * Math.PI * 2 / 14 + now / 2500;
+                const inner = event.radius * .18;
+                const outer = event.radius * (.78 + (i % 3) * .06);
+                ctx.strokeStyle = `rgba(168,85,247,${.12 + (i % 4) * .035})`;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(event.x + Math.cos(angle) * inner, event.y + Math.sin(angle) * inner);
+                ctx.lineTo(event.x + Math.cos(angle + .14) * outer, event.y + Math.sin(angle + .14) * outer);
+                ctx.stroke();
+            }
+            ctx.restore();
+        },
+
+        drawDomainOverlay: function () {
+            const event = this.domainEvent;
+            if (!event) return;
+            const now = this.multiplayer?.serverAuthoritative ? (this.serverTime || Date.now()) : performance.now();
+            const seconds = Math.max(0, Math.ceil((event.endsAt - now) / 1000));
+            ctx.save();
+            const vignette = ctx.createRadialGradient(canvas.width / 2, canvas.height / 2, canvas.height * .18, canvas.width / 2, canvas.height / 2, canvas.height * .78);
+            vignette.addColorStop(0, 'rgba(35,8,52,.08)');
+            vignette.addColorStop(1, 'rgba(30,3,46,.48)');
+            ctx.fillStyle = vignette;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#f5d0fe';
+            ctx.font = '900 18px "Chakra Petch"';
+            ctx.fillText(event.targetPlayerId === this.localPlayerId ? 'YOU ARE TRAPPED IN THE DEAD AISLE' : 'DEAD AISLE BREACH', canvas.width / 2, 142);
+            ctx.fillStyle = '#c084fc';
+            ctx.font = '800 12px "Chakra Petch"';
+            ctx.fillText(`SURVIVE ${seconds}s / KILL THE RIFT WARDEN`, canvas.width / 2, 163);
+            ctx.restore();
         },
 
         drawShopBuilding: function () {
@@ -2117,6 +2250,46 @@
                 lastHeal: 0,
                 lastWeld: 0
             });
+        },
+
+        updateDomainWarden: function (z, target, now) {
+            if (!z.isDomainWarden || !target) return false;
+            if (z.domainCastingUntil && now < z.domainCastingUntil) return true;
+            if (z.domainCastUsed || this.domainEvent || target.kind !== 'player' || target.distance > (z.domainRange || 480)) return false;
+            z.domainCastUsed = true;
+            z.domainCastingUntil = now + 1200;
+            this.domainEvent = {
+                id: `domain-${Math.floor(now)}`,
+                casterId: z.id,
+                targetPlayerId: this.localPlayerId,
+                x: target.x,
+                y: target.y,
+                radius: 260,
+                startedAt: now,
+                endsAt: now + 12000,
+                nextSpawnAt: now + 650,
+                spawned: 0,
+                maxSpawns: 6
+            };
+            return true;
+        },
+
+        updateLocalDomainEvent: function () {
+            if (this.multiplayer?.serverAuthoritative || !this.domainEvent) return;
+            const event = this.domainEvent;
+            const now = performance.now();
+            if (now >= event.endsAt) {
+                this.domainEvent = null;
+                return;
+            }
+            if (event.spawned >= event.maxSpawns || now < event.nextSpawnAt) return;
+            const angle = (event.spawned / event.maxSpawns) * Math.PI * 2 + Math.random() * .35;
+            const range = event.radius * (.62 + Math.random() * .18);
+            const type = event.spawned >= 4 ? 'runner' : (Math.random() < .35 ? 'spitter' : 'normal');
+            this.spawnBossMinion(type, event.x + Math.cos(angle) * range, event.y + Math.sin(angle) * range, .72);
+            event.spawned += 1;
+            event.nextSpawnAt = now + 1150;
+            this.totalZombiesInWave += 1;
         },
 
         updateBossMechanics: function (z, target, now) {
@@ -2631,7 +2804,7 @@
                     interactionRadius: 72,
                     collected: false,
                     rewards: {
-                        money: Math.floor(120 * waveScale),
+                        money: Math.floor(65 * waveScale),
                         wood: Math.ceil(12 * waveScale),
                         metal: Math.ceil(9 * waveScale),
                         ammo: Math.ceil(70 * waveScale)
@@ -2839,14 +3012,15 @@
                 { id: 'repairs', name: 'Crew Repairs', description: 'Restore all defenses and the bench', cost: 135 },
                 { id: 'parts', name: 'Rare Turret Parts', description: '+1 part for high-tier machinery', cost: 280 }
             ];
-            traderContent.innerHTML = `<p class="window-copy">Boss-wave discount stock. Cash is personal; placed defenses carry owner tags.</p>
+            traderContent.innerHTML = `<div class="trader-ledger"><div><span class="window-kicker">LIMITED BOSS-PREP INVENTORY</span><h3>Roadside Salvage Manifest</h3></div><p>Discount stock disappears when the boss arrives. Cash is personal; defenses retain owner tags.</p></div>
                 ${this.getAmmoStoreHtml('trader', 0.72, this.trader?.ammoDeals || ['small', 'medium'])}
                 <div class="trader-stock">${items.map((item) => `
-                    <div class="defense-card flex items-center justify-between">
+                    <article class="trader-item-card">
+                        <span class="trader-stock-code">${item.id === 'parts' ? 'RARE STOCK' : 'SALVAGE LOT'}</span>
                         <div><h3>${item.name}</h3><p>${item.description}</p></div>
                         <button class="btn ${this.player.money >= item.cost ? 'btn-primary' : 'btn-secondary opacity-50'}"
-                            ${this.player.money >= item.cost ? '' : 'disabled'} onclick="game.buyTraderItem('${item.id}')">$${item.cost}</button>
-                    </div>`).join('')}</div>`;
+                            ${this.player.money >= item.cost ? '' : 'disabled'} onclick="game.buyTraderItem('${item.id}')">BUY <small>$${item.cost}</small></button>
+                    </article>`).join('')}</div>`;
         },
 
         buyTraderItem: function (id) {
