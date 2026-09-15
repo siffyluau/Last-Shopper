@@ -3,11 +3,12 @@ const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
 const { WebSocketServer } = WebSocket;
+const WorldMap = require('./systems/world.js');
 
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
-const TICK_MS = 50;
-const SNAPSHOT_MS = 100;
+const TICK_MS = 25;
+const SNAPSHOT_MS = 50;
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -19,19 +20,13 @@ const MIME = {
   '.svg': 'image/svg+xml'
 };
 
-const spawnGates = [
-  { x: 100, y: 100 }, { x: 1900, y: 100 }, { x: 100, y: 1300 },
-  { x: 1900, y: 1300 }, { x: 1000, y: 100 }, { x: 1000, y: 1300 }
-];
-const MAP_WIDTH = 2000;
-const MAP_HEIGHT = 1400;
 const SHOP_RECT = { x: 980, y: 615, width: 390, height: 260 };
 const WORKBENCH_RECT = { x: 1285, y: 820, width: 118, height: 62 };
 const SERVER_PLACEMENT_LIMITS = {
   turrets: 12,
   walls: 60,
   traps: 24,
-  buildings: 6
+  buildings: 7
 };
 
 const enemyTypes = {
@@ -42,6 +37,8 @@ const enemyTypes = {
   spitter: { color: [150, 200, 50], speed: 0.8, health: 80, reward: 20, xp: 20, size: 14, shootRange: 300, shootRate: 1800, contactDamage: 7 },
   thrower: { color: [100, 150, 200], speed: 1.2, health: 120, reward: 22, xp: 22, size: 16, throwRange: 250, throwRate: 2500, contactDamage: 8 },
   bomber: { color: [245, 125, 35], speed: 1.8, health: 90, reward: 34, xp: 30, size: 14, explosionDamage: 180, isBomber: true },
+  sapper: { color: [239, 125, 45], speed: 1.22, health: 155, reward: 46, xp: 42, size: 16, explosionDamage: 260, isBomber: true, isSapper: true, contactDamage: 10 },
+  stalker: { color: [111, 45, 130], speed: 1.58, health: 135, reward: 40, xp: 38, size: 16, isFlanker: true, contactDamage: 12 },
   shield: { color: [55, 135, 180], speed: 0.92, health: 220, shieldHealth: 240, reward: 35, xp: 32, size: 19, contactDamage: 11 },
   armored: { color: [90, 105, 115], speed: 0.72, health: 420, reward: 38, xp: 35, size: 24, armor: 0.38, contactDamage: 14 },
   acidRanger: { color: [130, 215, 55], speed: 0.82, health: 125, reward: 28, xp: 26, size: 15, shootRange: 380, shootRate: 1550, isAcidRanger: true },
@@ -64,7 +61,19 @@ const enemyTypes = {
   bossSpitter: { name: 'Toxic Store Manager', color: [105, 190, 45], speed: 0.58, health: 4550, reward: 1000, xp: 720, size: 45, armor: 0.12, contactDamage: 24, shootRange: 520, shootRate: 720, isBoss: true, isAcidRanger: true }
 };
 
+const weaponTypes = {
+  pistol: { damage: 35, fireRate: 300, speed: 8, bulletSize: 4 },
+  shotgun: { damage: 12.5, fireRate: 600, speed: 6, pellets: 16, bulletSize: 3 },
+  smg: { damage: 17, fireRate: 78, speed: 10, bulletSize: 3 },
+  rifle: { damage: 29, fireRate: 115, speed: 11, bulletSize: 3 },
+  marksman: { damage: 118, fireRate: 560, speed: 16, bulletSize: 5, pierce: 1 },
+  minigun: { damage: 32, fireRate: 30, speed: 12, bulletSize: 2 },
+  grenadeLauncher: { damage: 300, fireRate: 1250, speed: 6, explosive: true, bulletSize: 7 },
+  rpg: { damage: 760, fireRate: 2100, speed: 5, explosive: true, bulletSize: 8 }
+};
+
 const rooms = new Map();
+let nextBulletId = 1;
 
 function nowMs() {
   return Date.now();
@@ -100,25 +109,26 @@ function validateBuildPlacement(kind, entity, world) {
   const y = Number(entity.y);
   const radius = buildRadius(entity);
   if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(radius)) return false;
-  if (x < radius + 20 || y < radius + 20 || x > MAP_WIDTH - radius - 20 || y > MAP_HEIGHT - radius - 20) return false;
   if (rectBlocked(x, y, radius, SHOP_RECT)) return false;
   if (rectBlocked(x, y, radius, WORKBENCH_RECT)) return false;
+  if ((world.mapStructures || []).some((structure) =>
+    WorldMap.wallSegments(structure).some((wall) => rectBlocked(x, y, radius, wall)))) return false;
   if (kind !== 'building' && world.buildings.some((building) => rectBlocked(x, y, radius, building))) return false;
 
   if (kind === 'turret') {
-    if (world.sentries.length >= SERVER_PLACEMENT_LIMITS.turrets) return false;
+    if (world.sentries.filter((item) => item.ownerId === entity.ownerId).length >= SERVER_PLACEMENT_LIMITS.turrets) return false;
     if (nearbyAny(x, y, radius, world.sentries, 78, entity.networkId)) return false;
     if (nearbyAny(x, y, radius, world.walls, 26)) return false;
   } else if (kind === 'wall') {
-    if (world.walls.length >= SERVER_PLACEMENT_LIMITS.walls) return false;
+    if (world.walls.filter((item) => item.ownerId === entity.ownerId).length >= SERVER_PLACEMENT_LIMITS.walls) return false;
     if (nearbyAny(x, y, radius, world.walls, 5, entity.networkId)) return false;
     if (nearbyAny(x, y, radius, world.sentries, 20)) return false;
   } else if (kind === 'trap') {
-    if (world.traps.length >= SERVER_PLACEMENT_LIMITS.traps) return false;
+    if (world.traps.filter((item) => item.ownerId === entity.ownerId).length >= SERVER_PLACEMENT_LIMITS.traps) return false;
     if (nearbyAny(x, y, radius, world.traps, 34, entity.networkId)) return false;
     if (nearbyAny(x, y, radius, world.sentries, 20) || nearbyAny(x, y, radius, world.walls, 12)) return false;
   } else if (kind === 'building') {
-    if (world.buildings.length >= SERVER_PLACEMENT_LIMITS.buildings) return false;
+    if (world.buildings.filter((item) => item.ownerId === entity.ownerId).length >= SERVER_PLACEMENT_LIMITS.buildings) return false;
     if (world.buildings.some((building) => building.id === entity.id)) return false;
     if (nearbyAny(x, y, radius, world.buildings, 82, entity.networkId)) return false;
     if (nearbyAny(x, y, radius, world.sentries, 44) || nearbyAny(x, y, radius, world.walls, 24)) return false;
@@ -178,6 +188,7 @@ function enemyPool(wave) {
   if (wave >= 3) pool.push('runner');
   if (wave >= 4) pool.push('tank');
   if (wave >= 5) pool.push('spitter');
+  if (wave >= 6) pool.push('sapper', 'stalker');
   if (wave >= 7) pool.push('bomber', 'healerZombie');
   if (wave >= 8) pool.push('shield');
   if (wave >= 9) pool.push('armored', 'acidRanger');
@@ -196,8 +207,13 @@ function bossPool(wave) {
   return pool;
 }
 
-function createWorld() {
+function createWorld(seed) {
   return {
+    mapSeed: seed || `last-shopper-${nowMs()}`,
+    mapStructures: [],
+    lootEvents: [],
+    lootBeacon: null,
+    nextWorldDropAt: nowMs() + 18000,
     serverTime: nowMs(),
     gameStarted: false,
     wave: 0,
@@ -225,7 +241,9 @@ function createWorld() {
     drops: [],
     acidPools: [],
     bossDefeats: 0,
-    killRewards: []
+    killRewards: [],
+    mapRevision: 0,
+    structureStateRevision: 0
   };
 }
 
@@ -236,9 +254,14 @@ function getRoom(code) {
       code: roomCode,
       clients: new Map(),
       players: new Map(),
+      weaponCooldowns: new Map(),
       hostId: null,
       gameStarted: false,
-      latestWorld: createWorld(),
+      latestWorld: createWorld(`room-${roomCode}`),
+      generatedChunks: new Set(),
+      structureStates: new Map(),
+      lastMapSnapshotRevision: -1,
+      lastStructureStateRevision: -1,
       lastTick: nowMs(),
       lastSnapshot: 0
     });
@@ -256,10 +279,32 @@ function broadcast(room, packet, except) {
   }
 }
 
-function worldSnapshot(room) {
+function getMapStructureStates(world) {
+  return (world.mapStructures || []).map((structure) => ({
+    id: structure.id,
+    door: {
+      open: Boolean(structure.door.open),
+      destroyed: Boolean(structure.door.destroyed),
+      health: Number(structure.door.health)
+    },
+    windows: (structure.windows || []).map((entry) => ({
+      id: entry.id,
+      breached: Boolean(entry.breached),
+      health: Number(entry.health)
+    })),
+    lootClaimed: Boolean(structure.loot.claimed)
+  }));
+}
+
+function worldSnapshot(room, options = {}) {
   const world = room.latestWorld;
+  const { mapStructures, ...dynamicWorld } = world;
+  const includeMap = options.includeMap !== false;
+  const includeMapStates = options.includeMapStates !== false;
   return {
-    ...world,
+    ...dynamicWorld,
+    ...(includeMap ? { mapStructures } : {}),
+    ...(includeMapStates ? { mapStructureStates: getMapStructureStates(world) } : {}),
     gameStarted: room.gameStarted,
     preparationEndsIn: world.preparationActive ? Math.max(0, world.preparationEndsAt - nowMs()) : 0,
     players: [...room.players.values()]
@@ -353,7 +398,20 @@ function startBossPreparation(room, seconds = 35) {
 
 function spawnZombie(room) {
   const world = room.latestWorld;
-  const gate = spawnGates[Math.floor(Math.random() * spawnGates.length)];
+  const activePlayers = [...room.players.values()].filter((player) =>
+    Number.isFinite(player.x) && Number.isFinite(player.y) && nowMs() - player.lastSeen < 5000);
+  const anchor = activePlayers[Math.floor(Math.random() * activePlayers.length)] || { x: 1100, y: 720 };
+  let spawnX = anchor.x;
+  let spawnY = anchor.y;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const spawnAngle = Math.random() * Math.PI * 2;
+    const spawnDistance = 620 + Math.random() * 220;
+    spawnX = anchor.x + Math.cos(spawnAngle) * spawnDistance;
+    spawnY = anchor.y + Math.sin(spawnAngle) * spawnDistance;
+    const blocked = (world.mapStructures || []).some((structure) =>
+      rectBlocked(spawnX, spawnY, 34, structure));
+    if (!blocked) break;
+  }
   let typeKey;
   if (world.bossesToSpawn > 0) {
     const pool = bossPool(world.wave);
@@ -375,8 +433,8 @@ function spawnZombie(room) {
     ...type,
     type: typeKey,
     id: `z-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-    x: gate.x + Math.random() * 80 - 40,
-    y: gate.y + Math.random() * 80 - 40,
+    x: spawnX,
+    y: spawnY,
     speed: type.speed * Math.min(1.25, 1 + world.wave * 0.004),
     health,
     maxHealth: health,
@@ -395,14 +453,16 @@ function spawnZombie(room) {
 
 function getTargets(room, zombie, includeStructures = true) {
   const world = room.latestWorld;
-  const candidates = [...room.players.values()]
+  const playerTargets = [...room.players.values()]
     .filter((player) => nowMs() - player.lastSeen < 5000 && (player.health ?? 100) > 0)
     .map((player) => ({ entity: player, x: player.x, y: player.y, radius: 12, kind: 'player' }));
+  const structureTargets = [];
   if (includeStructures) {
-    for (const wall of world.walls) candidates.push({ entity: wall, x: wall.x, y: wall.y, radius: wall.radius || 25, kind: 'structure' });
-    for (const sentry of world.sentries) candidates.push({ entity: sentry, x: sentry.x, y: sentry.y, radius: sentry.radius || 15, kind: 'structure' });
-    for (const building of world.buildings) candidates.push({ entity: building, x: building.x, y: building.y, radius: Math.max(building.width || 0, building.height || 0) / 2, kind: 'structure' });
+    for (const wall of world.walls) structureTargets.push({ entity: wall, x: wall.x, y: wall.y, radius: wall.radius || 25, kind: 'structure' });
+    for (const sentry of world.sentries) structureTargets.push({ entity: sentry, x: sentry.x, y: sentry.y, radius: sentry.radius || 15, kind: 'structure' });
+    for (const building of world.buildings) structureTargets.push({ entity: building, x: building.x, y: building.y, radius: Math.max(building.width || 0, building.height || 0) / 2, kind: 'structure' });
   }
+  const candidates = zombie.isSapper && structureTargets.length ? structureTargets : [...playerTargets, ...structureTargets];
   if (!candidates.length) return null;
   return candidates.reduce((nearest, candidate) => {
     const d = distance(zombie.x, zombie.y, candidate.x, candidate.y);
@@ -432,8 +492,8 @@ function spawnBossMinion(world, typeKey, x, y, scale = 0.75) {
     ...type,
     type: typeKey,
     id: `z-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-    x: clamp(x + Math.random() * 70 - 35, 25, 1975),
-    y: clamp(y + Math.random() * 70 - 35, 25, 1375),
+    x: x + Math.random() * 70 - 35,
+    y: y + Math.random() * 70 - 35,
     health,
     maxHealth: health,
     reward: Math.max(4, Math.floor((type.reward || 8) * 0.35)),
@@ -466,8 +526,8 @@ function runBossMechanics(room, z, target, dt, now) {
     }
     if (now - (z.lastBurrow || 0) > (z.burrowRate || 5600) && target.distance > 140) {
       const angle = Math.random() * Math.PI * 2;
-      z.emergeX = clamp(target.x + Math.cos(angle) * (70 + Math.random() * 55), 50, 1950);
-      z.emergeY = clamp(target.y + Math.sin(angle) * (70 + Math.random() * 55), 50, 1350);
+      z.emergeX = target.x + Math.cos(angle) * (70 + Math.random() * 55);
+      z.emergeY = target.y + Math.sin(angle) * (70 + Math.random() * 55);
       z.emergeAt = now + 1150;
       z.hidden = true;
       z.burrowWarning = { x: z.emergeX, y: z.emergeY, until: z.emergeAt };
@@ -488,8 +548,8 @@ function runBossMechanics(room, z, target, dt, now) {
     }
     if (z.chargeUntil && now < z.chargeUntil) {
       const speed = (z.chargeSpeed || 5) * (dt / 16.67);
-      z.x = clamp(z.x + Math.cos(z.chargeAngle || 0) * speed, 20, 1980);
-      z.y = clamp(z.y + Math.sin(z.chargeAngle || 0) * speed, 20, 1380);
+      z.x += Math.cos(z.chargeAngle || 0) * speed;
+      z.y += Math.sin(z.chargeAngle || 0) * speed;
       for (const wall of world.walls) {
         if (distance(z.x, z.y, wall.x, wall.y) < z.size + (wall.radius || 25)) {
           if ((wall.wallStage || 0) < 2) {
@@ -560,13 +620,14 @@ function tryBossDodge(world, z, bullet, now) {
   z.dodgeUntil = now + 360;
   const sign = Math.random() < 0.5 ? -1 : 1;
   const angle = Math.atan2(bullet.vy || 0, bullet.vx || 1) + Math.PI / 2 * sign;
-  z.x = clamp(z.x + Math.cos(angle) * 76, 35, 1965);
-  z.y = clamp(z.y + Math.sin(angle) * 76, 35, 1365);
+  z.x += Math.cos(angle) * 76;
+  z.y += Math.sin(angle) * 76;
   return true;
 }
 
 function pushBullet(world, x, y, angle, speed, damage, options = {}) {
   world.bullets.push({
+    id: `b-${nextBulletId++}`,
     x,
     y,
     vx: Math.cos(angle) * speed,
@@ -578,19 +639,34 @@ function pushBullet(world, x, y, angle, speed, damage, options = {}) {
     fromTurret: options.fromTurret,
     spitter: options.spitter,
     acid: options.acid,
-    ownerId: options.ownerId
+    ownerId: options.ownerId,
+    pierce: Math.max(0, Math.floor(options.pierce || 0)),
+    life: options.life || 240,
+    hitIds: []
   });
 }
 
 function spawnRemoteShot(room, player, weapon) {
   const world = room.latestWorld;
-  const angle = player.angle || 0;
-  const originX = player.x + Math.cos(angle) * 15;
-  const originY = player.y + Math.sin(angle) * 15;
-  const pellets = weapon.pellets || 0;
-  const fireOne = (spread) => pushBullet(world, originX, originY, angle + spread, weapon.speed || 8, weapon.damage || 20, {
-    explosive: weapon.explosive,
-    size: weapon.bulletSize || 4,
+  const shooter = room.players.get(player.id);
+  const type = weaponTypes[weapon.id];
+  const ownedWeapon = shooter?.weapons?.find((entry) => entry.id === weapon.id && entry.owned);
+  if (!shooter || !type || !ownedWeapon || !world.waveActive) return;
+  const now = nowMs();
+  const level = clamp(Math.floor(Number(ownedWeapon.upgradeLevel) || 0), 0, 5);
+  const cooldown = type.fireRate * Math.pow(0.92, level);
+  const cooldownKey = `${player.id}:${weapon.id}`;
+  if (now - (room.weaponCooldowns.get(cooldownKey) || 0) < cooldown) return;
+  room.weaponCooldowns.set(cooldownKey, now);
+  const angle = Number.isFinite(shooter.angle) ? shooter.angle : 0;
+  const originX = shooter.x + Math.cos(angle) * 15;
+  const originY = shooter.y + Math.sin(angle) * 15;
+  const pellets = type.pellets || 0;
+  const damage = type.damage * Math.pow(1.18, level);
+  const fireOne = (spread) => pushBullet(world, originX, originY, angle + spread, type.speed, damage, {
+    explosive: type.explosive,
+    pierce: type.pierce,
+    size: type.bulletSize || 4,
     ownerId: player.id
   });
   if (pellets) {
@@ -598,6 +674,85 @@ function spawnRemoteShot(room, player, weapon) {
   } else {
     fireOne(0);
   }
+}
+
+function getShelterBreachPlan(world, zombie, target) {
+  if (!target || target.kind !== 'player') return null;
+  const structure = (world.mapStructures || []).find((entry) =>
+    WorldMap.pointInside(entry, target.x, target.y, 2));
+  if (!structure || WorldMap.pointInside(structure, zombie.x, zombie.y, -zombie.size)) return null;
+
+  const entries = [{
+    id: `${structure.id}:door`,
+    kind: 'door',
+    entity: structure.door,
+    width: structure.door.width,
+    ...WorldMap.doorPoint(structure)
+  }, ...WorldMap.windowPoints(structure).map((entry) => ({
+    id: entry.id,
+    kind: 'window',
+    entity: structure.windows.find((candidate) => candidate.id === entry.id),
+    width: entry.width,
+    x: entry.x,
+    y: entry.y
+  }))];
+  const usableEntries = entries.filter((entry) => (entry.width || 0) >= zombie.size * 2 + 12);
+  const choicesBySize = usableEntries.length ? usableEntries : entries;
+  const passable = choicesBySize.filter((entry) => entry.kind === 'door'
+    ? entry.entity.open || entry.entity.destroyed
+    : entry.entity.breached);
+  const sealed = choicesBySize.filter((entry) => !passable.includes(entry));
+  let entry = choicesBySize.find((candidate) => candidate.id === zombie.breachTargetId);
+  if (!entry) {
+    const preferWindow = zombie.isFlanker || zombie.type === 'runner' || zombie.type === 'fast'
+      || String(zombie.id || '').charCodeAt(String(zombie.id || '').length - 1) % 3 === 0;
+    const preferred = preferWindow ? sealed.filter((candidate) => candidate.kind === 'window') : [];
+    const choices = preferred.length ? preferred : (passable.length ? passable : sealed);
+    entry = choices.reduce((nearest, candidate) => {
+      const candidateDistance = distance(zombie.x, zombie.y, candidate.x, candidate.y);
+      return !nearest || candidateDistance < nearest.distance
+        ? { ...candidate, distance: candidateDistance }
+        : nearest;
+    }, null);
+    if (entry) zombie.breachTargetId = entry.id;
+  }
+  if (!entry) return null;
+  return {
+    structure,
+    entry,
+    distance: distance(zombie.x, zombie.y, entry.x, entry.y),
+    passable: entry.kind === 'door'
+      ? Boolean(entry.entity.open || entry.entity.destroyed)
+      : Boolean(entry.entity.breached)
+  };
+}
+
+function damageShelterEntry(world, zombie, breachPlan, now) {
+  if (!breachPlan || breachPlan.passable) return false;
+  if (breachPlan.distance > zombie.size + 24) return false;
+  const entry = breachPlan.entry.entity;
+  if (zombie.isBomber) {
+    entry.health -= zombie.explosionDamage || 180;
+    zombie.health = 0;
+  } else if (now - (zombie.lastBreachHit || 0) >= (zombie.attackRate || 650)) {
+    zombie.lastBreachHit = now;
+    const bossScale = zombie.isBoss || zombie.isMiniBoss ? 2.4 : 1;
+    entry.health -= Math.max(12, (zombie.contactDamage || 8) * 1.45) * (zombie.damageScale || 1) * bossScale;
+  } else {
+    return true;
+  }
+  world.structureStateRevision = (world.structureStateRevision || 0) + 1;
+  if (entry.health <= 0) {
+    entry.health = 0;
+    if (breachPlan.entry.kind === 'door') {
+      entry.destroyed = true;
+      entry.open = true;
+    } else {
+      entry.breached = true;
+    }
+    zombie.breachTargetId = null;
+  }
+  return true;
 }
 
 function updateZombies(room, dt) {
@@ -629,17 +784,18 @@ function updateZombies(room, dt) {
     const target = getTargets(room, z, true);
     if (!target) continue;
     const targetDist = target.distance;
+    const breachPlan = getShelterBreachPlan(world, z, target);
     let didAction = false;
     if (runBossMechanics(room, z, target, dt, now)) didAction = true;
     if (z.hidden) continue;
-    if ((z.type === 'spitter' || z.type === 'boss' || z.type === 'miniBoss' || z.isAcidRanger || z.isBoss || z.isMiniBoss) && z.shootRange && targetDist < z.shootRange) {
+    if (!breachPlan && (z.type === 'spitter' || z.type === 'boss' || z.type === 'miniBoss' || z.isAcidRanger || z.isBoss || z.isMiniBoss) && z.shootRange && targetDist < z.shootRange) {
       didAction = true;
       if (now - z.lastShot > z.shootRate) {
         z.lastShot = now;
         const angle = Math.atan2(target.y - z.y, target.x - z.x);
         pushBullet(world, z.x, z.y, angle, 6, 20 * (z.damageScale || 1), { fromZombie: true, spitter: true, size: 8 });
       }
-    } else if (z.type === 'thrower' && targetDist < z.throwRange) {
+    } else if (!breachPlan && z.type === 'thrower' && targetDist < z.throwRange) {
       didAction = true;
       if (now - z.lastShot > z.throwRate) {
         z.lastShot = now;
@@ -649,12 +805,18 @@ function updateZombies(room, dt) {
     }
 
     if (!didAction) {
+      const moveTarget = breachPlan
+        ? { ...target, x: breachPlan.entry.x, y: breachPlan.entry.y, distance: breachPlan.distance }
+        : target;
+      if (damageShelterEntry(world, z, breachPlan, now)) didAction = true;
       if (z.isCharger && now - (z.lastCharge || 0) > z.chargeRate && targetDist < 330) {
         z.lastCharge = now;
         z.chargeUntil = now + z.chargeDuration;
       }
       const moveSpeed = (z.isCharger && now < (z.chargeUntil || 0) ? z.chargeSpeed : z.speed) * (dt / 16.67);
-      if (targetDist <= z.size + target.radius) {
+      if (didAction) {
+        // Hold position while tearing down a sealed entrance.
+      } else if (!breachPlan && targetDist <= z.size + target.radius) {
         if (z.isBomber) {
           if (target.kind === 'structure') target.entity.health -= z.explosionDamage;
           else target.entity.health = Math.max(0, (target.entity.health || 100) - z.explosionDamage * 0.35);
@@ -668,8 +830,41 @@ function updateZombies(room, dt) {
           if (target.entity.isElectric) damageZombie(z, target.entity.shockDamage || 20);
         }
       } else {
-        z.x += ((target.x - z.x) / targetDist) * moveSpeed;
-        z.y += ((target.y - z.y) / targetDist) * moveSpeed;
+        const moveDistance = Math.max(1, moveTarget.distance);
+        let moveX = (moveTarget.x - z.x) / moveDistance;
+        let moveY = (moveTarget.y - z.y) / moveDistance;
+        if (z.isFlanker && target.kind === 'player' && targetDist > 90) {
+          const flankSign = z.flankSign || (z.flankSign = Math.random() < 0.5 ? -1 : 1);
+          const baseX = moveX;
+          const baseY = moveY;
+          moveX += -baseY * 0.72 * flankSign;
+          moveY += baseX * 0.72 * flankSign;
+          const length = Math.hypot(moveX, moveY) || 1;
+          moveX /= length;
+          moveY /= length;
+        }
+        const previousX = z.x;
+        const previousY = z.y;
+        z.x += moveX * moveSpeed;
+        z.y += moveY * moveSpeed;
+        const isWallBlocked = () => (world.mapStructures || []).some((structure) =>
+          WorldMap.structureNearPoint(structure, z.x, z.y, z.size + 12) &&
+          WorldMap.wallSegments(structure).some((wall) => rectBlocked(z.x, z.y, z.size, wall)));
+        const hitBuildingWall = isWallBlocked();
+        if (hitBuildingWall) {
+          z.x = previousX;
+          z.y = previousY;
+          const turn = z.wallTurn || (z.wallTurn = Math.random() < 0.5 ? -1 : 1);
+          z.x += -moveY * moveSpeed * turn;
+          z.y += moveX * moveSpeed * turn;
+          if (isWallBlocked()) {
+            z.x = previousX;
+            z.y = previousY;
+            z.wallTurn *= -1;
+          }
+        } else {
+          z.wallTurn = 0;
+        }
       }
     }
 
@@ -724,9 +919,19 @@ function updateBullets(room, dt) {
   const now = nowMs();
   for (let i = world.bullets.length - 1; i >= 0; i--) {
     const b = world.bullets[i];
+    const previousX = b.x;
+    const previousY = b.y;
     b.x += b.vx * (dt / 16.67);
     b.y += b.vy * (dt / 16.67);
-    if (b.x < 0 || b.x > 2000 || b.y < 0 || b.y > 1400) {
+    b.life = (b.life || 240) - dt / 16.67;
+    if (b.life <= 0) {
+      world.bullets.splice(i, 1);
+      continue;
+    }
+    const hitMapWall = (world.mapStructures || []).some((structure) =>
+      WorldMap.structureNearSegment(structure, previousX, previousY, b.x, b.y, b.size || 4) &&
+      WorldMap.segmentHitsStructure(structure, previousX, previousY, b.x, b.y, b.size || 4));
+    if (hitMapWall) {
       world.bullets.splice(i, 1);
       continue;
     }
@@ -760,7 +965,9 @@ function updateBullets(room, dt) {
       if (!hit) {
         for (const player of room.players.values()) {
           if (distance(b.x, b.y, player.x, player.y) < 12) {
-            player.health = Math.max(0, (player.health || 100) - b.damage);
+            const sheltered = (world.mapStructures || []).some((structure) =>
+              WorldMap.pointInside(structure, player.x, player.y, 2));
+            if (!sheltered) player.health = Math.max(0, (player.health || 100) - b.damage);
             hit = true;
             break;
           }
@@ -769,6 +976,7 @@ function updateBullets(room, dt) {
       if (hit) world.bullets.splice(i, 1);
     } else {
       for (const z of world.zombies) {
+        if (b.hitIds?.includes(z.id)) continue;
         if (tryBossDodge(world, z, b, now)) continue;
         if (distance(b.x, b.y, z.x, z.y) < z.size) {
           z.lastHitBy = b.ownerId || z.lastHitBy || null;
@@ -782,7 +990,12 @@ function updateBullets(room, dt) {
           } else {
             damageZombie(z, b.damage);
           }
-          world.bullets.splice(i, 1);
+          if (b.pierce > 0 && !b.explosive) {
+            b.pierce--;
+            b.hitIds.push(z.id);
+          } else {
+            world.bullets.splice(i, 1);
+          }
           break;
         }
       }
@@ -793,6 +1006,9 @@ function updateBullets(room, dt) {
 function updateSentries(room) {
   const world = room.latestWorld;
   const now = nowMs();
+  const powerRelayOnline = world.buildings.some((building) => building.id === 'powerRelay' && building.health > 0);
+  const canRefill = powerRelayOnline && now - (world.lastPowerRelayTick || 0) >= 3000;
+  if (canRefill) world.lastPowerRelayTick = now;
   for (let i = world.sentries.length - 1; i >= 0; i--) {
     const sentry = world.sentries[i];
     if (sentry.health <= 0) {
@@ -801,7 +1017,8 @@ function updateSentries(room) {
     }
     if (sentry.isDisabled > now) continue;
     let closest = null;
-    let closestDist = sentry.range || 260;
+    let closestDist = (sentry.range || 260) * (powerRelayOnline ? 1.15 : 1);
+    if (canRefill && sentry.ammo < sentry.maxAmmo) sentry.ammo++;
     for (const z of world.zombies) {
       const d = distance(sentry.x, sentry.y, z.x, z.y);
       if (d < closestDist) {
@@ -837,7 +1054,95 @@ function dropLoot(world, x, y) {
   else if (rand < 0.3) type = 'ammo';
   else if (rand < 0.6) type = 'wood';
   else if (rand < 0.8) type = 'metal';
-  world.drops.push({ x, y, type, life: 600 });
+  world.drops.push({ id: `drop-${nowMs()}-${Math.random().toString(36).slice(2, 7)}`, x, y, type, life: 1800 });
+}
+
+function ensureWorldChunks(room) {
+  const world = room.latestWorld;
+  const previousChunkKeys = new Set(room.generatedChunks);
+  const anchors = [...room.players.values()].filter((player) => Number.isFinite(player.x) && Number.isFinite(player.y));
+  if (!anchors.length) anchors.push({ x: 1100, y: 720 });
+  const desiredChunks = new Set();
+  for (const anchor of anchors) {
+    const centerX = Math.floor(anchor.x / WorldMap.CHUNK_SIZE);
+    const centerY = Math.floor(anchor.y / WorldMap.CHUNK_SIZE);
+    for (let ox = -1; ox <= 1; ox += 1) {
+      for (let oy = -1; oy <= 1; oy += 1) {
+        const cx = centerX + ox;
+        const cy = centerY + oy;
+        const key = WorldMap.chunkKey(cx, cy);
+        desiredChunks.add(key);
+        if (room.generatedChunks.has(key)) continue;
+        room.generatedChunks.add(key);
+        const structures = WorldMap.generateChunk(world.mapSeed, cx, cy);
+        for (const structure of structures) {
+          const saved = room.structureStates.get(structure.id);
+          if (saved) {
+            structure.door.open = saved.doorOpen;
+            structure.door.destroyed = saved.doorDestroyed;
+            if (Number.isFinite(saved.doorHealth)) structure.door.health = saved.doorHealth;
+            structure.loot.claimed = saved.lootClaimed;
+            for (const windowEntry of structure.windows || []) {
+              const savedWindow = saved.windows?.find((entry) => entry.id === windowEntry.id);
+              if (!savedWindow) continue;
+              if (Number.isFinite(savedWindow.health)) windowEntry.health = savedWindow.health;
+              windowEntry.breached = savedWindow.breached;
+            }
+          }
+        }
+        world.mapStructures.push(...structures);
+      }
+    }
+  }
+  for (const structure of world.mapStructures) {
+    room.structureStates.set(structure.id, {
+      doorOpen: Boolean(structure.door.open),
+      doorDestroyed: Boolean(structure.door.destroyed),
+      doorHealth: Number(structure.door.health),
+      windows: (structure.windows || []).map((entry) => ({
+        id: entry.id,
+        health: Number(entry.health),
+        breached: Boolean(entry.breached)
+      })),
+      lootClaimed: Boolean(structure.loot.claimed)
+    });
+  }
+  world.mapStructures = world.mapStructures.filter((structure) => desiredChunks.has(structure.chunkKey));
+  for (const key of [...room.generatedChunks]) {
+    if (!desiredChunks.has(key)) room.generatedChunks.delete(key);
+  }
+  if (previousChunkKeys.size !== desiredChunks.size || [...desiredChunks].some((key) => !previousChunkKeys.has(key))) {
+    world.mapRevision = (world.mapRevision || 0) + 1;
+  }
+}
+
+function spawnWorldDrop(room) {
+  const world = room.latestWorld;
+  const players = [...room.players.values()].filter((player) => Number.isFinite(player.x) && Number.isFinite(player.y));
+  if (!players.length) return;
+  const player = players[Math.floor(Math.random() * players.length)];
+  const angle = Math.random() * Math.PI * 2;
+  const range = 150 + Math.random() * 110;
+  const x = player.x + Math.cos(angle) * range;
+  const y = player.y + Math.sin(angle) * range;
+  world.lootBeacon = { id: `beacon-${nowMs()}`, x, y, expiresAt: nowMs() + 90000 };
+  for (let i = 0; i < 5; i += 1) dropLoot(world, x + Math.random() * 50 - 25, y + Math.random() * 50 - 25);
+  world.nextWorldDropAt = nowMs() + 60000 + Math.random() * 30000;
+}
+
+function collectNearbyDrops(room) {
+  const world = room.latestWorld;
+  for (let i = world.drops.length - 1; i >= 0; i -= 1) {
+    const drop = world.drops[i];
+    const player = [...room.players.values()].find((candidate) =>
+      Number.isFinite(candidate.x) && distance(drop.x, drop.y, candidate.x, candidate.y) < 30);
+    if (!player) continue;
+    const amount = drop.type === 'ammo' ? 24 : drop.type === 'money' ? 18 : drop.type === 'medkit' ? 30 : 1;
+    world.lootEvents.push({ id: `loot-${drop.id}-${player.id}`, playerId: player.id, type: drop.type, amount, createdAt: nowMs() });
+    world.drops.splice(i, 1);
+  }
+  if (world.lootEvents.length > 80) world.lootEvents.splice(0, world.lootEvents.length - 80);
+  if (world.lootBeacon && (nowMs() > world.lootBeacon.expiresAt || !world.drops.length)) world.lootBeacon = null;
 }
 
 function recordKillReward(room, zombie) {
@@ -916,6 +1221,10 @@ function tickRoom(room) {
     if (now - player.lastSeen > 15000) room.players.delete(id);
   }
 
+  ensureWorldChunks(room);
+  if (now >= room.latestWorld.nextWorldDropAt) spawnWorldDrop(room);
+  collectNearbyDrops(room);
+
   updateWaveState(room);
   if (room.latestWorld.waveActive) {
     updateZombies(room, dt);
@@ -926,7 +1235,17 @@ function tickRoom(room) {
 
   if (now - room.lastSnapshot >= SNAPSHOT_MS) {
     room.lastSnapshot = now;
-    broadcast(room, { type: 'world', id: 'server', authoritative: true, room: room.code, world: worldSnapshot(room) });
+    const includeMap = room.lastMapSnapshotRevision !== room.latestWorld.mapRevision;
+    const includeMapStates = includeMap || room.lastStructureStateRevision !== room.latestWorld.structureStateRevision;
+    if (includeMap) room.lastMapSnapshotRevision = room.latestWorld.mapRevision;
+    if (includeMapStates) room.lastStructureStateRevision = room.latestWorld.structureStateRevision;
+    broadcast(room, {
+      type: 'world',
+      id: 'server',
+      authoritative: true,
+      room: room.code,
+      world: worldSnapshot(room, { includeMap, includeMapStates })
+    });
   }
 }
 
@@ -965,6 +1284,28 @@ function handleAction(room, packet) {
   }
   if (action.kind === 'shot' && action.player && action.weapon) {
     spawnRemoteShot(room, action.player, action.weapon);
+    return;
+  }
+  if (action.kind === 'toggleDoor') {
+    const structure = world.mapStructures.find((entry) => entry.id === action.structureId);
+    const player = room.players.get(packet.id);
+    if (!structure || !player || structure.door.destroyed) return;
+    const door = WorldMap.doorPoint(structure);
+    if (distance(player.x, player.y, door.x, door.y) > 95) return;
+    structure.door.open = !structure.door.open;
+    world.structureStateRevision = (world.structureStateRevision || 0) + 1;
+    return;
+  }
+  if (action.kind === 'openStructureLoot') {
+    const structure = world.mapStructures.find((entry) => entry.id === action.structureId);
+    const player = room.players.get(packet.id);
+    if (!structure || !player || structure.loot.claimed) return;
+    if (distance(player.x, player.y, structure.loot.x, structure.loot.y) > 75) return;
+    structure.loot.claimed = true;
+    world.structureStateRevision = (world.structureStateRevision || 0) + 1;
+    for (let i = 0; i < 4; i += 1) {
+      dropLoot(world, structure.loot.x + Math.random() * 35 - 17, structure.loot.y + Math.random() * 35 - 17);
+    }
     return;
   }
   if (action.kind === 'collectSupply' && world.supplyDrop && !world.supplyDrop.collected) {
@@ -1067,5 +1408,5 @@ setInterval(() => {
 
 server.listen(PORT, () => {
   console.log(`Last Shopper server running at http://localhost:${PORT}`);
-  console.log(`Use ws://localhost:${PORT}/room as the cloud relay URL.`);
+  console.log('Players can join with the same room code; networking is detected automatically.');
 });

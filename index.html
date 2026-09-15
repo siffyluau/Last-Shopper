@@ -5,8 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Last Shopper</title>
     <link rel="icon" href="data:,">
-    <!-- Loading Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Local game styles -->
     <!-- Loading Google Font 'Chakra Petch' for a gamey feel -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -63,15 +62,14 @@
                         </div>
                         <span id="multiplayer-status" class="cloud-pill offline">LOCAL READY</span>
                     </div>
-                    <p class="window-copy">Works as static deploy. Same-browser tabs use local rooms; cloud rooms use a WebSocket relay URL when configured.</p>
+                    <p class="window-copy">Enter a room code and invite your friends. Online hosting connects everyone automatically.</p>
                     <div class="room-row">
                         <input id="room-code-input" class="retail-input" maxlength="12" placeholder="ROOM CODE">
                         <button id="host-room-button" class="btn btn-primary">Host</button>
                         <button id="join-room-button" class="btn btn-secondary">Join</button>
                     </div>
-                    <div class="relay-row">
-                        <input id="cloud-relay-input" class="retail-input" placeholder="Optional cloud relay URL, e.g. wss://your-relay.example/room">
-                    </div>
+                    <input id="cloud-relay-input" type="hidden">
+                    <div class="room-tools"><button id="copy-invite-button" class="btn btn-secondary">Copy Squad Invite</button></div>
                     <div id="party-list" class="party-list">
                         <div class="party-slot active"><b>P1</b><span>The Shopper</span><em>Ready</em></div>
                     </div>
@@ -103,7 +101,7 @@
             </div>
 
             <div class="lobby-controls">
-                <p>WASD move / Mouse aim / Click shoot / 1-5 weapons</p>
+                <p>WASD move / Mouse aim / Click shoot / 1-8 weapons</p>
                 <p>R reload / G service defense / C field craft / E shop or workbench / K skills / I zombie index</p>
             </div>
         </div>
@@ -324,6 +322,7 @@
     </div>
 
 
+    <script src="systems/world.js"></script>
     <script src="systems/content.js"></script>
     <script src="systems/progression.js"></script>
     <script src="systems/multiplayer.js"></script>

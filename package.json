@@ -6,7 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check client.js && node --check systems/content.js && node --check systems/progression.js && node --check systems/multiplayer.js && node --check systems/survival.js && node --check server.js"
+    "check": "node --check client.js && node --check systems/content.js && node --check systems/progression.js && node --check systems/multiplayer.js && node --check systems/world.js && node --check systems/survival.js && node --check server.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

@@ -75,6 +75,7 @@
         const cloudRelayInput = document.getElementById('cloud-relay-input');
         const hostRoomButton = document.getElementById('host-room-button');
         const joinRoomButton = document.getElementById('join-room-button');
+        const copyInviteButton = document.getElementById('copy-invite-button');
         const partyList = document.getElementById('party-list');
         const multiplayerStatus = document.getElementById('multiplayer-status');
         const metaHighestWave = document.getElementById('meta-highest-wave');
@@ -101,6 +102,14 @@
             walls: [],
             drops: [],
             acidPools: [],
+            mapSeed: `local-${Math.random().toString(36).slice(2)}`,
+            mapStructures: [],
+            generatedWorldChunks: new Set(),
+            citySceneCache: new Map(),
+            lootEvents: [],
+            appliedLootEvents: new Set(),
+            lootBeacon: null,
+            nextLocalWorldDropAt: performance.now() + 18000,
             traps: [], 
             buildings: [],
             empPulses: [], 
@@ -198,13 +207,12 @@
             },
             
             // Weapons
-            weapons: [
-                { name: 'Pistol', cost: 0, damage: 35, fireRate: 300, maxAmmo: 12, owned: true, speed: 8, bulletSize: 4, reloadTime: 1500, currentAmmo: 12, isReloading: false, upgradeLevel: 0 },
-                { name: 'Shotgun', cost: 100, damage: 12.5, fireRate: 600, maxAmmo: 8, owned: false, speed: 6, pellets: 16, bulletSize: 3, reloadTime: 2500, currentAmmo: 8, isReloading: false, upgradeLevel: 0 },
-                { name: 'Assault Rifle', cost: 200, damage: 25, fireRate: 100, maxAmmo: 30, owned: false, speed: 10, bulletSize: 3, reloadTime: 2000, currentAmmo: 30, isReloading: false, upgradeLevel: 0 },
-                { name: 'Mini Gun', cost: 1000, damage: 30, fireRate: 20, maxAmmo: 100, owned: false, speed: 12, bulletSize: 2, reloadTime: 4000, currentAmmo: 100, isReloading: false, upgradeLevel: 0 },
-                { name: 'RPG', cost: 10000, damage: 450, fireRate: 2000, maxAmmo: 3, owned: false, speed: 5, explosive: true, bulletSize: 6, reloadTime: 3000, currentAmmo: 3, isReloading: false, upgradeLevel: 0 }
-            ],
+            weapons: LastShopperContent.weaponTypes.map((weapon) => ({
+                ...weapon,
+                currentAmmo: weapon.maxAmmo,
+                isReloading: false,
+                upgradeLevel: 0
+            })),
             selectedWeapon: 0,
             lastShot: 0,
             
@@ -373,6 +381,10 @@
                                 this.collectSupplyDrop();
                             } else if (station === 'trader' && !this.workbenchOpen && !this.shopOpen) {
                                 this.toggleTrader(!this.traderOpen);
+                            } else if (station && station.startsWith('door:')) {
+                                this.toggleWorldDoor(station.slice('door:'.length));
+                            } else if (station && station.startsWith('loot:')) {
+                                this.openWorldLoot(station.slice('loot:'.length));
                             } else if (station && station.startsWith('building:') && !this.workbenchOpen && !this.shopOpen) {
                                 this.toggleBuilding(!this.buildingOpen, station.slice('building:'.length));
                             }
@@ -381,7 +393,7 @@
                         this.refillNearbyTurret();
                     }
                     
-                    if (e.key >= '1' && e.key <= '5') {
+                    if (e.key >= '1' && e.key <= '8') {
                         this.selectWeapon(parseInt(e.key) - 1);
                     }
                     
@@ -435,6 +447,7 @@
                 startGameButton.onclick = () => this.requestStartGame();
                 hostRoomButton.onclick = () => this.hostRoom();
                 joinRoomButton.onclick = () => this.joinRoom();
+                copyInviteButton.onclick = () => this.copyRoomInvite();
                 zombieIndexLobbyButton.onclick = () => this.toggleZombieIndex(true);
                 zombieIndexHudButton.onclick = () => this.toggleZombieIndex(true);
                 zombieIndexSearch.oninput = () => {
@@ -523,6 +536,13 @@
                 this.acidPools = [];
                 this.traps = []; 
                 this.buildings = [];
+                this.mapStructures = [];
+                this.generatedWorldChunks = new Set();
+                this.citySceneCache = new Map();
+                this.lootEvents = [];
+                this.appliedLootEvents = new Set();
+                this.lootBeacon = null;
+                this.nextLocalWorldDropAt = performance.now() + 18000;
                 this.empPulses = []; 
                 this.healParticles = []; 
                 this.wave = 0;
@@ -617,6 +637,8 @@
                 if (!inputBlocked) this.updatePlayer();
                 if (this.syncMultiplayer) this.syncMultiplayer();
                 if (!this.isWorldHost || this.isWorldHost()) {
+                    if (this.ensureLocalWorldChunks) this.ensureLocalWorldChunks();
+                    if (this.updateLocalWorldEvents) this.updateLocalWorldEvents();
                     if (!this.waitingForReward) {
                         this.updateZombies(); 
                         this.updateBullets();
@@ -628,6 +650,7 @@
                         this.updateHealParticles(); 
                     }
                 }
+                if (this.advanceNetworkInterpolation) this.advanceNetworkInterpolation();
                 this.updateExplosions();
                 this.updateParticles();
                 this.updateCamera();
@@ -694,9 +717,6 @@
                     this.resolvePlayerEnvironmentCollision(previousX, previousY);
                 }
                 
-                this.player.x = Math.max(20, Math.min(this.MAP_WIDTH - 20, this.player.x));
-                this.player.y = Math.max(20, Math.min(this.MAP_HEIGHT - 20, this.player.y));
-                
                 if (this.updateMouseWorld) this.updateMouseWorld();
                 this.player.angle = Math.atan2(this.mouse.worldY - this.player.y, this.mouse.worldX - this.player.x);
                 
@@ -757,6 +777,9 @@
                     const nearestTarget = this.getNearestEnemyTarget(z, true);
                     const playerDist = this.dist(z.x, z.y, this.player.x, this.player.y);
                     const targetDist = nearestTarget.distance;
+                    const breachPlan = this.getShelterBreachPlan
+                        ? this.getShelterBreachPlan(z, nearestTarget)
+                        : null;
                     if (this.updateBossMechanics && this.updateBossMechanics(z, nearestTarget, now)) {
                         didAction = true;
                     }
@@ -768,13 +791,13 @@
                     const moveSpeed = z.isCharger && now < (z.chargeUntil || 0) ? z.chargeSpeed : z.speed;
 
                     // --- RANGED ATTACK AI ---
-                    if ((z.type === 'spitter' || z.type === 'boss' || z.type === 'miniBoss' || z.isAcidRanger || z.isBoss || z.isMiniBoss) && targetDist < z.shootRange) {
+                    if (!breachPlan && (z.type === 'spitter' || z.type === 'boss' || z.type === 'miniBoss' || z.isAcidRanger || z.isBoss || z.isMiniBoss) && targetDist < z.shootRange) {
                         didAction = true; 
                         if (now - z.lastShot > z.shootRate) {
                             z.lastShot = now;
                             this.shootAcid(z.x, z.y, nearestTarget.x, nearestTarget.y, false);
                         }
-                    } else if (z.type === 'thrower' && targetDist < z.throwRange) {
+                    } else if (!breachPlan && z.type === 'thrower' && targetDist < z.throwRange) {
                         didAction = true; 
                         if (now - z.lastShot > z.throwRate) {
                             z.lastShot = now;
@@ -791,9 +814,21 @@
                     }
 
                     // --- MELEE / MOVEMENT AI ---
+                    if (!didAction && this.damageShelterEntry && this.damageShelterEntry(z, breachPlan, now)) {
+                        didAction = true;
+                    }
                     if (!didAction) {
+                        if (breachPlan) {
+                            if (breachPlan.distance > 2) {
+                                const dx = breachPlan.entry.x - z.x;
+                                const dy = breachPlan.entry.y - z.y;
+                                const distance = Math.max(1, breachPlan.distance);
+                                z.x += (dx / distance) * moveSpeed;
+                                z.y += (dy / distance) * moveSpeed;
+                            }
+                        }
                         // --- SAPPER AI (NEW) ---
-                        if (z.isSapper || z.isBomber) {
+                        else if (z.isSapper || z.isBomber) {
                             if (nearestTarget) {
                                 if (targetDist <= z.size + nearestTarget.radius) { 
                                     // EXPLODE
@@ -895,8 +930,11 @@
             updateBullets: function() {
                 for (let i = this.bullets.length - 1; i >= 0; i--) {
                     const b = this.bullets[i];
+                    const previousBulletX = b.x;
+                    const previousBulletY = b.y;
                     b.x += b.vx;
                     b.y += b.vy;
+                    b.life = (b.life || 240) - 1;
                     
                     if (b.arcing) {
                         b.arcVelocity += 0.015;
@@ -910,7 +948,21 @@
                         }
                     }
                     
-                    if (b.x < 0 || b.x > this.MAP_WIDTH || b.y < 0 || b.y > this.MAP_HEIGHT) {
+                    if (b.life <= 0) {
+                        if (b.explosive) this.createExplosion(b.x, b.y, b.damage);
+                        if (b.acid) this.createAcidPool(b.x, b.y);
+                        this.bullets.splice(i, 1);
+                        continue;
+                    }
+                    if (window.LastShopperWorld && (this.mapStructures || []).some((structure) =>
+                        window.LastShopperWorld.segmentHitsStructure(
+                            structure,
+                            previousBulletX,
+                            previousBulletY,
+                            b.x,
+                            b.y,
+                            b.size || 4
+                        ))) {
                         if (b.explosive) this.createExplosion(b.x, b.y, b.damage);
                         if (b.acid) this.createAcidPool(b.x, b.y);
                         this.bullets.splice(i, 1);
@@ -956,14 +1008,17 @@
                     if (b.fromZombie) {
                         const d = this.dist(b.x, b.y, this.player.x, this.player.y);
                         if (d < this.PLAYER_RADIUS) { 
-                            this.applyPlayerDamage(b.damage);
+                            const sheltered = window.LastShopperWorld && (this.mapStructures || []).some((structure) =>
+                                window.LastShopperWorld.pointInside(structure, this.player.x, this.player.y, 2));
+                            if (!sheltered) this.applyPlayerDamage(b.damage);
                             if (b.acid) this.createAcidPool(b.x, b.y);
                             this.bullets.splice(i, 1);
-                            this.addCameraShake(4);
+                            if (!sheltered) this.addCameraShake(4);
                         }
                     } else {
                         for (let j = 0; j < this.zombies.length; j++) {
                             const z = this.zombies[j];
+                            if (b.hitIds?.includes(z.id || j)) continue;
                             if (this.tryBossDodge && this.tryBossDodge(z, b)) continue;
                             if (this.dist(b.x, b.y, z.x, z.y) < z.size) { 
                                 if (b.explosive) {
@@ -975,7 +1030,12 @@
                                         this.player.health = Math.min(this.player.maxHealth, this.player.health + b.damage * 0.08);
                                     }
                                 }
-                                this.bullets.splice(i, 1);
+                                if (b.pierce > 0 && !b.explosive) {
+                                    b.pierce--;
+                                    (b.hitIds ||= []).push(z.id || j);
+                                } else {
+                                    this.bullets.splice(i, 1);
+                                }
                                 break;
                             }
                         }
@@ -1005,6 +1065,9 @@
             
             updateSentries: function() {
                 const now = performance.now();
+                const powerRelayOnline = this.buildings.some((building) => building.id === 'powerRelay' && building.health > 0);
+                const canRefill = powerRelayOnline && now - (this.lastPowerRelayTick || 0) >= 3000;
+                if (canRefill) this.lastPowerRelayTick = now;
                 for (let i = this.sentries.length - 1; i >= 0; i--) {
                     const s = this.sentries[i];
                     if (s.health <= 0) {
@@ -1018,7 +1081,8 @@
                     }
 
                     let closestZombie = null;
-                    let closestDist = s.range;
+                    let closestDist = s.range * (powerRelayOnline ? 1.15 : 1);
+                    if (canRefill && s.ammo < s.maxAmmo) s.ammo++;
                     
                     for (const z of this.zombies) {
                         const d = this.dist(s.x, s.y, z.x, z.y);
@@ -1183,9 +1247,6 @@
                 this.camera.x += (this.camera.targetX - this.camera.x) * 0.1;
                 this.camera.y += (this.camera.targetY - this.camera.y) * 0.1;
                 
-                this.camera.x = Math.max(0, Math.min(this.MAP_WIDTH - canvas.width, this.camera.x));
-                this.camera.y = Math.max(0, Math.min(this.MAP_HEIGHT - canvas.height, this.camera.y));
-                
                 if (this.camera.shakeIntensity > 0) {
                     this.camera.shake = (Math.random() - 0.5) * this.camera.shakeIntensity * 2;
                     this.camera.shakeIntensity *= 0.9;
@@ -1323,6 +1384,7 @@
                 ctx.translate(-this.camera.x + this.camera.shake, -this.camera.y + this.camera.shake);
                 
                 this.drawMap();
+                if (this.drawWorldStructures) this.drawWorldStructures();
                 this.drawTraps(); 
                 if (this.drawBuildings) this.drawBuildings();
                 this.drawWalls();
@@ -1337,6 +1399,7 @@
                 this.drawHealParticles(); 
                 if (this.drawRemotePlayers) this.drawRemotePlayers();
                 this.drawPlayer();
+                if (this.drawWorldStructureRoofs) this.drawWorldStructureRoofs();
                 
                 if (this.placingSentry) this.drawSentryPreview();
                 if (this.placingWall) this.drawWallPreview();
@@ -1348,40 +1411,26 @@
 
             drawMap: function() {
                 ctx.fillStyle = '#1A1A1A';
-                ctx.fillRect(0, 0, this.MAP_WIDTH, this.MAP_HEIGHT);
+                ctx.fillRect(this.camera.x - 120, this.camera.y - 120, canvas.width + 240, canvas.height + 240);
                 
                 ctx.strokeStyle = '#2A2A2A';
                 ctx.lineWidth = 1;
                 ctx.beginPath();
-                for (let x = 0; x < this.MAP_WIDTH; x += 100) {
-                    ctx.moveTo(x, 0);
-                    ctx.lineTo(x, this.MAP_HEIGHT);
+                const left = Math.floor((this.camera.x - 120) / 100) * 100;
+                const top = Math.floor((this.camera.y - 120) / 100) * 100;
+                const right = this.camera.x + canvas.width + 120;
+                const bottom = this.camera.y + canvas.height + 120;
+                for (let x = left; x <= right; x += 100) {
+                    ctx.moveTo(x, top);
+                    ctx.lineTo(x, bottom);
                 }
-                for (let y = 0; y < this.MAP_HEIGHT; y += 100) {
-                    ctx.moveTo(0, y);
-                    ctx.lineTo(this.MAP_WIDTH, y);
+                for (let y = top; y <= bottom; y += 100) {
+                    ctx.moveTo(left, y);
+                    ctx.lineTo(right, y);
                 }
                 ctx.stroke();
-                
-                for (const gate of this.spawnGates) {
-                    ctx.save();
-                    ctx.translate(gate.x, gate.y);
-                    for (let i = 4; i > 0; i--) {
-                        ctx.fillStyle = `rgba(139, 0, 0, ${0.1 * i})`;
-                        ctx.beginPath();
-                        ctx.arc(0, 0, 20 + i * 15, 0, Math.PI * 2);
-                        ctx.fill();
-                    }
-                    ctx.fillStyle = '#581C0D';
-                    ctx.beginPath();
-                    ctx.arc(0, 0, 30, 0, Math.PI * 2);
-                    ctx.fill();
-                    ctx.fillStyle = '#991B1B';
-                    ctx.beginPath();
-                    ctx.arc(0, 0, 15, 0, Math.PI * 2);
-                    ctx.fill();
-                    ctx.restore();
-                }
+
+                if (this.drawCityTerrain) this.drawCityTerrain();
                 
                 this.drawShopBuilding();
                 this.drawWorkbenchStation();
@@ -1770,6 +1819,7 @@
                 const angle = this.player.angle;
                 this.addCameraShake(weapon.pellets ? 3 : 2);
                 if (this.broadcastShotAction) this.broadcastShotAction(weapon, angle);
+                if (this.multiplayer?.serverAuthoritative) return;
                 
                 if (weapon.pellets) {
                     for (let i = 0; i < weapon.pellets; i++) {
@@ -1781,6 +1831,7 @@
                             vy: Math.sin(angle + spread) * weapon.speed,
                             damage: this.getPlayerBulletDamage(weapon.damage),
                             explosive: weapon.explosive,
+                            pierce: weapon.pierce || 0,
                             size: weapon.bulletSize,
                             ownerId: this.localPlayerId
                         });
@@ -1793,6 +1844,7 @@
                         vy: Math.sin(angle) * weapon.speed,
                         damage: this.getPlayerBulletDamage(weapon.damage),
                         explosive: weapon.explosive,
+                        pierce: weapon.pierce || 0,
                         size: weapon.bulletSize,
                         ownerId: this.localPlayerId
                     });
@@ -1819,13 +1871,13 @@
                 if (!weapon || weapon.isReloading || weapon.currentAmmo === weapon.maxAmmo) return;
                 const reloadDuration = weapon.reloadTime * Math.pow(0.92, this.player.skillLevels.reloadSpeed);
                 
-                if (weapon.name === 'RPG') {
-                    if (this.player.reserveAmmo < 250) return;
+                if (weapon.ammoCost) {
+                    if (this.player.reserveAmmo < weapon.ammoCost) return;
                     
                     weapon.isReloading = true;
                     setTimeout(() => {
                         weapon.currentAmmo = weapon.maxAmmo;
-                        this.player.reserveAmmo -= 250;
+                        this.player.reserveAmmo -= weapon.ammoCost;
                         weapon.isReloading = false;
                         this.updateHUD();
                     }, reloadDuration);
@@ -1905,8 +1957,8 @@
                 weapon.owned = true;
                 weapon.currentAmmo = weapon.maxAmmo;
                 
-                if (weapon.name === 'RPG') {
-                    this.player.reserveAmmo += 250;
+                if (weapon.ammoCost) {
+                    this.player.reserveAmmo += weapon.ammoCost;
                 } else {
                     this.player.reserveAmmo += weapon.maxAmmo * 2; 
                 }

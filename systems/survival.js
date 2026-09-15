@@ -75,11 +75,24 @@
         setupLobby: function () {
             playerNameInput.value = this.metaProgression.playerName || 'The Shopper';
             roomCodeInput.value = new URLSearchParams(location.search).get('room') || this.roomCode;
-            cloudRelayInput.value = new URLSearchParams(location.search).get('ws') || '';
+            cloudRelayInput.value = new URLSearchParams(location.search).get('ws') || localStorage.getItem('lastShopperRelay') || '';
             this.populateSkinList();
             this.updateSkinPreview();
             this.updateLobbyMeta();
             this.updatePartyList();
+            this.discoverSameOriginRelay();
+        },
+
+        discoverSameOriginRelay: async function () {
+            if (cloudRelayInput.value || !location.host) return;
+            try {
+                const response = await fetch('/healthz', { cache: 'no-store' });
+                const health = response.ok ? await response.json() : null;
+                if (health?.service !== 'last-shopper') return;
+                cloudRelayInput.value = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/room`;
+            } catch {
+                // Static Sites deployments use a separately configured relay URL.
+            }
         },
 
         applyLobbySelections: function () {
@@ -253,8 +266,23 @@
             this.applyLobbySelections();
             this.roomCode = code || 'STORE';
             const relay = cloudRelayInput.value.trim();
+            if (relay) localStorage.setItem('lastShopperRelay', relay);
             if (this.multiplayer) this.multiplayer.connect(this.roomCode, relay, { host: this.isRoomHost });
             this.updatePartyList();
+        },
+
+        copyRoomInvite: async function () {
+            const code = (roomCodeInput.value || this.roomCode || 'STORE').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+            const relay = cloudRelayInput.value.trim();
+            const params = new URLSearchParams({ room: code });
+            if (relay) params.set('ws', relay);
+            const invite = `${location.origin}${location.pathname}?${params.toString()}`;
+            try {
+                await navigator.clipboard.writeText(invite);
+                this.setMultiplayerStatus('Invite copied. Send it to your squad.', 'online');
+            } catch {
+                this.setMultiplayerStatus(`Invite: ${invite}`, 'online');
+            }
         },
 
         syncMultiplayer: function () {
@@ -285,6 +313,11 @@
                 maxHealth: this.player.maxHealth,
                 wave: this.wave,
                 level: this.player.level,
+                weapons: this.weapons.map((weapon) => ({
+                    id: weapon.id,
+                    owned: Boolean(weapon.owned),
+                    upgradeLevel: weapon.upgradeLevel || 0
+                })),
                 isHost: this.isRoomHost,
                 gameStarted: this.gameStarted
             };
@@ -311,10 +344,60 @@
                 walls: this.walls,
                 traps: this.traps,
                 buildings: this.buildings,
+                mapSeed: this.mapSeed,
+                mapStructures: this.mapStructures,
+                lootEvents: this.lootEvents,
+                lootBeacon: this.lootBeacon,
                 drops: this.drops,
                 acidPools: this.acidPools,
                 gameStarted: this.gameStarted
             };
+        },
+
+        mergeNetworkEntities: function (current, incoming) {
+            const previousById = new Map((current || []).filter((entry) => entry.id).map((entry) => [entry.id, entry]));
+            return (incoming || []).map((entry) => {
+                const previous = entry.id ? previousById.get(entry.id) : null;
+                if (!previous) return { ...entry, networkX: entry.x, networkY: entry.y };
+                const teleported = Math.hypot(entry.x - previous.x, entry.y - previous.y) > 240;
+                return {
+                    ...previous,
+                    ...entry,
+                    x: teleported ? entry.x : previous.x,
+                    y: teleported ? entry.y : previous.y,
+                    networkX: entry.x,
+                    networkY: entry.y
+                };
+            });
+        },
+
+        applyMapStructureStates: function (states) {
+            if (!states?.length || !this.mapStructures?.length) return;
+            const structuresById = new Map(this.mapStructures.map((structure) => [structure.id, structure]));
+            for (const state of states) {
+                const structure = structuresById.get(state.id);
+                if (!structure) continue;
+                Object.assign(structure.door, state.door || {});
+                const windowsById = new Map((structure.windows || []).map((entry) => [entry.id, entry]));
+                for (const windowState of state.windows || []) {
+                    const entry = windowsById.get(windowState.id);
+                    if (entry) Object.assign(entry, windowState);
+                }
+                if (structure.loot) structure.loot.claimed = Boolean(state.lootClaimed);
+            }
+        },
+
+        advanceNetworkInterpolation: function () {
+            if (!this.multiplayer?.serverAuthoritative) return;
+            const smooth = (entities, alpha) => {
+                for (const entity of entities || []) {
+                    if (!Number.isFinite(entity.networkX) || !Number.isFinite(entity.networkY)) continue;
+                    entity.x += (entity.networkX - entity.x) * alpha;
+                    entity.y += (entity.networkY - entity.y) * alpha;
+                }
+            };
+            smooth(this.zombies, 0.34);
+            smooth(this.bullets, 0.58);
         },
 
         applyWorldSnapshot: function (world) {
@@ -340,12 +423,23 @@
             this.preparationEndsAt = this.preparationActive ? performance.now() + (world.preparationEndsIn || 0) : 0;
             this.supplyDrop = world.supplyDrop || null;
             this.trader = world.trader || null;
-            this.zombies = world.zombies || [];
-            this.bullets = world.bullets || [];
+            if (this.multiplayer?.serverAuthoritative) {
+                this.zombies = this.mergeNetworkEntities(this.zombies, world.zombies || []);
+                this.bullets = this.mergeNetworkEntities(this.bullets, world.bullets || []);
+            } else {
+                this.zombies = world.zombies || [];
+                this.bullets = world.bullets || [];
+            }
             this.sentries = world.sentries || [];
             this.walls = world.walls || [];
             this.traps = world.traps || [];
             this.buildings = world.buildings || [];
+            this.mapSeed = world.mapSeed || this.mapSeed;
+            if (world.mapStructures) this.mapStructures = world.mapStructures;
+            this.applyMapStructureStates(world.mapStructureStates);
+            this.lootEvents = world.lootEvents || [];
+            this.lootBeacon = world.lootBeacon || null;
+            this.applyLootEvents(this.lootEvents);
             this.drops = world.drops || [];
             this.acidPools = world.acidPools || [];
             if (world.players) {
@@ -359,6 +453,19 @@
                     .map((player) => ({ ...player, lastSeen: performance.now() }));
                 this.team.playerCount = Math.max(1, world.players.length);
                 this.updatePartyList();
+            }
+        },
+
+        applyLootEvents: function (events) {
+            if (!this.appliedLootEvents) this.appliedLootEvents = new Set();
+            for (const event of events || []) {
+                if (!event || event.playerId !== this.localPlayerId || this.appliedLootEvents.has(event.id)) continue;
+                this.appliedLootEvents.add(event.id);
+                if (event.type === 'money') this.player.money += event.amount || 0;
+                else if (event.type === 'wood') this.player.wood += event.amount || 1;
+                else if (event.type === 'metal') this.player.metal += event.amount || 1;
+                else if (event.type === 'ammo') this.player.reserveAmmo += event.amount || 20;
+                else if (event.type === 'medkit') this.player.health = Math.min(this.player.maxHealth, this.player.health + (event.amount || 30));
             }
         },
 
@@ -386,6 +493,8 @@
                     angle
                 },
                 weapon: {
+                    id: weapon.id,
+                    upgradeLevel: weapon.upgradeLevel || 0,
                     damage: this.getPlayerBulletDamage(weapon.damage),
                     speed: weapon.speed,
                     pellets: weapon.pellets || 0,
@@ -423,6 +532,25 @@
                 target.push(action.entity);
                 return;
             }
+            if (action.kind === 'toggleDoor') {
+                const structure = (this.mapStructures || []).find((entry) => entry.id === action.structureId);
+                if (structure && !structure.door.destroyed) structure.door.open = !structure.door.open;
+                return;
+            }
+            if (action.kind === 'openStructureLoot') {
+                const structure = (this.mapStructures || []).find((entry) => entry.id === action.structureId);
+                if (!structure || structure.loot.claimed) return;
+                structure.loot.claimed = true;
+                ['money', 'ammo', 'wood', 'metal'].forEach((type) => {
+                    this.drops.push({
+                        x: structure.loot.x + Math.random() * 34 - 17,
+                        y: structure.loot.y + Math.random() * 34 - 17,
+                        type,
+                        life: 1800
+                    });
+                });
+                return;
+            }
             if (action.kind === 'shot' && action.player && action.weapon) {
                 this.spawnRemoteShot(action.player, action.weapon);
             }
@@ -441,6 +569,7 @@
                     vy: Math.sin(angle + spread) * weapon.speed,
                     damage: weapon.damage,
                     explosive: weapon.explosive,
+                    pierce: weapon.pierce || 0,
                     size: weapon.bulletSize,
                     ownerId: player.id
                 });
@@ -495,7 +624,8 @@
                 spitter: ['Special', 5, 'Keeps range and fires acid projectiles.', 'Keep moving sideways and break line pressure.', 'Cash, XP, and ammo chance.'],
                 thrower: ['Special', 14, 'Throws arcing acid over defenses.', 'Spread structures out and push it quickly.', 'Cash and metal chance.'],
                 bomber: ['Special', 7, 'Explodes when it reaches a player or structure.', 'Shoot it before it touches walls or turrets.', 'High cash and explosive salvage.'],
-                sapper: ['Special', 7, 'A volatile demolition runner.', 'Do not let it reach the base.', 'High-risk cash reward.'],
+                sapper: ['Special', 6, 'Ignores survivors while defenses are standing and detonates on structures.', 'Intercept it before it reaches the relay, turret, or outer wall.', 'High-risk cash reward.'],
+                stalker: ['Special', 6, 'Flanks around the player instead of taking the direct path.', 'Keep moving and avoid fighting alone in open lanes.', 'Cash, XP, and ammo chance.'],
                 shield: ['Special', 8, 'Carries a shield that absorbs damage first.', 'Flank with traps or sustained turret fire.', 'Cash, XP, and shield scrap.'],
                 armored: ['Special', 9, 'Armored plating reduces incoming damage.', 'Upgrade turret damage and use explosives.', 'Metal-heavy rewards.'],
                 acidRanger: ['Special', 9, 'Long-range acid shooter.', 'Close distance or outrange with rifle/turrets.', 'Ammo and cash chance.'],
@@ -700,6 +830,369 @@
             resolveRect(this.shop);
             resolveRect(this.workbench);
             this.buildings.forEach(resolveRect);
+            if (window.LastShopperWorld) {
+                for (const structure of this.mapStructures || []) {
+                    if (this.dist(this.player.x, this.player.y, structure.x, structure.y) > Math.max(structure.width, structure.height)) continue;
+                    window.LastShopperWorld.wallSegments(structure).forEach(resolveRect);
+                }
+            }
+        },
+
+        ensureLocalWorldChunks: function () {
+            if (!window.LastShopperWorld || this.multiplayer?.serverAuthoritative) return;
+            const size = window.LastShopperWorld.CHUNK_SIZE;
+            const cx = Math.floor(this.player.x / size);
+            const cy = Math.floor(this.player.y / size);
+            for (let ox = -1; ox <= 1; ox++) {
+                for (let oy = -1; oy <= 1; oy++) {
+                    const key = window.LastShopperWorld.chunkKey(cx + ox, cy + oy);
+                    if (this.generatedWorldChunks.has(key)) continue;
+                    this.generatedWorldChunks.add(key);
+                    this.mapStructures.push(...window.LastShopperWorld.generateChunk(this.mapSeed, cx + ox, cy + oy));
+                }
+            }
+        },
+
+        updateLocalWorldEvents: function () {
+            const now = performance.now();
+            if (now < this.nextLocalWorldDropAt) return;
+            const angle = Math.random() * Math.PI * 2;
+            const range = 160 + Math.random() * 100;
+            const x = this.player.x + Math.cos(angle) * range;
+            const y = this.player.y + Math.sin(angle) * range;
+            this.lootBeacon = { x, y, expiresAt: now + 90000 };
+            const types = ['money', 'ammo', 'wood', 'metal', 'medkit'];
+            for (let i = 0; i < 5; i++) {
+                this.drops.push({ x: x + Math.random() * 50 - 25, y: y + Math.random() * 50 - 25, type: types[i], life: 1800 });
+            }
+            this.nextLocalWorldDropAt = now + 60000 + Math.random() * 30000;
+        },
+
+        toggleWorldDoor: function (structureId) {
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'toggleDoor', structureId });
+                return;
+            }
+            const structure = (this.mapStructures || []).find((entry) => entry.id === structureId);
+            if (structure && !structure.door.destroyed) structure.door.open = !structure.door.open;
+        },
+
+        openWorldLoot: function (structureId) {
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'openStructureLoot', structureId });
+                return;
+            }
+            const structure = (this.mapStructures || []).find((entry) => entry.id === structureId);
+            if (!structure || structure.loot.claimed) return;
+            structure.loot.claimed = true;
+            const types = ['money', 'ammo', 'wood', 'metal'];
+            for (let i = 0; i < types.length; i++) {
+                this.drops.push({ x: structure.loot.x + Math.random() * 34 - 17, y: structure.loot.y + Math.random() * 34 - 17, type: types[i], life: 1800 });
+            }
+        },
+
+        drawCityTerrain: function () {
+            if (!window.LastShopperWorld) return;
+            if (!this.citySceneCache) this.citySceneCache = new Map();
+            const chunkSize = window.LastShopperWorld.CHUNK_SIZE;
+            const minChunkX = Math.floor((this.camera.x - 160) / chunkSize);
+            const maxChunkX = Math.floor((this.camera.x + canvas.width + 160) / chunkSize);
+            const minChunkY = Math.floor((this.camera.y - 160) / chunkSize);
+            const maxChunkY = Math.floor((this.camera.y + canvas.height + 160) / chunkSize);
+            const districtColors = {
+                residential: '#252825',
+                commercial: '#292725',
+                industrial: '#25282a',
+                civic: '#28282b',
+                park: '#222a23'
+            };
+            for (let cx = minChunkX; cx <= maxChunkX; cx++) {
+                for (let cy = minChunkY; cy <= maxChunkY; cy++) {
+                    const cacheKey = `${this.mapSeed}:${cx}:${cy}`;
+                    let scene = this.citySceneCache.get(cacheKey);
+                    if (!scene) {
+                        scene = window.LastShopperWorld.generateChunkScene(this.mapSeed, cx, cy);
+                        this.citySceneCache.set(cacheKey, scene);
+                    }
+                    const baseX = cx * chunkSize;
+                    const baseY = cy * chunkSize;
+                    ctx.fillStyle = districtColors[scene.district] || '#252525';
+                    ctx.fillRect(baseX, baseY, chunkSize, chunkSize);
+
+                    for (const road of scene.roads) {
+                        ctx.fillStyle = '#4a4742';
+                        ctx.fillRect(road.x - road.width / 2 - 14, road.y - road.height / 2 - 14, road.width + 28, road.height + 28);
+                        ctx.fillStyle = '#20242a';
+                        ctx.fillRect(road.x - road.width / 2, road.y - road.height / 2, road.width, road.height);
+                        ctx.strokeStyle = '#b78c3f';
+                        ctx.lineWidth = 3;
+                        ctx.setLineDash([24, 22]);
+                        ctx.beginPath();
+                        if (road.orientation === 'horizontal') {
+                            ctx.moveTo(road.x - road.width / 2, road.y);
+                            ctx.lineTo(road.x + road.width / 2, road.y);
+                        } else {
+                            ctx.moveTo(road.x, road.y - road.height / 2);
+                            ctx.lineTo(road.x, road.y + road.height / 2);
+                        }
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                    }
+
+                    const centerX = baseX + chunkSize / 2;
+                    const centerY = baseY + chunkSize / 2;
+                    ctx.fillStyle = 'rgba(226,232,240,.55)';
+                    for (let stripe = -54; stripe <= 54; stripe += 18) {
+                        ctx.fillRect(centerX - 76, centerY + stripe - 3, 22, 6);
+                        ctx.fillRect(centerX + stripe - 3, centerY - 76, 6, 22);
+                    }
+
+                    for (const decoration of scene.decorations) {
+                        ctx.save();
+                        ctx.translate(decoration.x, decoration.y);
+                        if (decoration.type === 'park') {
+                            ctx.fillStyle = '#263b29';
+                            ctx.fillRect(-decoration.width / 2, -decoration.height / 2, decoration.width, decoration.height);
+                            ctx.strokeStyle = '#52634e';
+                            ctx.lineWidth = 5;
+                            ctx.strokeRect(-decoration.width / 2, -decoration.height / 2, decoration.width, decoration.height);
+                            ctx.fillStyle = '#7c6f59';
+                            ctx.fillRect(-decoration.width / 2, -9, decoration.width, 18);
+                            ctx.fillRect(-9, -decoration.height / 2, 18, decoration.height);
+                        } else if (decoration.type === 'tree') {
+                            ctx.fillStyle = '#3f2d20';
+                            ctx.fillRect(-3, -2, 6, 14);
+                            ctx.fillStyle = '#355b34';
+                            ctx.beginPath();
+                            ctx.arc(0, -7, decoration.size, 0, Math.PI * 2);
+                            ctx.fill();
+                            ctx.fillStyle = '#4d7443';
+                            ctx.beginPath();
+                            ctx.arc(-4, -11, decoration.size * .55, 0, Math.PI * 2);
+                            ctx.fill();
+                        } else if (decoration.type === 'bench') {
+                            ctx.rotate(decoration.rotation || 0);
+                            ctx.fillStyle = '#6b4b2f';
+                            ctx.fillRect(-18, -5, 36, 10);
+                            ctx.fillStyle = '#27211c';
+                            ctx.fillRect(-14, 5, 4, 6);
+                            ctx.fillRect(10, 5, 4, 6);
+                        } else if (decoration.type === 'manhole') {
+                            ctx.fillStyle = '#111827';
+                            ctx.beginPath(); ctx.arc(0, 0, decoration.size, 0, Math.PI * 2); ctx.fill();
+                            ctx.strokeStyle = '#64748b';
+                            ctx.lineWidth = 3;
+                            ctx.beginPath(); ctx.arc(0, 0, decoration.size - 3, 0, Math.PI * 2); ctx.stroke();
+                            ctx.beginPath(); ctx.moveTo(-8, -4); ctx.lineTo(8, -4); ctx.moveTo(-8, 4); ctx.lineTo(8, 4); ctx.stroke();
+                        } else if (decoration.type === 'sewer') {
+                            ctx.fillStyle = '#0f1715';
+                            ctx.beginPath(); ctx.arc(0, 0, decoration.size, 0, Math.PI * 2); ctx.fill();
+                            ctx.strokeStyle = '#6b7280';
+                            ctx.lineWidth = 4;
+                            ctx.beginPath(); ctx.arc(0, 0, decoration.size, 0, Math.PI * 2); ctx.stroke();
+                            ctx.strokeStyle = '#65a30d';
+                            ctx.lineWidth = 2;
+                            for (let grate = -12; grate <= 12; grate += 6) {
+                                ctx.beginPath(); ctx.moveTo(grate, -16); ctx.lineTo(grate, 16); ctx.stroke();
+                            }
+                        } else if (decoration.type === 'streetlight') {
+                            ctx.fillStyle = '#111827';
+                            ctx.fillRect(-3, -3, 6, 25);
+                            ctx.fillStyle = '#fde68a';
+                            ctx.shadowColor = '#f59e0b';
+                            ctx.shadowBlur = 12;
+                            ctx.fillRect(-7, -8, 14, 8);
+                            ctx.shadowBlur = 0;
+                        } else if (decoration.type === 'car') {
+                            ctx.rotate(decoration.rotation || 0);
+                            ctx.fillStyle = 'rgba(0,0,0,.35)';
+                            ctx.fillRect(-23, -11, 52, 28);
+                            ctx.fillStyle = decoration.color || '#7c2d12';
+                            ctx.fillRect(-26, -14, 52, 28);
+                            ctx.fillStyle = '#172033';
+                            ctx.fillRect(-11, -11, 22, 22);
+                            ctx.fillStyle = '#09090b';
+                            ctx.fillRect(-20, -18, 10, 5);
+                            ctx.fillRect(10, -18, 10, 5);
+                            ctx.fillRect(-20, 13, 10, 5);
+                            ctx.fillRect(10, 13, 10, 5);
+                        } else if (decoration.type === 'crates') {
+                            ctx.fillStyle = '#6b4423';
+                            ctx.fillRect(-18, -18, 25, 25);
+                            ctx.fillRect(3, -8, 24, 24);
+                            ctx.strokeStyle = '#b7793d';
+                            ctx.strokeRect(-18, -18, 25, 25);
+                            ctx.strokeRect(3, -8, 24, 24);
+                        }
+                        ctx.restore();
+                    }
+
+                    ctx.fillStyle = 'rgba(168,162,158,.55)';
+                    ctx.font = 'bold 10px "Chakra Petch"';
+                    ctx.textAlign = 'left';
+                    ctx.fillText(`${scene.district.toUpperCase()} DISTRICT`, baseX + 22, baseY + 30);
+                }
+            }
+        },
+
+        drawWorldStructures: function () {
+            if (!window.LastShopperWorld) return;
+            for (const structure of this.mapStructures || []) {
+                if (!this.isOnScreen(structure.x, structure.y, Math.max(structure.width, structure.height))) continue;
+                const left = structure.x - structure.width / 2;
+                const top = structure.y - structure.height / 2;
+                ctx.save();
+                ctx.fillStyle = '#292524';
+                ctx.fillRect(left, top, structure.width, structure.height);
+                ctx.strokeStyle = 'rgba(120,113,108,.32)';
+                ctx.lineWidth = 1;
+                for (let x = left + 24; x < left + structure.width; x += 24) {
+                    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + structure.height); ctx.stroke();
+                }
+                for (let y = top + 24; y < top + structure.height; y += 24) {
+                    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(left + structure.width, y); ctx.stroke();
+                }
+                ctx.fillStyle = '#44403c';
+                if (['house', 'townhouse', 'apartment'].includes(structure.type)) {
+                    ctx.fillRect(left + 28, top + 30, 72, 34);
+                    ctx.fillStyle = '#57534e';
+                    ctx.fillRect(left + structure.width - 105, top + structure.height - 62, 76, 30);
+                    ctx.fillStyle = '#78716c';
+                    ctx.fillRect(structure.x - 5, top + 18, 10, structure.height - 36);
+                } else if (['warehouse', 'hardware', 'garage'].includes(structure.type)) {
+                    for (let shelf = left + 35; shelf < left + structure.width - 30; shelf += 62) {
+                        ctx.fillRect(shelf, top + 34, 18, structure.height - 68);
+                    }
+                } else {
+                    ctx.fillRect(left + 28, top + 35, structure.width * .34, 18);
+                    ctx.fillRect(left + structure.width * .58, top + structure.height - 60, structure.width * .28, 20);
+                    ctx.fillStyle = '#78716c';
+                    ctx.fillRect(left + 34, structure.y - 5, structure.width - 68, 10);
+                }
+                ctx.fillStyle = '#78716c';
+                for (const wall of window.LastShopperWorld.wallSegments(structure)) {
+                    ctx.fillRect(wall.x - wall.width / 2, wall.y - wall.height / 2, wall.width, wall.height);
+                }
+                const door = window.LastShopperWorld.doorPoint(structure);
+                const doorHorizontal = ['top', 'bottom'].includes(structure.door.side);
+                if (structure.door.destroyed) {
+                    ctx.fillStyle = '#3f2b1f';
+                    for (let debris = -42; debris <= 42; debris += 21) {
+                        ctx.fillRect(door.x + (doorHorizontal ? debris : -4), door.y + (doorHorizontal ? -4 : debris), 9, 9);
+                    }
+                } else if (structure.door.open) {
+                    ctx.strokeStyle = '#b45309';
+                    ctx.lineWidth = 7;
+                    ctx.beginPath();
+                    ctx.moveTo(door.x, door.y);
+                    ctx.lineTo(door.x + (doorHorizontal ? 44 : 0), door.y + (doorHorizontal ? 0 : 44));
+                    ctx.stroke();
+                } else {
+                    ctx.fillStyle = '#78350f';
+                    ctx.fillRect(
+                        door.x - (doorHorizontal ? structure.door.width * .38 : 7),
+                        door.y - (doorHorizontal ? 7 : structure.door.width * .38),
+                        doorHorizontal ? structure.door.width * .76 : 14,
+                        doorHorizontal ? 14 : structure.door.width * .76
+                    );
+                }
+                if (!structure.door.destroyed && structure.door.health < structure.door.maxHealth) {
+                    const health = Math.max(0, structure.door.health / structure.door.maxHealth);
+                    ctx.fillStyle = '#111827';
+                    ctx.fillRect(door.x - 28, door.y - 24, 56, 5);
+                    ctx.fillStyle = '#f97316';
+                    ctx.fillRect(door.x - 28, door.y - 24, 56 * health, 5);
+                }
+                for (const windowEntry of window.LastShopperWorld.windowPoints(structure)) {
+                    const horizontal = ['top', 'bottom'].includes(windowEntry.side);
+                    if (windowEntry.breached) {
+                        ctx.strokeStyle = '#94a3b8';
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(windowEntry.x - 10, windowEntry.y - 10);
+                        ctx.lineTo(windowEntry.x + 10, windowEntry.y + 10);
+                        ctx.moveTo(windowEntry.x + 10, windowEntry.y - 10);
+                        ctx.lineTo(windowEntry.x - 10, windowEntry.y + 10);
+                        ctx.stroke();
+                    } else {
+                        ctx.fillStyle = '#7dd3fc';
+                        ctx.fillRect(
+                            windowEntry.x - (horizontal ? windowEntry.width * .35 : 5),
+                            windowEntry.y - (horizontal ? 5 : windowEntry.width * .35),
+                            horizontal ? windowEntry.width * .7 : 10,
+                            horizontal ? 10 : windowEntry.width * .7
+                        );
+                        ctx.strokeStyle = '#dbeafe';
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(
+                            windowEntry.x - (horizontal ? windowEntry.width * .35 : 5),
+                            windowEntry.y - (horizontal ? 5 : windowEntry.width * .35),
+                            horizontal ? windowEntry.width * .7 : 10,
+                            horizontal ? 10 : windowEntry.width * .7
+                        );
+                    }
+                    if (!windowEntry.breached && windowEntry.health < windowEntry.maxHealth) {
+                        const health = Math.max(0, windowEntry.health / windowEntry.maxHealth);
+                        ctx.fillStyle = '#111827';
+                        ctx.fillRect(windowEntry.x - 22, windowEntry.y - 20, 44, 4);
+                        ctx.fillStyle = '#38bdf8';
+                        ctx.fillRect(windowEntry.x - 22, windowEntry.y - 20, 44 * health, 4);
+                    }
+                }
+                if (!structure.loot.claimed) {
+                    ctx.fillStyle = '#92400e';
+                    ctx.fillRect(structure.loot.x - 13, structure.loot.y - 10, 26, 20);
+                    ctx.strokeStyle = '#f59e0b';
+                    ctx.strokeRect(structure.loot.x - 13, structure.loot.y - 10, 26, 20);
+                }
+                ctx.restore();
+            }
+            if (this.lootBeacon) {
+                const pulse = 18 + Math.sin(performance.now() / 180) * 5;
+                ctx.save();
+                ctx.strokeStyle = '#fb923c';
+                ctx.lineWidth = 3;
+                ctx.beginPath(); ctx.arc(this.lootBeacon.x, this.lootBeacon.y, pulse, 0, Math.PI * 2); ctx.stroke();
+                ctx.fillStyle = '#fff7ed';
+                ctx.font = 'bold 12px "Chakra Petch"';
+                ctx.textAlign = 'center';
+                ctx.fillText('SUPPLY CACHE', this.lootBeacon.x, this.lootBeacon.y - 28);
+                ctx.restore();
+            }
+        },
+
+        drawWorldStructureRoofs: function () {
+            if (!window.LastShopperWorld) return;
+            const station = this.getNearbyStation();
+            for (const structure of this.mapStructures || []) {
+                if (!this.isOnScreen(structure.x, structure.y, Math.max(structure.width, structure.height))) continue;
+                const inside = window.LastShopperWorld.pointInside(structure, this.player.x, this.player.y, 8);
+                ctx.save();
+                ctx.globalAlpha = inside ? 0.1 : 0.88;
+                ctx.fillStyle = structure.color;
+                ctx.fillRect(
+                    structure.x - structure.width / 2 + 10,
+                    structure.y - structure.height / 2 + 10,
+                    structure.width - 20,
+                    structure.height - 20
+                );
+                ctx.strokeStyle = '#1c1917';
+                ctx.lineWidth = 7;
+                ctx.strokeRect(structure.x - structure.width / 2, structure.y - structure.height / 2, structure.width, structure.height);
+                ctx.globalAlpha = inside ? 0.35 : 1;
+                ctx.fillStyle = '#fff7ed';
+                ctx.font = 'bold 13px "Chakra Petch"';
+                ctx.textAlign = 'center';
+                ctx.fillText(structure.name.toUpperCase(), structure.x, structure.y - structure.height / 2 - 10);
+                ctx.restore();
+                if (station === `door:${structure.id}` || station === `loot:${structure.id}`) {
+                    const target = station.startsWith('door:') ? window.LastShopperWorld.doorPoint(structure) : structure.loot;
+                    ctx.fillStyle = '#fff7ed';
+                    ctx.font = 'bold 14px "Chakra Petch"';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(station.startsWith('door:') ? `[E] ${structure.door.open ? 'CLOSE' : 'OPEN'} DOOR` : '[E] SEARCH LOOT', target.x, target.y - 22);
+                }
+            }
         },
 
         drawDetailedZombies: function () {
@@ -845,6 +1338,25 @@
                     ctx.beginPath();
                     ctx.arc(0, -z.size * 0.18, Math.max(2, z.size * 0.13), 0, Math.PI * 2);
                     ctx.fill();
+                }
+
+                if (z.isSapper) {
+                    ctx.strokeStyle = '#fed7aa';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.moveTo(-z.size * 0.52, -z.size * 0.48);
+                    ctx.lineTo(z.size * 0.16, z.size * 0.2);
+                    ctx.moveTo(-z.size * 0.55, z.size * 0.18);
+                    ctx.lineTo(z.size * 0.18, -z.size * 0.55);
+                    ctx.stroke();
+                }
+
+                if (z.isFlanker) {
+                    ctx.strokeStyle = '#d8b4fe';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(0, -z.size * 0.55, z.size * 0.72, 0.25, Math.PI * 1.72);
+                    ctx.stroke();
                 }
 
                 if (isArmored) {
@@ -1313,8 +1825,8 @@
             this.zombies.push({
                 ...type,
                 type: typeKey,
-                x: Math.max(25, Math.min(this.MAP_WIDTH - 25, x + Math.random() * 70 - 35)),
-                y: Math.max(25, Math.min(this.MAP_HEIGHT - 25, y + Math.random() * 70 - 35)),
+                x: x + Math.random() * 70 - 35,
+                y: y + Math.random() * 70 - 35,
                 health,
                 maxHealth: health,
                 reward: Math.max(4, Math.floor((type.reward || 8) * 0.35)),
@@ -1346,8 +1858,8 @@
                 }
                 if (now - (z.lastBurrow || 0) > (z.burrowRate || 5600) && target.distance > 140) {
                     const angle = Math.random() * Math.PI * 2;
-                    z.emergeX = Math.max(50, Math.min(this.MAP_WIDTH - 50, target.x + Math.cos(angle) * (70 + Math.random() * 55)));
-                    z.emergeY = Math.max(50, Math.min(this.MAP_HEIGHT - 50, target.y + Math.sin(angle) * (70 + Math.random() * 55)));
+                    z.emergeX = target.x + Math.cos(angle) * (70 + Math.random() * 55);
+                    z.emergeY = target.y + Math.sin(angle) * (70 + Math.random() * 55);
                     z.emergeAt = now + 1150;
                     z.hidden = true;
                     z.burrowWarning = { x: z.emergeX, y: z.emergeY, until: z.emergeAt };
@@ -1367,8 +1879,8 @@
                     z.warningLine = null;
                 }
                 if (z.chargeUntil && now < z.chargeUntil) {
-                    z.x = Math.max(20, Math.min(this.MAP_WIDTH - 20, z.x + Math.cos(z.chargeAngle || 0) * (z.chargeSpeed || 5)));
-                    z.y = Math.max(20, Math.min(this.MAP_HEIGHT - 20, z.y + Math.sin(z.chargeAngle || 0) * (z.chargeSpeed || 5)));
+                    z.x += Math.cos(z.chargeAngle || 0) * (z.chargeSpeed || 5);
+                    z.y += Math.sin(z.chargeAngle || 0) * (z.chargeSpeed || 5);
                     for (const wall of this.walls) {
                         if (this.dist(z.x, z.y, wall.x, wall.y) < z.size + (wall.radius || 25)) {
                             if ((wall.wallStage || 0) < 2) wall.health = 0;
@@ -1440,8 +1952,8 @@
             z.dodgeUntil = now + 360;
             const sign = Math.random() < 0.5 ? -1 : 1;
             const angle = Math.atan2(bullet.vy || 0, bullet.vx || 1) + Math.PI / 2 * sign;
-            z.x = Math.max(35, Math.min(this.MAP_WIDTH - 35, z.x + Math.cos(angle) * 76));
-            z.y = Math.max(35, Math.min(this.MAP_HEIGHT - 35, z.y + Math.sin(angle) * 76));
+            z.x += Math.cos(angle) * 76;
+            z.y += Math.sin(angle) * 76;
             return true;
         },
 
@@ -1489,7 +2001,105 @@
             }, null);
         },
 
+        getShelterBreachPlan: function (zombie, target) {
+            if (!window.LastShopperWorld || !target || !['player', 'remotePlayer'].includes(target.kind)) return null;
+            const structure = (this.mapStructures || []).find((entry) =>
+                window.LastShopperWorld.pointInside(entry, target.x, target.y, 2));
+            if (!structure || window.LastShopperWorld.pointInside(structure, zombie.x, zombie.y, -zombie.size)) return null;
+            const entries = [{
+                id: `${structure.id}:door`,
+                kind: 'door',
+                entity: structure.door,
+                width: structure.door.width,
+                ...window.LastShopperWorld.doorPoint(structure)
+            }, ...window.LastShopperWorld.windowPoints(structure).map((entry) => ({
+                id: entry.id,
+                kind: 'window',
+                entity: structure.windows.find((candidate) => candidate.id === entry.id),
+                width: entry.width,
+                x: entry.x,
+                y: entry.y
+            }))];
+            const isPassable = (entry) => entry.kind === 'door'
+                ? entry.entity.open || entry.entity.destroyed
+                : entry.entity.breached;
+            const usableEntries = entries.filter((entry) => (entry.width || 0) >= zombie.size * 2 + 12);
+            const choicesBySize = usableEntries.length ? usableEntries : entries;
+            const passable = choicesBySize.filter(isPassable);
+            const sealed = choicesBySize.filter((entry) => !isPassable(entry));
+            let selected = choicesBySize.find((entry) => entry.id === zombie.breachTargetId);
+            if (!selected) {
+                const preferWindow = zombie.isFlanker || zombie.type === 'runner' || zombie.type === 'fast'
+                    || String(zombie.id || '').charCodeAt(String(zombie.id || '').length - 1) % 3 === 0;
+                const preferred = preferWindow ? sealed.filter((entry) => entry.kind === 'window') : [];
+                const choices = preferred.length ? preferred : (passable.length ? passable : sealed);
+                selected = choices.reduce((nearest, entry) => {
+                    const distance = this.dist(zombie.x, zombie.y, entry.x, entry.y);
+                    return !nearest || distance < nearest.distance ? { ...entry, distance } : nearest;
+                }, null);
+                if (selected) zombie.breachTargetId = selected.id;
+            }
+            if (!selected) return null;
+            return {
+                structure,
+                entry: selected,
+                distance: this.dist(zombie.x, zombie.y, selected.x, selected.y),
+                passable: isPassable(selected)
+            };
+        },
+
+        damageShelterEntry: function (zombie, breachPlan, now) {
+            if (!breachPlan || breachPlan.passable || breachPlan.distance > zombie.size + 24) return false;
+            const entry = breachPlan.entry.entity;
+            if (zombie.isBomber) {
+                entry.health -= zombie.explosionDamage || 180;
+                zombie.health = 0;
+                zombie.exploded = true;
+                this.createExplosion(breachPlan.entry.x, breachPlan.entry.y, zombie.explosionDamage || 180);
+            } else if (now - (zombie.lastBreachHit || 0) >= (zombie.attackRate || 650)) {
+                zombie.lastBreachHit = now;
+                const bossScale = zombie.isBoss || zombie.isMiniBoss ? 2.4 : 1;
+                entry.health -= Math.max(12, (zombie.contactDamage || 8) * 1.45) * (zombie.damageScale || 1) * bossScale;
+                this.createSpark(breachPlan.entry.x, breachPlan.entry.y, breachPlan.entry.kind === 'door' ? [120, 70, 30] : [125, 190, 215], 5);
+            }
+            if (entry.health <= 0) {
+                entry.health = 0;
+                if (breachPlan.entry.kind === 'door') {
+                    entry.destroyed = true;
+                    entry.open = true;
+                } else {
+                    entry.breached = true;
+                }
+                zombie.breachTargetId = null;
+            }
+            return true;
+        },
+
         resolveZombieStructureCollision: function (zombie, previousX, previousY) {
+            if (window.LastShopperWorld) {
+                const blocked = (this.mapStructures || []).some((structure) =>
+                    window.LastShopperWorld.wallSegments(structure).some((wall) =>
+                        this.rectBlocked(zombie.x, zombie.y, zombie.size, wall)));
+                if (blocked) {
+                    const moveX = zombie.x - previousX;
+                    const moveY = zombie.y - previousY;
+                    zombie.x = previousX;
+                    zombie.y = previousY;
+                    const turn = zombie.wallTurn || (zombie.wallTurn = Math.random() < 0.5 ? -1 : 1);
+                    zombie.x += -moveY * turn;
+                    zombie.y += moveX * turn;
+                    const stillBlocked = (this.mapStructures || []).some((structure) =>
+                        window.LastShopperWorld.wallSegments(structure).some((wall) =>
+                            this.rectBlocked(zombie.x, zombie.y, zombie.size, wall)));
+                    if (stillBlocked) {
+                        zombie.x = previousX;
+                        zombie.y = previousY;
+                        zombie.wallTurn *= -1;
+                    }
+                    return;
+                }
+                zombie.wallTurn = 0;
+            }
             const blockers = [
                 ...this.walls.filter((wall) => !wall.isWorkbench),
                 { ...this.workbench, softBlocker: true },
@@ -2081,6 +2691,16 @@
                         <div class="workbench-item-title">Trap Capacity Online</div>
                         <p class="workbench-item-desc">Return to the main workbench Traps tab to craft unlocked traps.</p>
                     </article>`;
+                return;
+            }
+
+            if (building.id === 'powerRelay') {
+                buildingContent.innerHTML = `<p class="window-copy">Installed effect: all turrets gain 15% range and recover one round every three seconds while this relay has power.</p>
+                    <article class="workbench-item workbench-upgrade">
+                        <span class="window-kicker">GRID ONLINE</span>
+                        <div class="workbench-item-title">Defensive Power Network</div>
+                        <p class="workbench-item-desc">Keep the relay standing. It is a priority target for Demolition Sappers.</p>
+                    </article>`;
             }
         },
 
@@ -2150,7 +2770,7 @@
                 turrets: 4 + benchLevel * 2 + (hasAdvancedBench ? 2 : 0),
                 walls: 18 + benchLevel * 10,
                 traps: 6 + benchLevel * 4 + (hasTrapBench ? 4 : 0),
-                buildings: 6
+                buildings: 7
             };
         },
 
@@ -2173,34 +2793,36 @@
         getPlacementValidation: function (kind, item, x, y) {
             const limits = this.getPlacementLimits();
             const radius = item.radius || Math.max(item.width || 0, item.height || 0) / 2 || 20;
-            if (x < radius + 20 || y < radius + 20 || x > this.MAP_WIDTH - radius - 20 || y > this.MAP_HEIGHT - radius - 20) {
-                return { ok: false, message: 'Move placement inside the parking lot.' };
-            }
+            const owned = (entries) => entries.filter((entry) => !entry.ownerId || entry.ownerId === this.localPlayerId);
             if (this.rectBlocked(x, y, radius, this.shop)) return { ok: false, message: 'Cannot build inside the shop.' };
             if (this.rectBlocked(x, y, radius, this.workbench)) return { ok: false, message: 'Keep the workbench clear.' };
+            if (window.LastShopperWorld && (this.mapStructures || []).some((structure) =>
+                window.LastShopperWorld.wallSegments(structure).some((wall) => this.rectBlocked(x, y, radius, wall)))) {
+                return { ok: false, message: 'Cannot build through a building wall.' };
+            }
             if (kind !== 'building' && this.buildings.some((building) => this.rectBlocked(x, y, radius, building))) {
                 return { ok: false, message: 'Too close to a built station.' };
             }
             if (kind === 'turret') {
-                if (this.sentries.length >= limits.turrets) return { ok: false, message: `Turret cap reached: ${limits.turrets}. Upgrade tech or build a turret bench.` };
+                if (owned(this.sentries).length >= limits.turrets) return { ok: false, message: `Turret cap reached: ${limits.turrets}. Upgrade tech or build a turret bench.` };
                 if (this.nearbyAny(x, y, radius, this.sentries, 78)) return { ok: false, message: 'Turrets need more spacing.' };
                 if (this.nearbyAny(x, y, radius, this.walls, 26)) return { ok: false, message: 'Too close to a wall.' };
             }
             if (kind === 'wall') {
-                const wallCount = this.walls.filter((wall) => !wall.isWorkbench).length;
+                const wallCount = owned(this.walls).filter((wall) => !wall.isWorkbench).length;
                 if (wallCount >= limits.walls) return { ok: false, message: `Wall cap reached: ${limits.walls}. Upgrade the bench for more.` };
                 if (this.nearbyAny(x, y, radius, this.walls, 5)) return { ok: false, message: 'Walls cannot overlap.' };
                 if (this.nearbyAny(x, y, radius, this.sentries, 20)) return { ok: false, message: 'Leave space around turrets.' };
             }
             if (kind === 'trap') {
-                if (this.traps.length >= limits.traps) return { ok: false, message: `Trap cap reached: ${limits.traps}. Build a Trap Bench for more.` };
+                if (owned(this.traps).length >= limits.traps) return { ok: false, message: `Trap cap reached: ${limits.traps}. Build a Trap Bench for more.` };
                 if (this.nearbyAny(x, y, radius, this.traps, 34)) return { ok: false, message: 'Traps need more spacing.' };
                 if (this.nearbyAny(x, y, radius, this.sentries, 20) || this.nearbyAny(x, y, radius, this.walls, 12)) {
                     return { ok: false, message: 'Traps need open floor space.' };
                 }
             }
             if (kind === 'building') {
-                if (this.buildings.length >= limits.buildings) return { ok: false, message: `Building cap reached: ${limits.buildings}.` };
+                if (owned(this.buildings).length >= limits.buildings) return { ok: false, message: `Building cap reached: ${limits.buildings}.` };
                 if (this.buildings.some((building) => building.id === item.id)) return { ok: false, message: `${item.name} is already built.` };
                 if (this.nearbyAny(x, y, radius, this.buildings, 82)) return { ok: false, message: 'Stations need more spacing.' };
                 if (this.nearbyAny(x, y, radius, this.sentries, 44) || this.nearbyAny(x, y, radius, this.walls, 24)) {
@@ -2218,6 +2840,13 @@
             if (this.preparationActive && this.trader
                 && this.dist(this.player.x, this.player.y, this.trader.x, this.trader.y) <= this.trader.interactionRadius) {
                 return 'trader';
+            }
+            if (window.LastShopperWorld) {
+                for (const structure of this.mapStructures || []) {
+                    if (!structure.loot.claimed && this.dist(this.player.x, this.player.y, structure.loot.x, structure.loot.y) <= 58) return `loot:${structure.id}`;
+                    const door = window.LastShopperWorld.doorPoint(structure);
+                    if (!structure.door.destroyed && this.dist(this.player.x, this.player.y, door.x, door.y) <= 66) return `door:${structure.id}`;
+                }
             }
             const shopDistance = this.dist(
                 this.player.x,
@@ -2922,7 +3551,8 @@
         },
 
         spawnZombie: function () {
-            const gate = this.spawnGates[Math.floor(Math.random() * this.spawnGates.length)];
+            const spawnAngle = Math.random() * Math.PI * 2;
+            const spawnRange = 620 + Math.random() * 220;
             let typeKey;
             if (this.bossesToSpawn > 0) {
                 const bossPool = progression.bossPool ? progression.bossPool(this.wave) : ['boss'];
@@ -2946,8 +3576,8 @@
             this.zombies.push({
                 ...type,
                 type: typeKey,
-                x: gate.x + Math.random() * 80 - 40,
-                y: gate.y + Math.random() * 80 - 40,
+                x: this.player.x + Math.cos(spawnAngle) * spawnRange,
+                y: this.player.y + Math.sin(spawnAngle) * spawnRange,
                 speed: type.speed * Math.min(1.25, 1 + this.wave * 0.004),
                 health,
                 maxHealth: health,

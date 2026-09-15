@@ -1,3 +1,7 @@
+        *, *::before, *::after { box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; margin: 0; }
+        button, input { font: inherit; }
+
 /* Apply the game font to the whole page */
         body {
             font-family: 'Chakra Petch', sans-serif;
@@ -267,6 +271,7 @@
         .party-card .window-copy { padding: 12px 14px 0; margin: 0; font-size: 13px; }
         .room-row { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; padding: 14px; }
         .relay-row { padding: 0 14px 12px; }
+        .room-tools { display: flex; justify-content: flex-end; padding: 0 14px 12px; }
 
         .party-list {
             display: grid;
@@ -496,7 +501,7 @@
             font-weight: 700;
             letter-spacing: .08em;
         }
-        .weapon-slots { display: flex; justify-content: flex-end; gap: 6px; margin-top: 10px; }
+        .weapon-slots { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-top: 10px; max-width: 300px; }
 
         .break-banner {
             position: absolute;
@@ -1270,3 +1275,59 @@
                 grid-template-columns: repeat(2, minmax(0, 1fr));
             }
         }
+        .absolute { position: absolute; }
+        .fixed { position: fixed; }
+        .inset-0 { inset: 0; }
+        .z-10 { z-index: 10; }
+        .z-20 { z-index: 20; }
+        .z-30 { z-index: 30; }
+        .z-50 { z-index: 50; }
+        .flex { display: flex; }
+        .flex-col { flex-direction: column; }
+        .items-center { align-items: center; }
+        .justify-center { justify-content: center; }
+        .h-full { height: 100%; }
+        .w-full { width: 100%; }
+        .h-16 { height: 4rem; }
+        .w-16 { width: 4rem; }
+        .max-w-3xl { max-width: 48rem; }
+        .max-w-4xl { max-width: 56rem; }
+        [class~="max-h-[60vh]"] { max-height: 60vh; }
+        .overflow-y-auto { overflow-y: auto; }
+        .p-6 { padding: 1.5rem; }
+        .mb-2 { margin-bottom: .5rem; }
+        .mb-4 { margin-bottom: 1rem; }
+        .mb-8 { margin-bottom: 2rem; }
+        .mt-6 { margin-top: 1.5rem; }
+        [class~="space-y-3"] > * + * { margin-top: .75rem; }
+        .hidden { display: none !important; }
+        .select-none { user-select: none; }
+        .pointer-events-auto { pointer-events: auto; }
+        .pointer-events-none { pointer-events: none; }
+        .text-white { color: #fff; }
+        .text-gray-300 { color: #d1d5db; }
+        .text-gray-400 { color: #9ca3af; }
+        .text-orange-600 { color: #ea580c; }
+        .text-red-600 { color: #dc2626; }
+        .text-sm { font-size: .875rem; line-height: 1.25rem; }
+        .text-lg { font-size: 1.125rem; line-height: 1.75rem; }
+        .text-xl { font-size: 1.25rem; line-height: 1.75rem; }
+        .text-2xl { font-size: 1.5rem; line-height: 2rem; }
+        .text-4xl { font-size: 2.25rem; line-height: 2.5rem; }
+        .text-6xl { font-size: 3.75rem; line-height: 1; }
+        .font-semibold { font-weight: 600; }
+        .font-bold { font-weight: 700; }
+        .bg-black { background: #000; }
+        .bg-gray-900 { background: #111827; }
+        .border-4 { border-style: solid; border-width: 4px; }
+        .border-gray-700 { border-color: #374151; }
+        .border-t-orange-600 { border-top-color: #ea580c; }
+        .rounded-full { border-radius: 9999px; }
+        [class~="bg-black/80"] { background: rgba(0, 0, 0, .8); }
+        [class~="top-20"] { top: 5rem; }
+        [class~="left-1/2"] { left: 50%; }
+        [class~="-translate-x-1/2"] { transform: translateX(-50%); }
+        [class~="space-x-4"] > * + * { margin-left: 1rem; }
+        .transition-opacity { transition-property: opacity; }
+        .duration-1000 { transition-duration: 1000ms; }
+        .backdrop-blur-sm { backdrop-filter: blur(4px); }

@@ -32,6 +32,30 @@
             explosionDamage: 180,
             isBomber: true
         },
+        sapper: {
+            name: 'Demolition Sapper',
+            color: [239, 125, 45],
+            speed: 1.22,
+            health: 155,
+            reward: 46,
+            xp: 42,
+            size: 16,
+            explosionDamage: 260,
+            isBomber: true,
+            isSapper: true,
+            contactDamage: 10
+        },
+        stalker: {
+            name: 'Aisle Stalker',
+            color: [111, 45, 130],
+            speed: 1.58,
+            health: 135,
+            reward: 40,
+            xp: 38,
+            size: 16,
+            isFlanker: true,
+            contactDamage: 12
+        },
         shield: {
             name: 'Shield Zombie',
             color: [55, 135, 180],
@@ -287,6 +311,17 @@
         }
     };
 
+    const weaponTypes = [
+        { id: 'pistol', name: 'Pistol', cost: 0, damage: 35, fireRate: 300, maxAmmo: 12, owned: true, speed: 8, bulletSize: 4, reloadTime: 1500 },
+        { id: 'shotgun', name: 'Shotgun', cost: 100, damage: 12.5, fireRate: 600, maxAmmo: 8, owned: false, speed: 6, pellets: 16, bulletSize: 3, reloadTime: 2500 },
+        { id: 'smg', name: 'Checkout SMG', cost: 275, damage: 17, fireRate: 78, maxAmmo: 45, owned: false, speed: 10, bulletSize: 3, reloadTime: 2100 },
+        { id: 'rifle', name: 'Assault Rifle', cost: 520, damage: 29, fireRate: 115, maxAmmo: 32, owned: false, speed: 11, bulletSize: 3, reloadTime: 2050 },
+        { id: 'marksman', name: 'Marksman Rifle', cost: 950, damage: 118, fireRate: 560, maxAmmo: 8, owned: false, speed: 16, bulletSize: 5, pierce: 1, reloadTime: 2700 },
+        { id: 'minigun', name: 'Mini Gun', cost: 1650, damage: 32, fireRate: 30, maxAmmo: 120, owned: false, speed: 12, bulletSize: 2, reloadTime: 4200 },
+        { id: 'grenadeLauncher', name: 'Grenade Launcher', cost: 2900, damage: 300, fireRate: 1250, maxAmmo: 5, owned: false, speed: 6, explosive: true, bulletSize: 7, reloadTime: 3100, ammoCost: 85 },
+        { id: 'rpg', name: 'RPG', cost: 5600, damage: 760, fireRate: 2100, maxAmmo: 3, owned: false, speed: 5, explosive: true, bulletSize: 8, reloadTime: 3500, ammoCost: 250 }
+    ];
+
     const turretTypes = [
         {
             name: 'Auto Turret',
@@ -511,6 +546,16 @@
             width: 112,
             height: 78,
             color: [249, 115, 22]
+        },
+        {
+            id: 'powerRelay',
+            name: 'Parking Lot Power Relay',
+            techLevel: 3,
+            cost: { money: 2400, wood: 28, metal: 48, parts: 2 },
+            description: 'Extends turret coverage and slowly refills powered defenses.',
+            width: 108,
+            height: 76,
+            color: [45, 212, 191]
         }
     ];
 
@@ -622,6 +667,7 @@
 
     window.LastShopperContent = {
         enemyTypes,
+        weaponTypes,
         turretTypes,
         wallStages,
         trapTypes,

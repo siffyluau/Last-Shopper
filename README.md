@@ -36,13 +36,7 @@ Open the game:
 http://localhost:3000
 ```
 
-For cloud multiplayer, enter this relay URL in the lobby:
-
-```text
-ws://localhost:3000/room
-```
-
-Use the same room code on each computer. WebSocket rooms are server-authoritative: `server.js` owns waves, zombie AI, enemy spawning, turrets, bullets, structures, traders, supply drops, and boss events. Clients render snapshots and send player state/build/shot actions.
+Use the same room code on each computer. The game automatically connects to the WebSocket server at the same address as the webpage, so players do not enter or configure a relay URL. WebSocket rooms are server-authoritative: `server.js` owns waves, zombie AI, enemy spawning, turrets, bullets, structures, traders, supply drops, and boss events. Clients render snapshots and send player state/build/shot actions.
 
 Same-browser local rooms without a relay use `BroadcastChannel`. That mode is only for quick local testing. Because it has no server process, browser timer throttling can still affect whoever is locally simulating the room.
 
@@ -66,25 +60,22 @@ npm start
 
 5. Keep the server port controlled by the host. `server.js` listens on `process.env.PORT || 3000`, so Render can inject its own `PORT` automatically.
 6. Open the service URL to play.
-7. Use this relay URL in the lobby:
-
-```text
-wss://YOUR-SERVICE-DOMAIN/room
-```
+7. Send that same URL to your friends.
+8. One player selects **Host**, everyone else selects **Join**, and everyone uses the same room code. Only the room host starts the run.
 
 This repository includes `render.yaml` for Render Blueprint deployment with a single Node Web Service named `last-shopper`.
 
-Option B: Static site plus separate relay.
+Option B: Static site plus a separately configured server.
 
 1. Host `index.html`, `style.css`, `client.js`, and the `systems/` folder on a static host.
 2. Deploy this same project as a Node relay somewhere else.
-3. Put the relay URL in the lobby, for example:
+3. Add the server address to the page URL as a one-time `ws` query parameter, for example:
 
 ```text
-wss://YOUR-RELAY-DOMAIN/room
+https://YOUR-STATIC-SITE.example/?ws=wss%3A%2F%2FYOUR-NODE-SERVER.example%2Froom
 ```
 
-Static hosting alone will load the game, but friends on different computers need the WebSocket relay for online sync. Use the Node server for real multiplayer so the world keeps running even if a browser tab loses focus.
+Static hosting alone will load the game, but it cannot provide real internet multiplayer. The easiest setup is Option A: host the whole project as one Node service so the webpage and multiplayer server share one URL.
 
 ## Validation
 
