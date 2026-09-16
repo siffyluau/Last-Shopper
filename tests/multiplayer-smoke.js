@@ -38,13 +38,23 @@ function blockedByStructure(zombie, structure) {
   const host = await connect('smoke-host', true);
   const joiner = await connect('smoke-joiner', false);
   host.socket.send(JSON.stringify({ type: 'action', id: 'smoke-host', room, action: { kind: 'startGame' } }));
-  await new Promise((resolve) => setTimeout(resolve, 4200));
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  host.socket.send(JSON.stringify({
+    type: 'action',
+    id: 'smoke-host',
+    room,
+    action: { kind: 'shot', weapon: { id: 'pistol' }, angle: 0, clientTime: Date.now() }
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 3500));
 
   const hostWorld = host.snapshots.at(-1);
   const joinWorld = joiner.snapshots.at(-1);
   if (!hostWorld || !joinWorld) throw new Error('Both clients did not receive world snapshots');
   if (!hostWorld.gameStarted || !joinWorld.gameStarted) throw new Error('Shared game did not start');
   if (hostWorld.serverTime <= host.snapshots[0].serverTime) throw new Error('Server world clock did not advance');
+  const shotSynced = joiner.snapshots.some((snapshot) =>
+    (snapshot.shotEvents || []).some((event) => event.shooterId === 'smoke-host'));
+  if (!shotSynced) throw new Error('Server-validated shot visual event did not reach the second client');
 
   const hostIds = (hostWorld.zombies || []).map((zombie) => zombie.id).sort();
   const joinIds = (joinWorld.zombies || []).map((zombie) => zombie.id).sort();
@@ -61,6 +71,7 @@ function blockedByStructure(zombie, structure) {
     clients: 2,
     wave: hostWorld.wave,
     zombies: hostIds.length,
+    shotVisualSynced: shotSynced,
     serverAdvancedMs: hostWorld.serverTime - host.snapshots[0].serverTime,
     dayTime: hostWorld.dayTime,
     result: 'PASS'

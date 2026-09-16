@@ -11,7 +11,7 @@ const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
 const PERF_DEBUG = process.env.PERF_DEBUG === '1';
 const TICK_MS = 50;
-const SNAPSHOT_MS = 100;
+const SNAPSHOT_MS = 50;
 const TARGET_UPDATE_MS = 300;
 const PATH_UPDATE_MS = 650;
 const INTEREST_RADIUS = 1500;
@@ -379,6 +379,7 @@ function createWorld(seed) {
     trader: null,
     zombies: [],
     bullets: [],
+    shotEvents: [],
     sentries: [],
     walls: [],
     traps: [],
@@ -523,6 +524,7 @@ function networkWorldSnapshot(room, clientId, options = {}) {
     buildings,
     drops,
     acidPools,
+    shotEvents,
     ...globalWorld
   } = world;
   const interestedZombies = zombies.filter((entity) => entity.isBoss || entity.isMiniBoss || withinInterest(entity, anchor));
@@ -554,6 +556,7 @@ function networkWorldSnapshot(room, clientId, options = {}) {
     ]),
     drops: drops.filter((entity) => withinInterest(entity, anchor)),
     acidPools: acidPools.filter((entity) => withinInterest(entity, anchor)),
+    shotEvents: shotEvents.filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 350)),
     ...(options.includeMap ? { mapStructures: interestedMap } : {}),
     ...(options.includeMapStates ? { mapStructureStates: getMapStructureStates(world, interestedMap) } : {}),
     gameStarted: room.gameStarted,
@@ -1142,6 +1145,19 @@ function spawnRemoteShot(room, player, weapon) {
   } else {
     fireOne(0);
   }
+  world.shotEvents.push({
+    id: `shot-${player.id}-${now}-${Math.random().toString(36).slice(2, 6)}`,
+    shooterId: player.id,
+    weaponId: weapon.id,
+    x: originX,
+    y: originY,
+    angle,
+    speed: type.speed,
+    pellets,
+    bulletSize: type.bulletSize || 4,
+    explosive: Boolean(type.explosive)
+  });
+  if (world.shotEvents.length > 80) world.shotEvents.splice(0, world.shotEvents.length - 80);
 }
 
 function getShelterBreachPlan(world, zombie, target) {
@@ -1795,6 +1811,7 @@ function tickRoom(room) {
           world: networkWorldSnapshot(room, clientId, { includeMap, includeMapStates })
         }, room);
       }
+      room.latestWorld.shotEvents.length = 0;
     });
   }
 

@@ -1808,7 +1808,8 @@
                 }
                 for (const tracer of this.predictedProjectiles) {
                     ctx.save();
-                    ctx.globalAlpha = Math.max(0, tracer.life / tracer.maxLife);
+                    const remaining = tracer.expiresAt - performance.now();
+                    ctx.globalAlpha = Math.max(0, remaining / Math.max(1, tracer.expiresAt - tracer.createdAt));
                     ctx.strokeStyle = tracer.explosive ? '#fb923c' : '#fde68a';
                     ctx.lineWidth = tracer.size || 2;
                     ctx.beginPath();
@@ -1934,13 +1935,14 @@
             
             // --- ACTION FUNCTIONS ---
 
-            spawnPredictedShot: function(weapon, angle) {
+            spawnPredictedShot: function(weapon, angle, origin = null) {
                 if (!this.multiplayer?.serverAuthoritative) return;
                 const pelletCount = weapon.pellets ? Math.min(6, weapon.pellets) : 1;
+                const createdAt = performance.now();
                 for (let i = 0; i < pelletCount; i++) {
                     const shotAngle = angle + (weapon.pellets ? (Math.random() - 0.5) * 0.4 : 0);
-                    const x = this.player.x + Math.cos(angle) * 15;
-                    const y = this.player.y + Math.sin(angle) * 15;
+                    const x = origin?.x ?? (this.player.x + Math.cos(angle) * 15);
+                    const y = origin?.y ?? (this.player.y + Math.sin(angle) * 15);
                     this.predictedProjectiles.push({
                         x,
                         y,
@@ -1950,21 +1952,30 @@
                         vy: Math.sin(shotAngle) * weapon.speed * 2.2,
                         explosive: Boolean(weapon.explosive),
                         size: weapon.pellets ? 1.5 : Math.max(2, (weapon.bulletSize || 4) * 0.55),
-                        life: 9,
-                        maxLife: 9
+                        createdAt,
+                        lastUpdatedAt: createdAt,
+                        expiresAt: createdAt + (weapon.explosive ? 320 : weapon.pellets ? 220 : 260)
                     });
+                }
+                if (this.predictedProjectiles.length > 160) {
+                    this.predictedProjectiles.splice(0, this.predictedProjectiles.length - 160);
                 }
             },
 
             updatePredictedProjectiles: function() {
+                const now = performance.now();
                 for (let i = this.predictedProjectiles.length - 1; i >= 0; i -= 1) {
                     const tracer = this.predictedProjectiles[i];
+                    if (now >= tracer.expiresAt) {
+                        this.predictedProjectiles.splice(i, 1);
+                        continue;
+                    }
+                    const frameScale = Math.min(2.5, Math.max(0, (now - tracer.lastUpdatedAt) / (1000 / 60)));
                     tracer.previousX = tracer.x;
                     tracer.previousY = tracer.y;
-                    tracer.x += tracer.vx;
-                    tracer.y += tracer.vy;
-                    tracer.life -= 1;
-                    if (tracer.life <= 0) this.predictedProjectiles.splice(i, 1);
+                    tracer.x += tracer.vx * frameScale;
+                    tracer.y += tracer.vy * frameScale;
+                    tracer.lastUpdatedAt = now;
                 }
             },
             

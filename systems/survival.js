@@ -428,11 +428,12 @@
             };
         },
 
-        mergeNetworkEntities: function (current, incoming) {
+        mergeNetworkEntities: function (current, incoming, durationScale = 1) {
             const previousById = new Map((current || []).filter((entry) => entry.id).map((entry) => [entry.id, entry]));
             return (incoming || []).map((entry) => {
                 const previous = entry.id ? previousById.get(entry.id) : null;
                 const receivedAt = performance.now();
+                const interpolationDuration = Math.max(16, (this.networkInterpolationDelay || 50) * durationScale);
                 if (!previous) return {
                     ...entry,
                     networkFromX: entry.x,
@@ -440,7 +441,7 @@
                     networkToX: entry.x,
                     networkToY: entry.y,
                     networkReceivedAt: receivedAt,
-                    networkDuration: this.networkInterpolationDelay || 100
+                    networkDuration: interpolationDuration
                 };
                 const teleported = Math.hypot(entry.x - previous.x, entry.y - previous.y) > 240;
                 return {
@@ -453,9 +454,28 @@
                     networkToX: entry.x,
                     networkToY: entry.y,
                     networkReceivedAt: receivedAt,
-                    networkDuration: this.networkInterpolationDelay || 100
+                    networkDuration: interpolationDuration
                 };
             });
+        },
+
+        applyNetworkShotEvents: function (events) {
+            if (!events?.length || !this.spawnPredictedShot) return;
+            if (!this.appliedNetworkShotEvents) this.appliedNetworkShotEvents = new Set();
+            for (const event of events) {
+                if (!event?.id || event.shooterId === this.localPlayerId || this.appliedNetworkShotEvents.has(event.id)) continue;
+                this.appliedNetworkShotEvents.add(event.id);
+                const weapon = this.weapons.find((entry) => entry.id === event.weaponId) || {};
+                this.spawnPredictedShot({
+                    ...weapon,
+                    id: event.weaponId,
+                    speed: event.speed || weapon.speed || 8,
+                    pellets: event.pellets ?? weapon.pellets ?? 0,
+                    bulletSize: event.bulletSize || weapon.bulletSize || 4,
+                    explosive: event.explosive ?? weapon.explosive
+                }, event.angle, { x: event.x, y: event.y });
+            }
+            if (this.appliedNetworkShotEvents.size > 500) this.appliedNetworkShotEvents.clear();
         },
 
         mergeNetworkState: function (current, incoming) {
@@ -502,7 +522,7 @@
             const snapshotReceivedAt = performance.now();
             if (this.lastNetworkSnapshotAt) {
                 const snapshotGap = snapshotReceivedAt - this.lastNetworkSnapshotAt;
-                this.networkInterpolationDelay = Math.max(55, Math.min(180, snapshotGap * 1.08));
+                this.networkInterpolationDelay = Math.max(35, Math.min(100, snapshotGap * 0.95));
             }
             this.lastNetworkSnapshotAt = snapshotReceivedAt;
             const wasDowned = Boolean(this.player.downed);
@@ -532,7 +552,8 @@
             this.trader = world.trader || null;
             if (this.multiplayer?.serverAuthoritative) {
                 this.zombies = this.mergeNetworkEntities(this.zombies, world.zombies || []);
-                this.bullets = this.mergeNetworkEntities(this.bullets, world.bullets || []);
+                this.bullets = this.mergeNetworkEntities(this.bullets, world.bullets || [], 0.7);
+                this.applyNetworkShotEvents(world.shotEvents || []);
             } else {
                 this.zombies = world.zombies || [];
                 this.bullets = world.bullets || [];
@@ -884,6 +905,29 @@
 
         broadcastShotAction: function (weapon, angle) {
             if (!this.multiplayer || !this.multiplayer.roomCode || this.isWorldHost()) return;
+            if (!this.multiplayer.serverAuthoritative) {
+                this.multiplayer.sendAction({
+                    kind: 'shot',
+                    player: {
+                        id: this.localPlayerId,
+                        name: this.player.name,
+                        x: this.player.x,
+                        y: this.player.y,
+                        angle
+                    },
+                    weapon: {
+                        id: weapon.id,
+                        upgradeLevel: weapon.upgradeLevel,
+                        damage: weapon.damage,
+                        speed: weapon.speed,
+                        pellets: weapon.pellets,
+                        explosive: weapon.explosive,
+                        bulletSize: weapon.bulletSize,
+                        pierce: weapon.pierce
+                    }
+                });
+                return;
+            }
             this.multiplayer.sendAction({
                 kind: 'shot',
                 weapon: { id: weapon.id },

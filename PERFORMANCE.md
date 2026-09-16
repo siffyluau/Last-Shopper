@@ -3,7 +3,7 @@
 ## Runtime targets
 
 - Server simulation: 20 Hz fixed schedule
-- Network snapshots: 10 Hz
+- Network snapshots: 20 Hz
 - Zombie target selection: roughly 2-4 Hz, staggered per zombie
 - Zombie path/detour checks: roughly 1-2 Hz, cached between checks
 - Client rendering: browser refresh rate with timestamped interpolation
@@ -31,16 +31,16 @@ Measurements used Node 24 on Windows with two clients, 240 zombies, and 24 sentr
 | --- | ---: | ---: |
 | Configured simulation rate | 40 Hz | 20 Hz |
 | Sustained simulation rate | 32.16 Hz | 20.14 Hz |
-| Average server tick | 5.31 ms | 1.82 ms |
-| Worst server tick | 21.17 ms | 14.32 ms |
+| Average server tick | 5.31 ms | 2.16 ms |
+| Worst server tick | 21.17 ms | 21.01 ms |
 | Zombie AI + path/detour | 4.28 ms/tick | 0.83 ms/tick |
 | Bullet collision | 0.15 ms/tick | 0.04 ms/tick |
-| Snapshot construction/send | 0.64 ms/tick | 0.50 ms/tick |
-| Average snapshot | 106.7 KB | 29.6 KB |
-| Outgoing messages | 48.3/sec | 20.0/sec |
-| Outgoing bandwidth | 3.42 MB/sec | 0.59 MB/sec |
+| Snapshot construction/send | 0.64 ms/tick | 0.92 ms/tick |
+| Average snapshot | 106.7 KB | 28.7 KB |
+| Outgoing messages | 48.3/sec | 40.0/sec |
+| Outgoing bandwidth | 3.42 MB/sec | 1.15 MB/sec |
 
-The largest CPU improvement came from removing 40 Hz target/path recomputation and quadratic support-zombie scans. The largest network improvement came from 10 Hz batched interest snapshots with static entity data sent only when an entity first enters a client's interest set.
+The largest CPU improvement came from removing 40 Hz target/path recomputation and quadratic support-zombie scans. Network traffic stays well below the baseline through compact 20 Hz interest snapshots with static entity data sent only when an entity first enters a client's interest set. The 20 Hz rate is intentional: 10 Hz made movement feel delayed and allowed short-lived bullets to exist entirely between snapshots.
 
 ## Render hosting notes
 
