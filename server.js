@@ -12,6 +12,7 @@ const ROOT = __dirname;
 const PERF_DEBUG = process.env.PERF_DEBUG === '1';
 const TICK_MS = 50;
 const SNAPSHOT_MS = 50;
+const BUILD_COMMIT = process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'local';
 const TARGET_UPDATE_MS = 300;
 const PATH_UPDATE_MS = 650;
 const INTEREST_RADIUS = 1500;
@@ -1984,7 +1985,14 @@ function serveStatic(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (url.pathname === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ ok: true, service: 'last-shopper' }));
+    res.end(JSON.stringify({
+      ok: true,
+      service: 'last-shopper',
+      commit: BUILD_COMMIT,
+      simulationHz: Math.round(1000 / TICK_MS),
+      snapshotHz: Math.round(1000 / SNAPSHOT_MS),
+      protocol: 'authoritative-world-v2'
+    }));
     return;
   }
   if (url.pathname === '/debug/perf' && PERF_DEBUG) {

@@ -1,4 +1,18 @@
 (function () {
+    const EVENT_METRIC_NAMES = {
+        world: 'worldSnapshot',
+        state: 'playerState',
+        startGame: 'gameState',
+        zombieUpdate: 'zombieUpdate',
+        projectileUpdate: 'projectileUpdate',
+        gameState: 'gameState',
+        server: 'serverControl',
+        host: 'serverControl',
+        pong: 'pong',
+        action: 'action',
+        hello: 'hello'
+    };
+
     class LastShopperMultiplayer {
         constructor(options) {
             this.localId = options.localId;
@@ -22,6 +36,8 @@
             this.pingMs = 0;
             this.snapshotTimes = [];
             this.incomingByteSamples = [];
+            this.incomingEventCounts = Object.create(null);
+            this.metricsStartedAt = performance.now();
         }
 
         connect(roomCode, relayUrl, options = {}) {
@@ -72,7 +88,9 @@
                 try {
                     const receivedAt = performance.now();
                     this.incomingByteSamples.push({ at: receivedAt, bytes: typeof event.data === 'string' ? event.data.length : 0 });
-                    this.receive(JSON.parse(event.data));
+                    const packet = JSON.parse(event.data);
+                    this.recordIncomingEvent(packet.type);
+                    this.receive(packet);
                 } catch {
                     this.onStatus('BAD CLOUD PACKET', 'offline');
                 }
@@ -149,14 +167,32 @@
             }
         }
 
+        recordIncomingEvent(type) {
+            const name = EVENT_METRIC_NAMES[type] || String(type || 'unknown');
+            this.incomingEventCounts[name] = (this.incomingEventCounts[name] || 0) + 1;
+        }
+
+        resetMetrics() {
+            this.metricsStartedAt = performance.now();
+            this.incomingEventCounts = Object.create(null);
+            this.snapshotTimes.length = 0;
+            this.incomingByteSamples.length = 0;
+        }
+
         getMetrics() {
             const cutoff = performance.now() - 1000;
             while (this.snapshotTimes.length && this.snapshotTimes[0] < cutoff) this.snapshotTimes.shift();
             while (this.incomingByteSamples.length && this.incomingByteSamples[0].at < cutoff) this.incomingByteSamples.shift();
+            const elapsedSeconds = Math.max(0.001, (performance.now() - this.metricsStartedAt) / 1000);
+            const eventRates = {};
+            for (const name of ['worldSnapshot', 'playerState', 'zombieUpdate', 'projectileUpdate', 'gameState', 'serverControl', 'action', 'pong', 'hello']) {
+                eventRates[name] = (this.incomingEventCounts[name] || 0) / elapsedSeconds;
+            }
             return {
                 pingMs: this.pingMs,
                 snapshotRate: this.snapshotTimes.length,
-                incomingBytesPerSecond: this.incomingByteSamples.reduce((sum, sample) => sum + sample.bytes, 0)
+                incomingBytesPerSecond: this.incomingByteSamples.reduce((sum, sample) => sum + sample.bytes, 0),
+                eventRates
             };
         }
 
@@ -188,6 +224,8 @@
             this.pingMs = 0;
             this.snapshotTimes.length = 0;
             this.incomingByteSamples.length = 0;
+            this.incomingEventCounts = Object.create(null);
+            this.metricsStartedAt = performance.now();
             this.lastLoadoutSignature = null;
             this.lastLoadoutSentAt = 0;
             this.peers.clear();

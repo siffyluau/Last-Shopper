@@ -163,7 +163,16 @@
             },
             multiplayer: null,
             performanceDebug: false,
-            performanceStats: { frames: 0, fps: 0, windowStartedAt: performance.now() },
+            performanceScenario: 'off',
+            performanceStats: {
+                frames: 0,
+                fps: 0,
+                windowStartedAt: performance.now(),
+                sampleStartedAt: performance.now(),
+                lastFrameAt: 0,
+                frameTimes: [],
+                reconciliation: []
+            },
             team: {
                 playerCount: 1
             },
@@ -376,8 +385,24 @@
                     if (typingTarget && e.key !== 'Escape') return;
                     if (e.key === 'F3') {
                         e.preventDefault();
+                        if (e.shiftKey) {
+                            this.resetPerformanceMetrics();
+                            return;
+                        }
                         this.performanceDebug = !this.performanceDebug;
                         this.performanceOverlay.hidden = !this.performanceDebug;
+                        if (this.performanceDebug) this.resetPerformanceMetrics();
+                        return;
+                    }
+                    if (e.key === 'F6' && this.performanceDebug) {
+                        e.preventDefault();
+                        this.cyclePerformanceScenario();
+                        return;
+                    }
+                    if (e.key === 'F7' && this.performanceDebug) {
+                        e.preventDefault();
+                        this.multiplayer?.sendAction({ kind: 'debugPopulate', zombies: 240, projectiles: 40, sentries: 24 });
+                        this.resetPerformanceMetrics();
                         return;
                     }
                     if (e.key === 'Escape' && this.zombieIndexOpen) {
@@ -685,6 +710,11 @@
 
             updatePerformanceMetrics: function(timestamp) {
                 const stats = this.performanceStats;
+                if (stats.lastFrameAt && this.performanceDebug) {
+                    stats.frameTimes.push(timestamp - stats.lastFrameAt);
+                    if (stats.frameTimes.length > 3600) stats.frameTimes.shift();
+                }
+                stats.lastFrameAt = timestamp;
                 stats.frames += 1;
                 const elapsed = timestamp - stats.windowStartedAt;
                 if (elapsed >= 500) {
@@ -694,18 +724,91 @@
                 }
                 if (!this.performanceDebug || !this.performanceOverlay) return;
                 const network = this.multiplayer?.getMetrics?.() || {};
+                const report = this.getPerformanceReport();
+                const events = network.eventRates || {};
                 const rendered = this.zombies.length + this.bullets.length + this.remotePlayers.length
                     + this.sentries.length + this.walls.length + this.traps.length + this.buildings.length;
                 this.performanceOverlay.textContent = [
                     'LAST SHOPPER PERF [F3]',
-                    `FPS              ${stats.fps.toFixed(1)}`,
+                    `Role/Scenario    ${this.isRoomHost ? 'HOST' : 'JOINER'} / ${this.performanceScenario}`,
+                    `Average FPS      ${report.averageFps.toFixed(1)}`,
+                    `Frame p50/p95    ${report.p50.toFixed(1)} / ${report.p95.toFixed(1)} ms`,
+                    `Frame p99/worst  ${report.p99.toFixed(1)} / ${report.worst.toFixed(1)} ms`,
+                    `Long >16/33/50   ${report.long16} / ${report.long33} / ${report.long50}`,
                     `Ping             ${(network.pingMs || 0).toFixed(0)} ms`,
                     `Snapshots        ${network.snapshotRate || 0}/s`,
                     `Inbound          ${((network.incomingBytesPerSecond || 0) / 1024).toFixed(1)} KB/s`,
                     `Interpolation    ${(this.networkInterpolationDelay || 0).toFixed(0)} ms`,
+                    `Reconcile        ${report.correctionsPerSecond.toFixed(2)}/s avg ${report.averageCorrection.toFixed(1)} max ${report.maxCorrection.toFixed(1)} px`,
+                    `worldSnapshot    ${(events.worldSnapshot || 0).toFixed(2)}/s`,
+                    `playerState      ${(events.playerState || 0).toFixed(2)}/s`,
+                    `zombieUpdate     ${(events.zombieUpdate || 0).toFixed(2)}/s`,
+                    `projectileUpdate ${(events.projectileUpdate || 0).toFixed(2)}/s`,
+                    `gameState        ${(events.gameState || 0).toFixed(2)}/s`,
+                    `server/action    ${(events.serverControl || 0).toFixed(2)} / ${(events.action || 0).toFixed(2)}/s`,
                     `Rendered entities ${rendered}`,
                     `Zombies/Bullets  ${this.zombies.length}/${this.bullets.length}`
                 ].join('\n');
+            },
+
+            resetPerformanceMetrics: function() {
+                const now = performance.now();
+                this.performanceStats.frames = 0;
+                this.performanceStats.fps = 0;
+                this.performanceStats.windowStartedAt = now;
+                this.performanceStats.sampleStartedAt = now;
+                this.performanceStats.lastFrameAt = 0;
+                this.performanceStats.frameTimes = [];
+                this.performanceStats.reconciliation = [];
+                this.multiplayer?.resetMetrics?.();
+            },
+
+            getPerformanceReport: function() {
+                const stats = this.performanceStats;
+                const frames = stats.frameTimes;
+                const sorted = frames.length ? [...frames].sort((a, b) => a - b) : [0];
+                const percentile = (value) => sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * value))] || 0;
+                const totalFrameTime = frames.reduce((sum, value) => sum + value, 0);
+                const elapsedSeconds = Math.max(0.001, (performance.now() - stats.sampleStartedAt) / 1000);
+                const corrections = stats.reconciliation;
+                const correctionTotal = corrections.reduce((sum, sample) => sum + sample.distance, 0);
+                return {
+                    averageFps: totalFrameTime > 0 ? frames.length * 1000 / totalFrameTime : stats.fps || 0,
+                    p50: percentile(0.5),
+                    p95: percentile(0.95),
+                    p99: percentile(0.99),
+                    worst: sorted[sorted.length - 1] || 0,
+                    long16: frames.filter((value) => value > 16.7).length,
+                    long33: frames.filter((value) => value > 33).length,
+                    long50: frames.filter((value) => value > 50).length,
+                    correctionsPerSecond: corrections.length / elapsedSeconds,
+                    averageCorrection: corrections.length ? correctionTotal / corrections.length : 0,
+                    maxCorrection: corrections.reduce((max, sample) => Math.max(max, sample.distance), 0)
+                };
+            },
+
+            cyclePerformanceScenario: function() {
+                const scenarios = ['standing', 'moving', 'shooting', 'moveShoot', 'off'];
+                const index = scenarios.indexOf(this.performanceScenario);
+                this.performanceScenario = scenarios[(index + 1) % scenarios.length];
+                this.keys = {};
+                this.mouse.isDown = false;
+                this.resetPerformanceMetrics();
+                this.showWaveStatus?.(`PERF SCENARIO: ${this.performanceScenario.toUpperCase()}`, 1200);
+            },
+
+            applyPerformanceScenario: function() {
+                if (!this.performanceDebug || this.performanceScenario === 'off' || !this.gameStarted || this.player.downed) return;
+                this.keys.w = false;
+                this.keys.a = false;
+                this.keys.s = false;
+                this.keys.d = false;
+                const moving = this.performanceScenario === 'moving' || this.performanceScenario === 'moveShoot';
+                if (moving) {
+                    const direction = ['d', 's', 'a', 'w'][Math.floor(performance.now() / 1200) % 4];
+                    this.keys[direction] = true;
+                }
+                this.mouse.isDown = this.performanceScenario === 'shooting' || this.performanceScenario === 'moveShoot';
             },
             
             // --- UPDATE FUNCTIONS ---
@@ -716,6 +819,7 @@
                 if (this.updateLocalDayNight) this.updateLocalDayNight();
                 if (this.updateRevival) this.updateRevival();
                 if (this.updateMouseWorld) this.updateMouseWorld();
+                this.applyPerformanceScenario();
                 const inputBlocked = this.isInputBlocked ? this.isInputBlocked() : false;
                 if (inputBlocked) {
                     this.mouse.isDown = false;

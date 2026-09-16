@@ -575,6 +575,10 @@
                 const localServerPlayer = world.players.find((player) => player.id === this.localPlayerId);
                 if (localServerPlayer) {
                     const correctionDistance = Math.hypot(localServerPlayer.x - this.player.x, localServerPlayer.y - this.player.y);
+                    if (this.performanceDebug && correctionDistance > 0.01) {
+                        this.performanceStats.reconciliation.push({ at: performance.now(), distance: correctionDistance });
+                        if (this.performanceStats.reconciliation.length > 1200) this.performanceStats.reconciliation.shift();
+                    }
                     const correctionScale = correctionDistance > 180 ? 1 : 0.14;
                     this.player.x += (localServerPlayer.x - this.player.x) * correctionScale;
                     this.player.y += (localServerPlayer.y - this.player.y) * correctionScale;
