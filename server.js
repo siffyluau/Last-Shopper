@@ -1,14 +1,20 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { performance, monitorEventLoopDelay } = require('perf_hooks');
 const WebSocket = require('ws');
 const { WebSocketServer } = WebSocket;
 const WorldMap = require('./systems/world.js');
+const SpatialHash = require('./systems/spatial-hash.js');
 
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
-const TICK_MS = 25;
-const SNAPSHOT_MS = 50;
+const PERF_DEBUG = process.env.PERF_DEBUG === '1';
+const TICK_MS = 50;
+const SNAPSHOT_MS = 100;
+const TARGET_UPDATE_MS = 300;
+const PATH_UPDATE_MS = 650;
+const INTEREST_RADIUS = 1500;
 const DAY_CYCLE_MS = 8 * 60 * 1000;
 const REVIVE_DURATION_MS = 2500;
 const MIME = {
@@ -77,9 +83,141 @@ const weaponTypes = {
 
 const rooms = new Map();
 let nextBulletId = 1;
+const eventLoopDelay = PERF_DEBUG ? monitorEventLoopDelay({ resolution: 20 }) : null;
+if (eventLoopDelay) eventLoopDelay.enable();
 
 function nowMs() {
   return Date.now();
+}
+
+function createPerformanceMetrics() {
+  return {
+    startedAt: nowMs(),
+    ticks: 0,
+    tickTotalMs: 0,
+    tickWorstMs: 0,
+    slowTicks: 0,
+    stages: {
+      chunks: 0,
+      spatial: 0,
+      wave: 0,
+      zombies: 0,
+      bullets: 0,
+      sentries: 0,
+      cleanup: 0,
+      snapshots: 0
+    },
+    outgoingMessages: 0,
+    outgoingBytes: 0,
+    snapshotMessages: 0,
+    snapshotBytes: 0,
+    snapshotEntities: 0,
+    lastSlowLogAt: 0
+  };
+}
+
+function measureStage(room, name, callback) {
+  if (!PERF_DEBUG) return callback();
+  const startedAt = performance.now();
+  const result = callback();
+  room.perf.stages[name] += performance.now() - startedAt;
+  return result;
+}
+
+function performanceReport(room) {
+  const perf = room.perf;
+  const elapsedSeconds = Math.max(0.001, (nowMs() - perf.startedAt) / 1000);
+  const stageAverages = {};
+  for (const [name, total] of Object.entries(perf.stages)) {
+    stageAverages[name] = perf.ticks ? total / perf.ticks : 0;
+  }
+  return {
+    room: room.code,
+    configuredTickRate: Math.round(1000 / TICK_MS),
+    configuredSnapshotRate: Math.round(1000 / SNAPSHOT_MS),
+    measuredTickRate: perf.ticks / elapsedSeconds,
+    averageTickMs: perf.ticks ? perf.tickTotalMs / perf.ticks : 0,
+    worstTickMs: perf.tickWorstMs,
+    slowTicks: perf.slowTicks,
+    stageAverageMs: stageAverages,
+    players: room.players.size,
+    zombies: room.latestWorld.zombies.length,
+    projectiles: room.latestWorld.bullets.length,
+    structures: room.latestWorld.sentries.length + room.latestWorld.walls.length + room.latestWorld.traps.length + room.latestWorld.buildings.length,
+    outgoingMessagesPerSecond: perf.outgoingMessages / elapsedSeconds,
+    outgoingBytesPerSecond: perf.outgoingBytes / elapsedSeconds,
+    averageSnapshotBytes: perf.snapshotMessages ? perf.snapshotBytes / perf.snapshotMessages : 0,
+    averageSnapshotEntities: perf.snapshotMessages ? perf.snapshotEntities / perf.snapshotMessages : 0,
+    eventLoopDelayMeanMs: eventLoopDelay ? eventLoopDelay.mean / 1e6 : 0,
+    eventLoopDelayMaxMs: eventLoopDelay ? eventLoopDelay.max / 1e6 : 0
+  };
+}
+
+function createSpatialIndexes() {
+  return {
+    zombies: new SpatialHash(192),
+    traps: new SpatialHash(192),
+    walls: new SpatialHash(192),
+    sentries: new SpatialHash(192),
+    buildings: new SpatialHash(256),
+    mapStructures: new SpatialHash(WorldMap.CHUNK_SIZE)
+  };
+}
+
+function rebuildSpatialIndexes(room, zombiesOnly = false) {
+  const world = room.latestWorld;
+  room.spatial.zombies.rebuild(world.zombies);
+  if (zombiesOnly) return;
+  room.spatial.traps.rebuild(world.traps);
+  room.spatial.walls.rebuild(world.walls);
+  room.spatial.sentries.rebuild(world.sentries);
+  room.spatial.buildings.rebuild(world.buildings);
+  room.spatial.mapStructures.rebuild(world.mapStructures || []);
+}
+
+function segmentCircleHit(x1, y1, x2, y2, circleX, circleY, radius) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared <= 0.0001) return distance(x1, y1, circleX, circleY) <= radius;
+  const amount = clamp(((circleX - x1) * dx + (circleY - y1) * dy) / lengthSquared, 0, 1);
+  const nearestX = x1 + dx * amount;
+  const nearestY = y1 + dy * amount;
+  const offsetX = nearestX - circleX;
+  const offsetY = nearestY - circleY;
+  return offsetX * offsetX + offsetY * offsetY <= radius * radius;
+}
+
+function segmentAabbHit(x1, y1, x2, y2, rect, padding = 0) {
+  const minX = rect.x - rect.width / 2 - padding;
+  const maxX = rect.x + rect.width / 2 + padding;
+  const minY = rect.y - rect.height / 2 - padding;
+  const maxY = rect.y + rect.height / 2 + padding;
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  let low = 0;
+  let high = 1;
+  for (const [start, delta, min, max] of [[x1, dx, minX, maxX], [y1, dy, minY, maxY]]) {
+    if (Math.abs(delta) < 0.0001) {
+      if (start < min || start > max) return false;
+      continue;
+    }
+    const first = (min - start) / delta;
+    const second = (max - start) / delta;
+    low = Math.max(low, Math.min(first, second));
+    high = Math.min(high, Math.max(first, second));
+    if (low > high) return false;
+  }
+  return true;
+}
+
+function querySegment(index, x1, y1, x2, y2, padding) {
+  return index.queryAabb(
+    Math.min(x1, x2) - padding,
+    Math.min(y1, y2) - padding,
+    Math.max(x1, x2) + padding,
+    Math.max(y1, y2) + padding
+  );
 }
 
 function distance(a, b, x2, y2) {
@@ -268,27 +406,49 @@ function getRoom(code) {
       latestWorld: createWorld(`room-${roomCode}`),
       generatedChunks: new Set(),
       structureStates: new Map(),
+      spatial: createSpatialIndexes(),
+      worldChunkSignature: '',
+      clientEntityKnowledge: new Map(),
       lastMapSnapshotRevision: -1,
       lastStructureStateRevision: -1,
       lastTick: nowMs(),
-      lastSnapshot: 0
+      lastSnapshot: 0,
+      snapshotAccumulator: 0,
+      perf: createPerformanceMetrics()
     });
   }
   return rooms.get(roomCode);
 }
 
-function send(ws, packet) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(packet));
+function send(ws, packet, room = ws.room) {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const payload = JSON.stringify(packet);
+  ws.send(payload);
+  if (!PERF_DEBUG || !room?.perf) return;
+  const bytes = Buffer.byteLength(payload);
+  room.perf.outgoingMessages += 1;
+  room.perf.outgoingBytes += bytes;
+  if (packet.type === 'world') {
+    room.perf.snapshotMessages += 1;
+    room.perf.snapshotBytes += bytes;
+    room.perf.snapshotEntities += (packet.world?.players?.length || 0)
+      + (packet.world?.zombies?.length || 0)
+      + (packet.world?.bullets?.length || 0)
+      + (packet.world?.sentries?.length || 0)
+      + (packet.world?.walls?.length || 0)
+      + (packet.world?.traps?.length || 0)
+      + (packet.world?.buildings?.length || 0);
+  }
 }
 
 function broadcast(room, packet, except) {
   for (const client of room.clients.values()) {
-    if (client !== except) send(client, packet);
+    if (client !== except) send(client, packet, room);
   }
 }
 
-function getMapStructureStates(world) {
-  return (world.mapStructures || []).map((structure) => ({
+function getMapStructureStates(world, structures = world.mapStructures || []) {
+  return structures.map((structure) => ({
     id: structure.id,
     door: {
       open: Boolean(structure.door.open),
@@ -319,6 +479,92 @@ function worldSnapshot(room, options = {}) {
   };
 }
 
+function withinInterest(entity, anchor, radius = INTEREST_RADIUS) {
+  if (!anchor || !Number.isFinite(anchor.x) || !Number.isFinite(anchor.y)) return true;
+  const dx = entity.x - anchor.x;
+  const dy = entity.y - anchor.y;
+  return dx * dx + dy * dy <= radius * radius;
+}
+
+function compactKnownEntities(knowledge, key, entities, idSelector, dynamicFields) {
+  const previousKnown = knowledge[key] || new Set();
+  const nextKnown = new Set();
+  const result = [];
+  for (const entity of entities) {
+    const id = idSelector(entity);
+    if (!id) continue;
+    nextKnown.add(id);
+    if (!previousKnown.has(id)) {
+      result.push(entity);
+      continue;
+    }
+    const compact = {};
+    for (const field of dynamicFields) {
+      if (entity[field] !== undefined) compact[field] = entity[field];
+    }
+    result.push(compact);
+  }
+  knowledge[key] = nextKnown;
+  return result;
+}
+
+function networkWorldSnapshot(room, clientId, options = {}) {
+  const world = room.latestWorld;
+  const anchor = room.players.get(clientId) || null;
+  const knowledge = room.clientEntityKnowledge.get(clientId) || {};
+  room.clientEntityKnowledge.set(clientId, knowledge);
+  const {
+    mapStructures,
+    zombies,
+    bullets,
+    sentries,
+    walls,
+    traps,
+    buildings,
+    drops,
+    acidPools,
+    ...globalWorld
+  } = world;
+  const interestedZombies = zombies.filter((entity) => entity.isBoss || entity.isMiniBoss || withinInterest(entity, anchor));
+  const interestedBullets = bullets.filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 350));
+  const interestedSentries = sentries.filter((entity) => withinInterest(entity, anchor));
+  const interestedWalls = walls.filter((entity) => withinInterest(entity, anchor));
+  const interestedTraps = traps.filter((entity) => withinInterest(entity, anchor));
+  const interestedBuildings = buildings.filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 300));
+  const interestedMap = mapStructures.filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 650));
+  const playerList = [...room.players.values()];
+  return {
+    ...globalWorld,
+    zombies: compactKnownEntities(knowledge, 'zombies', interestedZombies, (entity) => entity.id, [
+      'id', 'x', 'y', 'health', 'shieldHealth', 'hidden', 'phase', 'burrowWarning', 'warningLine',
+      'chargeWindupUntil', 'chargeUntil', 'dodgeUntil', 'weakSpotUntil', 'stunnedUntil', 'domainCastingUntil'
+    ]),
+    bullets: compactKnownEntities(knowledge, 'bullets', interestedBullets, (entity) => entity.id, ['id', 'x', 'y', 'life']),
+    sentries: compactKnownEntities(knowledge, 'sentries', interestedSentries, (entity) => entity.networkId || entity.id, [
+      'networkId', 'id', 'x', 'y', 'angle', 'health', 'ammo', 'isDisabled'
+    ]),
+    walls: compactKnownEntities(knowledge, 'walls', interestedWalls, (entity) => entity.networkId || entity.id, [
+      'networkId', 'id', 'x', 'y', 'health', 'isElectric'
+    ]),
+    traps: compactKnownEntities(knowledge, 'traps', interestedTraps, (entity) => entity.networkId || entity.id, [
+      'networkId', 'id', 'x', 'y'
+    ]),
+    buildings: compactKnownEntities(knowledge, 'buildings', interestedBuildings, (entity) => entity.networkId || entity.id, [
+      'networkId', 'id', 'x', 'y', 'health'
+    ]),
+    drops: drops.filter((entity) => withinInterest(entity, anchor)),
+    acidPools: acidPools.filter((entity) => withinInterest(entity, anchor)),
+    ...(options.includeMap ? { mapStructures: interestedMap } : {}),
+    ...(options.includeMapStates ? { mapStructureStates: getMapStructureStates(world, interestedMap) } : {}),
+    gameStarted: room.gameStarted,
+    preparationEndsIn: world.preparationActive ? Math.max(0, world.preparationEndsAt - nowMs()) : 0,
+    players: compactKnownEntities(knowledge, 'players', playerList, (entity) => entity.id, [
+      'id', 'x', 'y', 'angle', 'health', 'maxHealth', 'downed', 'downedAt', 'respawnAt', 'giveUpAt',
+      'reviveProgress', 'reviverId', 'emergencyRespawns', 'lastSeen'
+    ])
+  };
+}
+
 function announceRoom(room) {
   if (!room.hostId || !room.clients.has(room.hostId)) {
     room.hostId = room.clients.keys().next().value || null;
@@ -329,8 +575,7 @@ function announceRoom(room) {
     room: room.code,
     hostId: room.hostId,
     clientCount: room.clients.size,
-    roomStarted: room.gameStarted,
-    latestWorld: worldSnapshot(room)
+    roomStarted: room.gameStarted
   });
 }
 
@@ -342,6 +587,7 @@ function registerClient(room, ws, packet) {
   }
   ws.clientId = packet.id;
   room.clients.set(packet.id, ws);
+  room.clientEntityKnowledge.delete(packet.id);
   if (!room.hostId) room.hostId = packet.id;
   send(ws, {
     type: 'server',
@@ -481,6 +727,15 @@ function findSafeZombieSpawn(world, anchor, radius) {
 }
 
 function getZombieDetour(world, zombie, target, now) {
+  if (now < (zombie.nextPathAt || 0)) {
+    if (zombie.detourUntil > now && Number.isFinite(zombie.detourX) && Number.isFinite(zombie.detourY)
+      && distance(zombie.x, zombie.y, zombie.detourX, zombie.detourY) > 28) {
+      return { ...target, x: zombie.detourX, y: zombie.detourY, distance: distance(zombie.x, zombie.y, zombie.detourX, zombie.detourY) };
+    }
+    return target;
+  }
+  const stagger = String(zombie.id || '').charCodeAt(String(zombie.id || '').length - 1) % 220;
+  zombie.nextPathAt = now + PATH_UPDATE_MS + stagger;
   const probe = WorldMap.approachPoint(
     zombie.x,
     zombie.y,
@@ -523,23 +778,73 @@ function getZombieDetour(world, zombie, target, now) {
   return { ...target, ...corners[0], distance: distance(zombie.x, zombie.y, corners[0].x, corners[0].y) };
 }
 
-function getTargets(room, zombie, includeStructures = true) {
+function targetEntityId(entity) {
+  return String(entity.id || entity.networkId || '');
+}
+
+function buildTargetContext(room, now) {
   const world = room.latestWorld;
-  const playerTargets = [...room.players.values()]
-    .filter((player) => nowMs() - player.lastSeen < 5000 && !player.downed && (player.health ?? 100) > 0)
-    .map((player) => ({ entity: player, x: player.x, y: player.y, radius: 12, kind: 'player' }));
-  const structureTargets = [];
-  if (includeStructures) {
-    for (const wall of world.walls) structureTargets.push({ entity: wall, x: wall.x, y: wall.y, radius: wall.radius || 25, kind: 'structure' });
-    for (const sentry of world.sentries) structureTargets.push({ entity: sentry, x: sentry.x, y: sentry.y, radius: sentry.radius || 15, kind: 'structure' });
-    for (const building of world.buildings) structureTargets.push({ entity: building, x: building.x, y: building.y, radius: Math.max(building.width || 0, building.height || 0) / 2, kind: 'structure' });
+  const players = [];
+  const playersById = new Map();
+  for (const player of room.players.values()) {
+    if (now - player.lastSeen >= 5000 || player.downed || (player.health ?? 100) <= 0) continue;
+    const target = {
+      entity: player,
+      x: player.x,
+      y: player.y,
+      radius: 12,
+      kind: 'player',
+      shelter: (world.mapStructures || []).find((entry) => WorldMap.pointInside(entry, player.x, player.y, 2)) || null
+    };
+    players.push(target);
+    playersById.set(player.id, target);
   }
-  const candidates = zombie.isSapper && structureTargets.length ? structureTargets : [...playerTargets, ...structureTargets];
-  if (!candidates.length) return null;
-  return candidates.reduce((nearest, candidate) => {
-    const d = distance(zombie.x, zombie.y, candidate.x, candidate.y);
-    return !nearest || d < nearest.distance ? { ...candidate, distance: d } : nearest;
-  }, null);
+  const structures = [];
+  const structuresById = new Map();
+  const addStructure = (entity, radius) => {
+    if ((entity.health ?? 1) <= 0) return;
+    const target = { entity, x: entity.x, y: entity.y, radius, kind: 'structure' };
+    structures.push(target);
+    structuresById.set(targetEntityId(entity), target);
+  };
+  for (const wall of world.walls) addStructure(wall, wall.radius || 25);
+  for (const sentry of world.sentries) addStructure(sentry, sentry.radius || 15);
+  for (const building of world.buildings) addStructure(building, Math.max(building.width || 0, building.height || 0) / 2);
+  return { players, playersById, structures, structuresById };
+}
+
+function getTargets(zombie, context, now, includeStructures = true) {
+  const cached = zombie.targetKind === 'player'
+    ? context.playersById.get(zombie.targetId)
+    : context.structuresById.get(zombie.targetId);
+  if (cached && now < (zombie.nextTargetAt || 0)) {
+    cached.x = cached.entity.x;
+    cached.y = cached.entity.y;
+    return { ...cached, distance: distance(zombie.x, zombie.y, cached.x, cached.y) };
+  }
+
+  const structureTargets = includeStructures ? context.structures : [];
+  const candidateGroups = zombie.isSapper && structureTargets.length
+    ? [structureTargets]
+    : [context.players, structureTargets];
+  let nearest = null;
+  let nearestDistanceSquared = Infinity;
+  for (const candidates of candidateGroups) {
+    for (const candidate of candidates) {
+      const dx = zombie.x - candidate.entity.x;
+      const dy = zombie.y - candidate.entity.y;
+      const distanceSquared = dx * dx + dy * dy;
+      if (distanceSquared >= nearestDistanceSquared) continue;
+      nearest = candidate;
+      nearestDistanceSquared = distanceSquared;
+    }
+  }
+  if (!nearest) return null;
+  zombie.targetId = targetEntityId(nearest.entity);
+  zombie.targetKind = nearest.kind;
+  const stagger = String(zombie.id || '').charCodeAt(String(zombie.id || '').length - 1) % 140;
+  zombie.nextTargetAt = now + TARGET_UPDATE_MS + stagger;
+  return { ...nearest, x: nearest.entity.x, y: nearest.entity.y, distance: Math.sqrt(nearestDistanceSquared) };
 }
 
 function damageZombie(zombie, amount) {
@@ -555,6 +860,57 @@ function damageZombie(zombie, amount) {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function sanitizePlayerState(previous, incoming, id, now) {
+  const requestedX = Number(incoming.x);
+  const requestedY = Number(incoming.y);
+  let x = Number.isFinite(requestedX) ? requestedX : (Number(previous.x) || 1100);
+  let y = Number.isFinite(requestedY) ? requestedY : (Number(previous.y) || 720);
+  if (Number.isFinite(previous.x) && Number.isFinite(previous.y)) {
+    const elapsed = Math.max(16, Math.min(500, now - (previous.lastSeen || now - 50)));
+    const maxTravel = 24 + elapsed * 0.65;
+    const travel = distance(previous.x, previous.y, x, y);
+    if (travel > maxTravel) {
+      const scale = maxTravel / travel;
+      x = previous.x + (x - previous.x) * scale;
+      y = previous.y + (y - previous.y) * scale;
+    }
+    if (previous.downed) {
+      x = previous.x;
+      y = previous.y;
+    }
+  }
+  const weapons = Array.isArray(incoming.weapons)
+    ? incoming.weapons.slice(0, 12).map((weapon) => ({
+      id: String(weapon.id || '').slice(0, 32),
+      owned: Boolean(weapon.owned),
+      upgradeLevel: clamp(Math.floor(Number(weapon.upgradeLevel) || 0), 0, 5)
+    }))
+    : previous.weapons;
+  return {
+    ...previous,
+    id,
+    name: String(incoming.name ?? previous.name ?? 'Shopper').slice(0, 24),
+    skinId: String(incoming.skinId ?? previous.skinId ?? 'shopper').slice(0, 32),
+    x,
+    y,
+    angle: Number.isFinite(Number(incoming.angle)) ? Number(incoming.angle) : (previous.angle || 0),
+    level: clamp(Math.floor(Number(incoming.level ?? previous.level) || 1), 1, 999),
+    weapons,
+    health: previous.health ?? clamp(Number(incoming.health) || 100, 0, 1000),
+    maxHealth: clamp(Number(incoming.maxHealth ?? previous.maxHealth) || 100, 1, 1000),
+    downed: Boolean(previous.downed),
+    downedAt: previous.downedAt || 0,
+    respawnAt: previous.respawnAt || 0,
+    giveUpAt: previous.giveUpAt || 0,
+    reviveProgress: previous.reviveProgress || 0,
+    reviverId: previous.reviverId || null,
+    lastReviveTick: previous.lastReviveTick || 0,
+    invulnerableUntil: previous.invulnerableUntil || 0,
+    emergencyRespawns: previous.emergencyRespawns || 0,
+    lastSeen: now
+  };
 }
 
 function spawnBossMinion(world, typeKey, x, y, scale = 0.75) {
@@ -769,7 +1125,8 @@ function spawnRemoteShot(room, player, weapon) {
   const cooldownKey = `${player.id}:${weapon.id}`;
   if (now - (room.weaponCooldowns.get(cooldownKey) || 0) < cooldown) return;
   room.weaponCooldowns.set(cooldownKey, now);
-  const angle = Number.isFinite(shooter.angle) ? shooter.angle : 0;
+  const requestedAngle = Number(weapon.angle);
+  const angle = Number.isFinite(requestedAngle) ? requestedAngle : (Number.isFinite(shooter.angle) ? shooter.angle : 0);
   const originX = shooter.x + Math.cos(angle) * 15;
   const originY = shooter.y + Math.sin(angle) * 15;
   const pellets = type.pellets || 0;
@@ -789,8 +1146,7 @@ function spawnRemoteShot(room, player, weapon) {
 
 function getShelterBreachPlan(world, zombie, target) {
   if (!target || target.kind !== 'player') return null;
-  const structure = (world.mapStructures || []).find((entry) =>
-    WorldMap.pointInside(entry, target.x, target.y, 2));
+  const structure = target.shelter || null;
   if (!structure || WorldMap.pointInside(structure, zombie.x, zombie.y, -zombie.size)) return null;
 
   const entries = [{
@@ -869,11 +1225,13 @@ function damageShelterEntry(world, zombie, breachPlan, now) {
 function updateZombies(room, dt) {
   const world = room.latestWorld;
   const now = nowMs();
+  const targetContext = buildTargetContext(room, now);
   updateDomainEvent(room, now);
   for (const z of world.zombies) {
     if (z.isHealer && now - z.lastHeal > z.healRate) {
       z.lastHeal = now;
-      for (const other of world.zombies) {
+      const nearbyZombies = room.spatial.zombies.queryRadius(z.x, z.y, z.healRadius);
+      for (const other of nearbyZombies) {
         if (other !== z && other.health < other.maxHealth && distance(z.x, z.y, other.x, other.y) < z.healRadius) {
           other.health = Math.min(other.maxHealth, other.health + z.healAmount);
           break;
@@ -881,7 +1239,8 @@ function updateZombies(room, dt) {
       }
     } else if (z.isEngineer && now - z.lastWeld > z.weldRate) {
       z.lastWeld = now;
-      for (const other of world.zombies) {
+      const nearbyZombies = room.spatial.zombies.queryRadius(z.x, z.y, z.weldRadius);
+      for (const other of nearbyZombies) {
         if (other !== z && distance(z.x, z.y, other.x, other.y) < z.weldRadius) {
           other.maxShieldHealth = Math.max(other.maxShieldHealth || 0, 90);
           other.shieldHealth = Math.min(other.maxShieldHealth, (other.shieldHealth || 0) + 30);
@@ -893,7 +1252,7 @@ function updateZombies(room, dt) {
 
   for (let i = world.zombies.length - 1; i >= 0; i--) {
     const z = world.zombies[i];
-    const target = getTargets(room, z, true);
+    const target = getTargets(z, targetContext, now, true);
     if (!target) continue;
     const targetDist = target.distance;
     const breachPlan = getShelterBreachPlan(world, z, target);
@@ -963,7 +1322,8 @@ function updateZombies(room, dt) {
         const previousY = z.y;
         z.x += moveX * moveSpeed;
         z.y += moveY * moveSpeed;
-        const isWallBlocked = () => (world.mapStructures || []).some((structure) =>
+        const nearbyMapStructures = room.spatial.mapStructures.queryRadius(z.x, z.y, WorldMap.CHUNK_SIZE);
+        const isWallBlocked = () => nearbyMapStructures.some((structure) =>
           WorldMap.structureNearPoint(structure, z.x, z.y, z.size + 12) &&
           WorldMap.wallSegments(structure).some((wall) => rectBlocked(z.x, z.y, z.size, wall)));
         const hitBuildingWall = isWallBlocked();
@@ -987,11 +1347,15 @@ function updateZombies(room, dt) {
       }
     }
 
-    for (let t = world.traps.length - 1; t >= 0 && z.health > 0; t--) {
-      const trap = world.traps[t];
+    const nearbyTraps = room.spatial.traps.queryRadius(z.x, z.y, 100);
+    for (const trap of nearbyTraps) {
+      if (z.health <= 0) break;
       if (distance(z.x, z.y, trap.x, trap.y) < trap.radius) {
         damageZombie(z, trap.damage || 250);
-        if (trap.oneTimeUse) world.traps.splice(t, 1);
+        if (trap.oneTimeUse) {
+          const trapIndex = world.traps.indexOf(trap);
+          if (trapIndex >= 0) world.traps.splice(trapIndex, 1);
+        }
       }
     }
 
@@ -1049,7 +1413,7 @@ function updateBullets(room, dt) {
       world.bullets.splice(i, 1);
       continue;
     }
-    const hitMapWall = (world.mapStructures || []).some((structure) =>
+    const hitMapWall = querySegment(room.spatial.mapStructures, previousX, previousY, b.x, b.y, 420).some((structure) =>
       WorldMap.structureNearSegment(structure, previousX, previousY, b.x, b.y, b.size || 4) &&
       WorldMap.segmentHitsStructure(structure, previousX, previousY, b.x, b.y, b.size || 4));
     if (hitMapWall) {
@@ -1058,16 +1422,16 @@ function updateBullets(room, dt) {
     }
     if (b.fromZombie) {
       let hit = false;
-      for (const wall of world.walls) {
-        if (Math.abs(b.x - wall.x) < (wall.radius || 25) && Math.abs(b.y - wall.y) < (wall.radius || 25)) {
+      for (const wall of querySegment(room.spatial.walls, previousX, previousY, b.x, b.y, 70)) {
+        if (segmentCircleHit(previousX, previousY, b.x, b.y, wall.x, wall.y, (wall.radius || 25) + (b.size || 4))) {
           wall.health -= b.damage;
           hit = true;
           break;
         }
       }
       if (!hit) {
-        for (const sentry of world.sentries) {
-          if (distance(b.x, b.y, sentry.x, sentry.y) < (sentry.radius || 15)) {
+        for (const sentry of querySegment(room.spatial.sentries, previousX, previousY, b.x, b.y, 55)) {
+          if (segmentCircleHit(previousX, previousY, b.x, b.y, sentry.x, sentry.y, (sentry.radius || 15) + (b.size || 4))) {
             sentry.health -= b.damage;
             hit = true;
             break;
@@ -1075,8 +1439,8 @@ function updateBullets(room, dt) {
         }
       }
       if (!hit) {
-        for (const building of world.buildings) {
-          if (Math.abs(b.x - building.x) < building.width / 2 && Math.abs(b.y - building.y) < building.height / 2) {
+        for (const building of querySegment(room.spatial.buildings, previousX, previousY, b.x, b.y, 220)) {
+          if (segmentAabbHit(previousX, previousY, b.x, b.y, building, b.size || 4)) {
             building.health -= b.damage;
             hit = true;
             break;
@@ -1085,7 +1449,7 @@ function updateBullets(room, dt) {
       }
       if (!hit) {
         for (const player of room.players.values()) {
-          if (distance(b.x, b.y, player.x, player.y) < 12) {
+          if (segmentCircleHit(previousX, previousY, b.x, b.y, player.x, player.y, 12 + (b.size || 4))) {
             const sheltered = (world.mapStructures || []).some((structure) =>
               WorldMap.pointInside(structure, player.x, player.y, 2));
             if (!sheltered && now >= (player.invulnerableUntil || 0)) player.health = Math.max(0, (player.health || 100) - b.damage);
@@ -1096,13 +1460,14 @@ function updateBullets(room, dt) {
       }
       if (hit) world.bullets.splice(i, 1);
     } else {
-      for (const z of world.zombies) {
+      const nearbyZombies = querySegment(room.spatial.zombies, previousX, previousY, b.x, b.y, 70);
+      for (const z of nearbyZombies) {
         if (b.hitIds?.includes(z.id)) continue;
         if (tryBossDodge(world, z, b, now)) continue;
-        if (distance(b.x, b.y, z.x, z.y) < z.size) {
+        if (segmentCircleHit(previousX, previousY, b.x, b.y, z.x, z.y, z.size + (b.size || 4))) {
           z.lastHitBy = b.ownerId || z.lastHitBy || null;
           if (b.explosive) {
-            for (const nearby of world.zombies) {
+            for (const nearby of room.spatial.zombies.queryRadius(b.x, b.y, 105)) {
               if (distance(b.x, b.y, nearby.x, nearby.y) < 95) {
                 nearby.lastHitBy = b.ownerId || nearby.lastHitBy || null;
                 damageZombie(nearby, b.damage * 0.5);
@@ -1141,7 +1506,7 @@ function updateSentries(room) {
     let closest = null;
     let closestDist = (sentry.range || 260) * (powerRelayOnline ? 1.15 : 1);
     if (canRefill && sentry.ammo < sentry.maxAmmo) sentry.ammo = Math.min(sentry.maxAmmo, sentry.ammo + (armoryOnline ? 6 : 1));
-    for (const z of world.zombies) {
+    for (const z of room.spatial.zombies.queryRadius(sentry.x, sentry.y, closestDist + 55)) {
       const d = distance(sentry.x, sentry.y, z.x, z.y);
       if (d < closestDist) {
         closest = z;
@@ -1182,7 +1547,6 @@ function dropLoot(world, x, y) {
 
 function ensureWorldChunks(room) {
   const world = room.latestWorld;
-  const previousChunkKeys = new Set(room.generatedChunks);
   const anchors = [...room.players.values()].filter((player) => Number.isFinite(player.x) && Number.isFinite(player.y));
   if (!anchors.length) anchors.push({ x: 1100, y: 720 });
   const desiredChunks = new Set();
@@ -1195,29 +1559,34 @@ function ensureWorldChunks(room) {
         const cy = centerY + oy;
         const key = WorldMap.chunkKey(cx, cy);
         desiredChunks.add(key);
-        if (room.generatedChunks.has(key)) continue;
-        room.generatedChunks.add(key);
-        const structures = WorldMap.generateChunk(world.mapSeed, cx, cy);
-        for (const structure of structures) {
-          const saved = room.structureStates.get(structure.id);
-          if (saved) {
-            structure.door.open = saved.doorOpen;
-            structure.door.destroyed = saved.doorDestroyed;
-            if (Number.isFinite(saved.doorHealth)) structure.door.health = saved.doorHealth;
-            structure.loot.claimed = saved.lootClaimed;
-            for (const windowEntry of structure.windows || []) {
-              const savedWindow = saved.windows?.find((entry) => entry.id === windowEntry.id);
-              if (!savedWindow) continue;
-              if (Number.isFinite(savedWindow.health)) windowEntry.health = savedWindow.health;
-              windowEntry.breached = savedWindow.breached;
-            }
-          }
-        }
-        world.mapStructures.push(...structures);
       }
     }
   }
+  const signature = [...desiredChunks].sort().join('|');
+  if (signature === room.worldChunkSignature) return;
+  const previousChunkKeys = room.generatedChunks;
+  for (const key of desiredChunks) {
+    if (previousChunkKeys.has(key)) continue;
+    const [cx, cy] = key.split(':').map(Number);
+    const structures = WorldMap.generateChunk(world.mapSeed, cx, cy);
+    for (const structure of structures) {
+      const saved = room.structureStates.get(structure.id);
+      if (!saved) continue;
+      structure.door.open = saved.doorOpen;
+      structure.door.destroyed = saved.doorDestroyed;
+      if (Number.isFinite(saved.doorHealth)) structure.door.health = saved.doorHealth;
+      structure.loot.claimed = saved.lootClaimed;
+      for (const windowEntry of structure.windows || []) {
+        const savedWindow = saved.windows?.find((entry) => entry.id === windowEntry.id);
+        if (!savedWindow) continue;
+        if (Number.isFinite(savedWindow.health)) windowEntry.health = savedWindow.health;
+        windowEntry.breached = savedWindow.breached;
+      }
+    }
+    world.mapStructures.push(...structures);
+  }
   for (const structure of world.mapStructures) {
+    if (desiredChunks.has(structure.chunkKey)) continue;
     room.structureStates.set(structure.id, {
       doorOpen: Boolean(structure.door.open),
       doorDestroyed: Boolean(structure.door.destroyed),
@@ -1231,12 +1600,9 @@ function ensureWorldChunks(room) {
     });
   }
   world.mapStructures = world.mapStructures.filter((structure) => desiredChunks.has(structure.chunkKey));
-  for (const key of [...room.generatedChunks]) {
-    if (!desiredChunks.has(key)) room.generatedChunks.delete(key);
-  }
-  if (previousChunkKeys.size !== desiredChunks.size || [...desiredChunks].some((key) => !previousChunkKeys.has(key))) {
-    world.mapRevision = (world.mapRevision || 0) + 1;
-  }
+  room.generatedChunks = desiredChunks;
+  room.worldChunkSignature = signature;
+  world.mapRevision = (world.mapRevision || 0) + 1;
 }
 
 function spawnWorldDrop(room) {
@@ -1385,9 +1751,11 @@ function updateDayNight(world, now) {
 }
 
 function tickRoom(room) {
+  const tickStartedAt = PERF_DEBUG ? performance.now() : 0;
   const now = nowMs();
   const dt = Math.min(200, Math.max(1, now - room.lastTick));
   room.lastTick = now;
+  room.snapshotAccumulator += dt;
   room.latestWorld.serverTime = now;
   updateDayNight(room.latestWorld, now);
 
@@ -1396,37 +1764,122 @@ function tickRoom(room) {
   }
   updatePlayerLifeStates(room, now);
 
-  ensureWorldChunks(room);
+  measureStage(room, 'chunks', () => ensureWorldChunks(room));
+  measureStage(room, 'spatial', () => rebuildSpatialIndexes(room));
   if (now >= room.latestWorld.nextWorldDropAt) spawnWorldDrop(room);
   collectNearbyDrops(room);
 
-  updateWaveState(room);
+  measureStage(room, 'wave', () => updateWaveState(room));
   if (room.latestWorld.waveActive) {
-    updateZombies(room, dt);
-    updateBullets(room, dt);
-    updateSentries(room);
-    cleanupWorld(room.latestWorld, dt);
+    measureStage(room, 'zombies', () => updateZombies(room, dt));
+    measureStage(room, 'spatial', () => rebuildSpatialIndexes(room, true));
+    measureStage(room, 'bullets', () => updateBullets(room, dt));
+    measureStage(room, 'sentries', () => updateSentries(room));
+    measureStage(room, 'cleanup', () => cleanupWorld(room.latestWorld, dt));
   }
 
-  if (now - room.lastSnapshot >= SNAPSHOT_MS) {
+  if (room.snapshotAccumulator >= SNAPSHOT_MS) {
+    room.snapshotAccumulator %= SNAPSHOT_MS;
     room.lastSnapshot = now;
     const includeMap = room.lastMapSnapshotRevision !== room.latestWorld.mapRevision;
     const includeMapStates = includeMap || room.lastStructureStateRevision !== room.latestWorld.structureStateRevision;
     if (includeMap) room.lastMapSnapshotRevision = room.latestWorld.mapRevision;
     if (includeMapStates) room.lastStructureStateRevision = room.latestWorld.structureStateRevision;
-    broadcast(room, {
-      type: 'world',
-      id: 'server',
-      authoritative: true,
-      room: room.code,
-      world: worldSnapshot(room, { includeMap, includeMapStates })
+    measureStage(room, 'snapshots', () => {
+      for (const [clientId, client] of room.clients) {
+        send(client, {
+          type: 'world',
+          id: 'server',
+          authoritative: true,
+          room: room.code,
+          world: networkWorldSnapshot(room, clientId, { includeMap, includeMapStates })
+        }, room);
+      }
     });
+  }
+
+  if (PERF_DEBUG) {
+    const tickMs = performance.now() - tickStartedAt;
+    room.perf.ticks += 1;
+    room.perf.tickTotalMs += tickMs;
+    room.perf.tickWorstMs = Math.max(room.perf.tickWorstMs, tickMs);
+    if (tickMs > 30) {
+      room.perf.slowTicks += 1;
+      if (now - room.perf.lastSlowLogAt > 1000) {
+        room.perf.lastSlowLogAt = now;
+        console.warn(`[perf:${room.code}] Slow tick ${tickMs.toFixed(1)}ms with ${room.latestWorld.zombies.length} zombies and ${room.latestWorld.bullets.length} projectiles`);
+      }
+    }
   }
 }
 
 function handleAction(room, packet) {
   const action = packet.action || {};
   const world = room.latestWorld;
+  if (PERF_DEBUG && action.kind === 'debugPopulate' && packet.id === room.hostId) {
+    const anchor = room.players.get(packet.id) || { x: 1100, y: 720 };
+    const zombieCount = clamp(Math.floor(Number(action.zombies) || 0), 0, 800);
+    const projectileCount = clamp(Math.floor(Number(action.projectiles) || 0), 0, 1000);
+    const sentryCount = clamp(Math.floor(Number(action.sentries) || 0), 0, 100);
+    world.wave = Math.max(20, world.wave || 0);
+    world.waveActive = true;
+    world.gameStarted = true;
+    room.gameStarted = true;
+    world.zombies.length = 0;
+    world.bullets.length = 0;
+    world.sentries.length = 0;
+    for (let i = 0; i < zombieCount; i += 1) {
+      const typeKey = i % 17 === 0 ? 'healerZombie' : i % 19 === 0 ? 'engineer' : i % 7 === 0 ? 'armored' : 'normal';
+      const type = enemyTypes[typeKey];
+      const angle = (i / Math.max(1, zombieCount)) * Math.PI * 2;
+      const ring = 220 + (i % 10) * 34;
+      world.zombies.push({
+        ...type,
+        type: typeKey,
+        id: `debug-z-${i}`,
+        x: anchor.x + Math.cos(angle) * ring,
+        y: anchor.y + Math.sin(angle) * ring,
+        health: type.health,
+        maxHealth: type.health,
+        shieldHealth: type.shieldHealth || 0,
+        maxShieldHealth: type.shieldHealth || 0,
+        damageScale: 1,
+        lastShot: 0,
+        lastSlam: 0,
+        lastMelee: 0,
+        lastHeal: 0,
+        lastWeld: 0
+      });
+    }
+    for (let i = 0; i < projectileCount; i += 1) {
+      const angle = (i / Math.max(1, projectileCount)) * Math.PI * 2;
+      pushBullet(world, anchor.x + Math.cos(angle) * 520, anchor.y + Math.sin(angle) * 520, angle, 1.2, 2, {
+        fromZombie: true,
+        life: 10000
+      });
+    }
+    for (let i = 0; i < sentryCount; i += 1) {
+      const angle = (i / Math.max(1, sentryCount)) * Math.PI * 2;
+      world.sentries.push({
+        networkId: `debug-s-${i}`,
+        x: anchor.x + Math.cos(angle) * 150,
+        y: anchor.y + Math.sin(angle) * 150,
+        range: 360,
+        damage: 1,
+        fireRate: 200,
+        speed: 8,
+        ammo: 100000,
+        maxAmmo: 100000,
+        health: 100000,
+        maxHealth: 100000,
+        ownerId: packet.id,
+        lastShot: 0
+      });
+    }
+    world.totalZombiesInWave = zombieCount;
+    room.perf = createPerformanceMetrics();
+    return;
+  }
   if (action.kind === 'startGame') {
     if (packet.id && packet.id !== room.hostId) return;
     room.gameStarted = true;
@@ -1454,11 +1907,10 @@ function handleAction(room, packet) {
     }, packet.id);
     if (!validateBuildPlacement(action.buildKind, entity, world)) return;
     target.push(entity);
-    broadcast(room, { type: 'world', id: 'server', authoritative: true, room: room.code, world: worldSnapshot(room) });
     return;
   }
-  if (action.kind === 'shot' && action.player && action.weapon) {
-    spawnRemoteShot(room, action.player, action.weapon);
+  if (action.kind === 'shot' && action.weapon) {
+    spawnRemoteShot(room, { id: packet.id }, { ...action.weapon, angle: action.angle });
     return;
   }
   if (action.kind === 'revive') {
@@ -1518,6 +1970,11 @@ function serveStatic(req, res) {
     res.end(JSON.stringify({ ok: true, service: 'last-shopper' }));
     return;
   }
+  if (url.pathname === '/debug/perf' && PERF_DEBUG) {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ rooms: [...rooms.values()].map(performanceReport) }, null, 2));
+    return;
+  }
   let pathname = decodeURIComponent(url.pathname);
   if (pathname === '/') pathname = '/index.html';
   const requested = path.normalize(path.join(ROOT, pathname));
@@ -1532,7 +1989,10 @@ function serveStatic(req, res) {
       res.end('Not found');
       return;
     }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(requested)] || 'application/octet-stream' });
+    const extension = path.extname(requested);
+    const headers = { 'Content-Type': MIME[extension] || 'application/octet-stream' };
+    if (extension === '.html' || extension === '.js' || extension === '.css') headers['Cache-Control'] = 'no-cache';
+    res.writeHead(200, headers);
     res.end(data);
   });
 }
@@ -1567,25 +2027,14 @@ wss.on('connection', (ws, req, room) => {
 
     if (packet.id) registerClient(room, ws, packet);
 
+    if (packet.type === 'ping') {
+      send(ws, { type: 'pong', sentAt: packet.sentAt, serverTime: nowMs() }, room);
+      return;
+    }
+
     if (packet.type === 'state' && packet.id && packet.state) {
       const previous = room.players.get(packet.id) || {};
-      room.players.set(packet.id, {
-        id: packet.id,
-        ...previous,
-        ...packet.state,
-        health: previous.health ?? packet.state.health ?? 100,
-        maxHealth: packet.state.maxHealth ?? previous.maxHealth ?? 100,
-        downed: Boolean(previous.downed),
-        downedAt: previous.downedAt || 0,
-        respawnAt: previous.respawnAt || 0,
-        giveUpAt: previous.giveUpAt || 0,
-        reviveProgress: previous.reviveProgress || 0,
-        reviverId: previous.reviverId || null,
-        lastReviveTick: previous.lastReviveTick || 0,
-        invulnerableUntil: previous.invulnerableUntil || 0,
-        lastSeen: nowMs()
-      });
-      broadcast(room, packet, ws);
+      room.players.set(packet.id, sanitizePlayerState(previous, packet.state, packet.id, nowMs()));
       return;
     }
 
@@ -1601,6 +2050,7 @@ wss.on('connection', (ws, req, room) => {
     if (ws.clientId && room.clients.get(ws.clientId) === ws) {
       room.clients.delete(ws.clientId);
       room.players.delete(ws.clientId);
+      room.clientEntityKnowledge.delete(ws.clientId);
       if (room.hostId === ws.clientId) room.hostId = null;
       announceRoom(room);
     }
@@ -1608,9 +2058,24 @@ wss.on('connection', (ws, req, room) => {
   });
 });
 
-setInterval(() => {
+let nextServerTick = performance.now() + TICK_MS;
+function runServerTickLoop() {
+  const loopStartedAt = performance.now();
   for (const room of rooms.values()) tickRoom(room);
-}, TICK_MS);
+  nextServerTick += TICK_MS;
+  if (loopStartedAt - nextServerTick > TICK_MS * 3) nextServerTick = performance.now() + TICK_MS;
+  setTimeout(runServerTickLoop, Math.max(1, nextServerTick - performance.now()));
+}
+setTimeout(runServerTickLoop, TICK_MS);
+
+if (PERF_DEBUG) {
+  setInterval(() => {
+    for (const room of rooms.values()) {
+      const report = performanceReport(room);
+      console.log(`[perf:${room.code}] ${report.measuredTickRate.toFixed(1)}Hz avg=${report.averageTickMs.toFixed(2)}ms worst=${report.worstTickMs.toFixed(1)}ms zombies=${report.zombies} projectiles=${report.projectiles} snapshots=${(report.averageSnapshotBytes / 1024).toFixed(1)}KB outbound=${(report.outgoingBytesPerSecond / 1024).toFixed(1)}KB/s`);
+    }
+  }, 5000).unref();
+}
 
 server.listen(PORT, () => {
   console.log(`Last Shopper server running at http://localhost:${PORT}`);

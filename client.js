@@ -104,6 +104,7 @@
             // Core game state
             zombies: [],
             bullets: [],
+            predictedProjectiles: [],
             explosions: [],
             particles: [],
             sentries: [],
@@ -161,6 +162,8 @@
                 playerName: 'The Shopper'
             },
             multiplayer: null,
+            performanceDebug: false,
+            performanceStats: { frames: 0, fps: 0, windowStartedAt: performance.now() },
             team: {
                 playerCount: 1
             },
@@ -349,6 +352,14 @@
                 this.loadMetaProgression();
                 this.setupLobby();
                 this.setupMultiplayer();
+                this.performanceOverlay = document.createElement('pre');
+                this.performanceOverlay.hidden = true;
+                Object.assign(this.performanceOverlay.style, {
+                    position: 'fixed', right: '12px', bottom: '12px', zIndex: '120', margin: '0',
+                    padding: '10px 12px', color: '#fed7aa', background: 'rgba(12,10,9,.9)',
+                    border: '1px solid #9a3412', font: '12px/1.45 monospace', pointerEvents: 'none'
+                });
+                document.body.appendChild(this.performanceOverlay);
                 // Set canvas size
                 canvas.width = window.innerWidth;
                 canvas.height = window.innerHeight;
@@ -363,6 +374,12 @@
                         || e.target instanceof HTMLTextAreaElement
                         || e.target?.isContentEditable;
                     if (typingTarget && e.key !== 'Escape') return;
+                    if (e.key === 'F3') {
+                        e.preventDefault();
+                        this.performanceDebug = !this.performanceDebug;
+                        this.performanceOverlay.hidden = !this.performanceDebug;
+                        return;
+                    }
                     if (e.key === 'Escape' && this.zombieIndexOpen) {
                         this.toggleZombieIndex(false);
                         return;
@@ -563,6 +580,7 @@
             resetGame: function() {
                 this.zombies = [];
                 this.bullets = [];
+                this.predictedProjectiles = [];
                 this.explosions = [];
                 this.particles = [];
                 this.sentries = [];
@@ -656,12 +674,38 @@
             
             gameLoop: function(timestamp) {
                 if (this.gameOver || !this.gameStarted) return;
+                this.updatePerformanceMetrics(timestamp);
                 
                 this.update();
                 this.draw();
                 
                 this.lastFrameTime = timestamp;
                 requestAnimationFrame(this.gameLoop.bind(this));
+            },
+
+            updatePerformanceMetrics: function(timestamp) {
+                const stats = this.performanceStats;
+                stats.frames += 1;
+                const elapsed = timestamp - stats.windowStartedAt;
+                if (elapsed >= 500) {
+                    stats.fps = stats.frames * 1000 / elapsed;
+                    stats.frames = 0;
+                    stats.windowStartedAt = timestamp;
+                }
+                if (!this.performanceDebug || !this.performanceOverlay) return;
+                const network = this.multiplayer?.getMetrics?.() || {};
+                const rendered = this.zombies.length + this.bullets.length + this.remotePlayers.length
+                    + this.sentries.length + this.walls.length + this.traps.length + this.buildings.length;
+                this.performanceOverlay.textContent = [
+                    'LAST SHOPPER PERF [F3]',
+                    `FPS              ${stats.fps.toFixed(1)}`,
+                    `Ping             ${(network.pingMs || 0).toFixed(0)} ms`,
+                    `Snapshots        ${network.snapshotRate || 0}/s`,
+                    `Inbound          ${((network.incomingBytesPerSecond || 0) / 1024).toFixed(1)} KB/s`,
+                    `Interpolation    ${(this.networkInterpolationDelay || 0).toFixed(0)} ms`,
+                    `Rendered entities ${rendered}`,
+                    `Zombies/Bullets  ${this.zombies.length}/${this.bullets.length}`
+                ].join('\n');
             },
             
             // --- UPDATE FUNCTIONS ---
@@ -695,6 +739,7 @@
                     }
                 }
                 if (this.advanceNetworkInterpolation) this.advanceNetworkInterpolation();
+                this.updatePredictedProjectiles();
                 this.updateExplosions();
                 this.updateParticles();
                 this.updateCamera();
@@ -1761,6 +1806,17 @@
 
                     ctx.shadowBlur = 0;
                 }
+                for (const tracer of this.predictedProjectiles) {
+                    ctx.save();
+                    ctx.globalAlpha = Math.max(0, tracer.life / tracer.maxLife);
+                    ctx.strokeStyle = tracer.explosive ? '#fb923c' : '#fde68a';
+                    ctx.lineWidth = tracer.size || 2;
+                    ctx.beginPath();
+                    ctx.moveTo(tracer.previousX, tracer.previousY);
+                    ctx.lineTo(tracer.x, tracer.y);
+                    ctx.stroke();
+                    ctx.restore();
+                }
             },
 
             drawExplosions: function() {
@@ -1877,6 +1933,40 @@
             },
             
             // --- ACTION FUNCTIONS ---
+
+            spawnPredictedShot: function(weapon, angle) {
+                if (!this.multiplayer?.serverAuthoritative) return;
+                const pelletCount = weapon.pellets ? Math.min(6, weapon.pellets) : 1;
+                for (let i = 0; i < pelletCount; i++) {
+                    const shotAngle = angle + (weapon.pellets ? (Math.random() - 0.5) * 0.4 : 0);
+                    const x = this.player.x + Math.cos(angle) * 15;
+                    const y = this.player.y + Math.sin(angle) * 15;
+                    this.predictedProjectiles.push({
+                        x,
+                        y,
+                        previousX: x,
+                        previousY: y,
+                        vx: Math.cos(shotAngle) * weapon.speed * 2.2,
+                        vy: Math.sin(shotAngle) * weapon.speed * 2.2,
+                        explosive: Boolean(weapon.explosive),
+                        size: weapon.pellets ? 1.5 : Math.max(2, (weapon.bulletSize || 4) * 0.55),
+                        life: 9,
+                        maxLife: 9
+                    });
+                }
+            },
+
+            updatePredictedProjectiles: function() {
+                for (let i = this.predictedProjectiles.length - 1; i >= 0; i -= 1) {
+                    const tracer = this.predictedProjectiles[i];
+                    tracer.previousX = tracer.x;
+                    tracer.previousY = tracer.y;
+                    tracer.x += tracer.vx;
+                    tracer.y += tracer.vy;
+                    tracer.life -= 1;
+                    if (tracer.life <= 0) this.predictedProjectiles.splice(i, 1);
+                }
+            },
             
             shoot: function() {
                 const weapon = this.weapons[this.selectedWeapon];
@@ -1905,6 +1995,7 @@
                 
                 const angle = this.player.angle;
                 this.addCameraShake(weapon.pellets ? 3 : 2);
+                this.spawnPredictedShot(weapon, angle);
                 if (this.broadcastShotAction) this.broadcastShotAction(weapon, angle);
                 if (this.multiplayer?.serverAuthoritative) return;
                 

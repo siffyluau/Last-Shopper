@@ -14,10 +14,14 @@
             this.socket = null;
             this.syncTimer = null;
             this.cleanupTimer = null;
+            this.pingTimer = null;
             this.isHost = true;
             this.roomHostId = null;
             this.desiredHost = false;
             this.serverAuthoritative = false;
+            this.pingMs = 0;
+            this.snapshotTimes = [];
+            this.incomingByteSamples = [];
         }
 
         connect(roomCode, relayUrl, options = {}) {
@@ -29,8 +33,11 @@
             } else {
                 this.connectLocal(this.roomCode);
             }
-            this.syncTimer = setInterval(() => this.sendState(), 110);
+            this.syncTimer = setInterval(() => this.sendState(), relayUrl ? 50 : 110);
             this.cleanupTimer = setInterval(() => this.cleanupPeers(), 1000);
+            if (relayUrl) this.pingTimer = setInterval(() => {
+                this.sendPacket({ type: 'ping', id: this.localId, sentAt: performance.now() });
+            }, 2000);
             this.sendState();
         }
 
@@ -63,6 +70,8 @@
             this.socket.onerror = () => this.onStatus('CLOUD ERROR', 'offline');
             this.socket.onmessage = (event) => {
                 try {
+                    const receivedAt = performance.now();
+                    this.incomingByteSamples.push({ at: receivedAt, bytes: typeof event.data === 'string' ? event.data.length : 0 });
                     this.receive(JSON.parse(event.data));
                 } catch {
                     this.onStatus('BAD CLOUD PACKET', 'offline');
@@ -73,6 +82,10 @@
 
         receive(packet) {
             if (!packet) return;
+            if (packet.type === 'pong') {
+                this.pingMs = Math.max(0, performance.now() - Number(packet.sentAt || performance.now()));
+                return;
+            }
             if (packet.type === 'server' || packet.type === 'host') {
                 this.serverAuthoritative = Boolean(packet.authoritative);
                 this.roomHostId = packet.hostId || this.roomHostId;
@@ -96,6 +109,7 @@
                 return;
             }
             if (packet.type === 'world') {
+                this.snapshotTimes.push(performance.now());
                 if (this.serverAuthoritative || !this.isHost) this.onWorld(packet.world);
                 return;
             }
@@ -105,7 +119,17 @@
         }
 
         sendState() {
-            const packet = { type: 'state', id: this.localId, room: this.roomCode, state: this.getState() };
+            const fullState = this.getState();
+            const now = performance.now();
+            const loadoutSignature = JSON.stringify(fullState.weapons || []);
+            const includeLoadout = loadoutSignature !== this.lastLoadoutSignature || now - (this.lastLoadoutSentAt || 0) > 1000;
+            if (includeLoadout) {
+                this.lastLoadoutSignature = loadoutSignature;
+                this.lastLoadoutSentAt = now;
+            }
+            const state = { ...fullState };
+            if (!includeLoadout) delete state.weapons;
+            const packet = { type: 'state', id: this.localId, room: this.roomCode, state };
             this.sendPacket(packet);
         }
 
@@ -125,6 +149,17 @@
             }
         }
 
+        getMetrics() {
+            const cutoff = performance.now() - 1000;
+            while (this.snapshotTimes.length && this.snapshotTimes[0] < cutoff) this.snapshotTimes.shift();
+            while (this.incomingByteSamples.length && this.incomingByteSamples[0].at < cutoff) this.incomingByteSamples.shift();
+            return {
+                pingMs: this.pingMs,
+                snapshotRate: this.snapshotTimes.length,
+                incomingBytesPerSecond: this.incomingByteSamples.reduce((sum, sample) => sum + sample.bytes, 0)
+            };
+        }
+
         cleanupPeers() {
             const now = performance.now();
             let changed = false;
@@ -140,14 +175,21 @@
         disconnect() {
             if (this.syncTimer) clearInterval(this.syncTimer);
             if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+            if (this.pingTimer) clearInterval(this.pingTimer);
             if (this.channel) this.channel.close();
             if (this.socket) this.socket.close();
             this.syncTimer = null;
             this.cleanupTimer = null;
+            this.pingTimer = null;
             this.channel = null;
             this.socket = null;
             this.isHost = true;
             this.serverAuthoritative = false;
+            this.pingMs = 0;
+            this.snapshotTimes.length = 0;
+            this.incomingByteSamples.length = 0;
+            this.lastLoadoutSignature = null;
+            this.lastLoadoutSentAt = 0;
             this.peers.clear();
             this.onPeers([]);
         }

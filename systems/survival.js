@@ -102,13 +102,14 @@
 
         discoverSameOriginRelay: async function () {
             if (cloudRelayInput.value || !location.host) return;
+            const sameOriginRelay = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/room`;
+            cloudRelayInput.value = sameOriginRelay;
             try {
                 const response = await fetch('/healthz', { cache: 'no-store' });
                 const health = response.ok ? await response.json() : null;
-                if (health?.service !== 'last-shopper') return;
-                cloudRelayInput.value = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/room`;
+                if (health?.service !== 'last-shopper') cloudRelayInput.value = '';
             } catch {
-                // Static Sites deployments use a separately configured relay URL.
+                // Keep the same-origin relay on transient health-check failures.
             }
         },
 
@@ -431,17 +432,36 @@
             const previousById = new Map((current || []).filter((entry) => entry.id).map((entry) => [entry.id, entry]));
             return (incoming || []).map((entry) => {
                 const previous = entry.id ? previousById.get(entry.id) : null;
-                if (!previous) return { ...entry, networkX: entry.x, networkY: entry.y };
+                const receivedAt = performance.now();
+                if (!previous) return {
+                    ...entry,
+                    networkFromX: entry.x,
+                    networkFromY: entry.y,
+                    networkToX: entry.x,
+                    networkToY: entry.y,
+                    networkReceivedAt: receivedAt,
+                    networkDuration: this.networkInterpolationDelay || 100
+                };
                 const teleported = Math.hypot(entry.x - previous.x, entry.y - previous.y) > 240;
                 return {
                     ...previous,
                     ...entry,
                     x: teleported ? entry.x : previous.x,
                     y: teleported ? entry.y : previous.y,
-                    networkX: entry.x,
-                    networkY: entry.y
+                    networkFromX: teleported ? entry.x : previous.x,
+                    networkFromY: teleported ? entry.y : previous.y,
+                    networkToX: entry.x,
+                    networkToY: entry.y,
+                    networkReceivedAt: receivedAt,
+                    networkDuration: this.networkInterpolationDelay || 100
                 };
             });
+        },
+
+        mergeNetworkState: function (current, incoming) {
+            const getId = (entry) => entry?.networkId || entry?.id;
+            const previousById = new Map((current || []).map((entry) => [getId(entry), entry]));
+            return (incoming || []).map((entry) => ({ ...(previousById.get(getId(entry)) || {}), ...entry }));
         },
 
         applyMapStructureStates: function (states) {
@@ -462,20 +482,29 @@
 
         advanceNetworkInterpolation: function () {
             if (!this.multiplayer?.serverAuthoritative) return;
-            const smooth = (entities, alpha) => {
+            const now = performance.now();
+            const smooth = (entities) => {
                 for (const entity of entities || []) {
-                    if (!Number.isFinite(entity.networkX) || !Number.isFinite(entity.networkY)) continue;
-                    entity.x += (entity.networkX - entity.x) * alpha;
-                    entity.y += (entity.networkY - entity.y) * alpha;
+                    if (!Number.isFinite(entity.networkToX) || !Number.isFinite(entity.networkToY)) continue;
+                    const progress = Math.max(0, Math.min(1, (now - entity.networkReceivedAt) / Math.max(16, entity.networkDuration || 100)));
+                    const eased = progress * progress * (3 - 2 * progress);
+                    entity.x = entity.networkFromX + (entity.networkToX - entity.networkFromX) * eased;
+                    entity.y = entity.networkFromY + (entity.networkToY - entity.networkFromY) * eased;
                 }
             };
-            smooth(this.zombies, 0.34);
-            smooth(this.bullets, 0.58);
-            smooth(this.remotePlayers, 0.42);
+            smooth(this.zombies);
+            smooth(this.bullets);
+            smooth(this.remotePlayers);
         },
 
         applyWorldSnapshot: function (world) {
             if (!world || this.isWorldHost()) return;
+            const snapshotReceivedAt = performance.now();
+            if (this.lastNetworkSnapshotAt) {
+                const snapshotGap = snapshotReceivedAt - this.lastNetworkSnapshotAt;
+                this.networkInterpolationDelay = Math.max(55, Math.min(180, snapshotGap * 1.08));
+            }
+            this.lastNetworkSnapshotAt = snapshotReceivedAt;
             const wasDowned = Boolean(this.player.downed);
             this.serverTime = world.serverTime || this.serverTime;
             this.dayTime = Number.isFinite(world.dayTime) ? world.dayTime : this.dayTime;
@@ -508,10 +537,10 @@
                 this.zombies = world.zombies || [];
                 this.bullets = world.bullets || [];
             }
-            this.sentries = world.sentries || [];
-            this.walls = world.walls || [];
-            this.traps = world.traps || [];
-            this.buildings = world.buildings || [];
+            this.sentries = this.mergeNetworkState(this.sentries, world.sentries || []);
+            this.walls = this.mergeNetworkState(this.walls, world.walls || []);
+            this.traps = this.mergeNetworkState(this.traps, world.traps || []);
+            this.buildings = this.mergeNetworkState(this.buildings, world.buildings || []);
             this.mapSeed = world.mapSeed || this.mapSeed;
             if (world.mapStructures) this.mapStructures = world.mapStructures;
             this.applyMapStructureStates(world.mapStructureStates);
@@ -524,6 +553,10 @@
             if (world.players) {
                 const localServerPlayer = world.players.find((player) => player.id === this.localPlayerId);
                 if (localServerPlayer) {
+                    const correctionDistance = Math.hypot(localServerPlayer.x - this.player.x, localServerPlayer.y - this.player.y);
+                    const correctionScale = correctionDistance > 180 ? 1 : 0.14;
+                    this.player.x += (localServerPlayer.x - this.player.x) * correctionScale;
+                    this.player.y += (localServerPlayer.y - this.player.y) * correctionScale;
                     const emergencyRespawns = localServerPlayer.emergencyRespawns || 0;
                     if (emergencyRespawns > (this.player.emergencyRespawns || 0)) {
                         this.player.money = Math.floor(this.player.money * 0.8);
@@ -853,22 +886,10 @@
             if (!this.multiplayer || !this.multiplayer.roomCode || this.isWorldHost()) return;
             this.multiplayer.sendAction({
                 kind: 'shot',
-                player: {
-                    id: this.localPlayerId,
-                    name: this.player.name,
-                    x: this.player.x,
-                    y: this.player.y,
-                    angle
-                },
-                weapon: {
-                    id: weapon.id,
-                    upgradeLevel: weapon.upgradeLevel || 0,
-                    damage: this.getPlayerBulletDamage(weapon.damage),
-                    speed: weapon.speed,
-                    pellets: weapon.pellets || 0,
-                    explosive: weapon.explosive,
-                    bulletSize: weapon.bulletSize || 4
-                }
+                weapon: { id: weapon.id },
+                origin: { x: this.player.x, y: this.player.y },
+                angle,
+                clientTime: performance.now()
             });
         },
 
