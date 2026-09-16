@@ -131,13 +131,15 @@
                 }
                 this.setMultiplayerStatus('Host starting game...', 'online');
                 this.multiplayer.sendAction({ kind: 'startGame' });
-                this.enterGameFromLobby();
+                // A server room starts every client from the same authoritative event.
+                if (!this.multiplayer.serverAuthoritative) this.enterGameFromLobby();
                 return;
             }
             this.enterGameFromLobby();
         },
 
         enterGameFromLobby: function () {
+            if (this.gameStarted) return;
             this.applyLobbySelections();
             this.applySkinRunPerk?.();
             this.roomStarted = true;
@@ -338,7 +340,12 @@
         connectRoom: function (code) {
             this.applyLobbySelections();
             this.roomCode = code || 'STORE';
-            const relay = cloudRelayInput.value.trim();
+            const configuredRelay = cloudRelayInput.value.trim();
+            const sameOriginRelay = location.host && (location.protocol === 'http:' || location.protocol === 'https:')
+                ? `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/room`
+                : '';
+            const relay = configuredRelay || sameOriginRelay;
+            if (relay) cloudRelayInput.value = relay;
             if (relay) localStorage.setItem('lastShopperRelay', relay);
             if (this.multiplayer) this.multiplayer.connect(this.roomCode, relay, { host: this.isRoomHost });
             this.updatePartyList();
@@ -574,14 +581,27 @@
             if (world.players) {
                 const localServerPlayer = world.players.find((player) => player.id === this.localPlayerId);
                 if (localServerPlayer) {
-                    const correctionDistance = Math.hypot(localServerPlayer.x - this.player.x, localServerPlayer.y - this.player.y);
-                    if (this.performanceDebug && correctionDistance > 0.01) {
-                        this.performanceStats.reconciliation.push({ at: performance.now(), distance: correctionDistance });
-                        if (this.performanceStats.reconciliation.length > 1200) this.performanceStats.reconciliation.shift();
+                    const correctionX = localServerPlayer.x - this.player.x;
+                    const correctionY = localServerPlayer.y - this.player.y;
+                    const correctionDistance = Math.hypot(correctionX, correctionY);
+                    const moving = Boolean(this.keys.w || this.keys.a || this.keys.s || this.keys.d);
+                    const correctionDeadzone = moving ? Math.max(8, this.player.speed * 5) : 1.5;
+                    const hardSnap = correctionDistance > 220;
+                    if (hardSnap || correctionDistance > correctionDeadzone) {
+                        if (this.performanceDebug) {
+                            this.performanceStats.reconciliation.push({ at: performance.now(), distance: correctionDistance });
+                            if (this.performanceStats.reconciliation.length > 1200) this.performanceStats.reconciliation.shift();
+                        }
+                        if (hardSnap) {
+                            this.player.x = localServerPlayer.x;
+                            this.player.y = localServerPlayer.y;
+                        } else {
+                            const correctionScale = correctionDistance > 90 ? 0.18 : 0.08;
+                            const correctionAmount = (correctionDistance - correctionDeadzone) * correctionScale;
+                            this.player.x += correctionX / correctionDistance * correctionAmount;
+                            this.player.y += correctionY / correctionDistance * correctionAmount;
+                        }
                     }
-                    const correctionScale = correctionDistance > 180 ? 1 : 0.14;
-                    this.player.x += (localServerPlayer.x - this.player.x) * correctionScale;
-                    this.player.y += (localServerPlayer.y - this.player.y) * correctionScale;
                     const emergencyRespawns = localServerPlayer.emergencyRespawns || 0;
                     if (emergencyRespawns > (this.player.emergencyRespawns || 0)) {
                         this.player.money = Math.floor(this.player.money * 0.8);

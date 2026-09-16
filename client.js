@@ -827,7 +827,9 @@
                 }
                 if (!inputBlocked && !this.player.downed) this.updatePlayer();
                 if (this.syncMultiplayer) this.syncMultiplayer();
-                if (!this.isWorldHost || this.isWorldHost()) {
+                const shouldSimulateWorld = !this.multiplayer?.serverAuthoritative
+                    && (!this.isWorldHost || this.isWorldHost());
+                if (shouldSimulateWorld) {
                     if (this.ensureLocalWorldChunks) this.ensureLocalWorldChunks();
                     if (this.updateLocalWorldEvents) this.updateLocalWorldEvents();
                     if (!this.waitingForReward) {
