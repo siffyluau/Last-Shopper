@@ -185,6 +185,18 @@
         return wallSegments(structure).some((wall) => segmentIntersectsRect(x1, y1, x2, y2, wall, padding));
     }
 
+    function approachPoint(x1, y1, x2, y2, clearance) {
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const length = Math.hypot(dx, dy);
+        if (length <= 1) return { x: x2, y: y2 };
+        const pullback = Math.min(Math.max(0, Number(clearance) || 0), length * 0.45);
+        return {
+            x: x2 - (dx / length) * pullback,
+            y: y2 - (dy / length) * pullback
+        };
+    }
+
     function shuffle(list, random) {
         for (let i = list.length - 1; i > 0; i -= 1) {
             const j = Math.floor(random() * (i + 1));
@@ -327,6 +339,7 @@
         structureNearSegment,
         segmentIntersectsRect,
         segmentHitsStructure,
+        approachPoint,
         generateChunkScene,
         generateChunk
     };

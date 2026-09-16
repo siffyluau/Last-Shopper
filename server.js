@@ -481,16 +481,28 @@ function findSafeZombieSpawn(world, anchor, radius) {
 }
 
 function getZombieDetour(world, zombie, target, now) {
-  if (zombie.detourUntil > now && Number.isFinite(zombie.detourX) && Number.isFinite(zombie.detourY)) {
+  const probe = WorldMap.approachPoint(
+    zombie.x,
+    zombie.y,
+    target.x,
+    target.y,
+    zombie.size + (target.radius || 12) + 18
+  );
+  const obstacle = (world.mapStructures || []).find((structure) =>
+    !WorldMap.pointInside(structure, zombie.x, zombie.y, 2)
+    && WorldMap.segmentHitsStructure(structure, zombie.x, zombie.y, probe.x, probe.y, zombie.size + 4));
+  if (!obstacle) {
+    zombie.detourUntil = 0;
+    zombie.detourObstacleId = null;
+    return target;
+  }
+  if (zombie.detourObstacleId === obstacle.id && zombie.detourUntil > now
+    && Number.isFinite(zombie.detourX) && Number.isFinite(zombie.detourY)) {
     if (distance(zombie.x, zombie.y, zombie.detourX, zombie.detourY) > 28) {
       return { ...target, x: zombie.detourX, y: zombie.detourY, distance: distance(zombie.x, zombie.y, zombie.detourX, zombie.detourY) };
     }
   }
   zombie.detourUntil = 0;
-  const obstacle = (world.mapStructures || []).find((structure) =>
-    !WorldMap.pointInside(structure, zombie.x, zombie.y, 2)
-    && WorldMap.segmentHitsStructure(structure, zombie.x, zombie.y, target.x, target.y, zombie.size + 10));
-  if (!obstacle) return target;
   const padding = zombie.size + 34;
   const halfW = obstacle.width / 2 + padding;
   const halfH = obstacle.height / 2 + padding;
@@ -506,6 +518,7 @@ function getZombieDetour(world, zombie, target, now) {
     - distance(zombie.x, zombie.y, b.x, b.y) - distance(b.x, b.y, target.x, target.y));
   zombie.detourX = corners[0].x;
   zombie.detourY = corners[0].y;
+  zombie.detourObstacleId = obstacle.id;
   zombie.detourUntil = now + 2600;
   return { ...target, ...corners[0], distance: distance(zombie.x, zombie.y, corners[0].x, corners[0].y) };
 }

@@ -2646,14 +2646,26 @@
         getZombieNavigationTarget: function (zombie, target, now) {
             const worldMap = window.LastShopperWorld;
             if (!worldMap || !target) return target;
-            if (zombie.detourUntil > now && this.dist(zombie.x, zombie.y, zombie.detourX, zombie.detourY) > 28) {
+            const probe = worldMap.approachPoint(
+                zombie.x,
+                zombie.y,
+                target.x,
+                target.y,
+                zombie.size + (target.radius || 12) + 18
+            );
+            const obstacle = (this.mapStructures || []).find((structure) =>
+                !worldMap.pointInside(structure, zombie.x, zombie.y, 2)
+                && worldMap.segmentHitsStructure(structure, zombie.x, zombie.y, probe.x, probe.y, zombie.size + 4));
+            if (!obstacle) {
+                zombie.detourUntil = 0;
+                zombie.detourObstacleId = null;
+                return target;
+            }
+            if (zombie.detourObstacleId === obstacle.id && zombie.detourUntil > now
+                && this.dist(zombie.x, zombie.y, zombie.detourX, zombie.detourY) > 28) {
                 return { ...target, x: zombie.detourX, y: zombie.detourY, distance: this.dist(zombie.x, zombie.y, zombie.detourX, zombie.detourY) };
             }
             zombie.detourUntil = 0;
-            const obstacle = (this.mapStructures || []).find((structure) =>
-                !worldMap.pointInside(structure, zombie.x, zombie.y, 2)
-                && worldMap.segmentHitsStructure(structure, zombie.x, zombie.y, target.x, target.y, zombie.size + 10));
-            if (!obstacle) return target;
             const padding = zombie.size + 34;
             const corners = [
                 { x: obstacle.x - obstacle.width / 2 - padding, y: obstacle.y - obstacle.height / 2 - padding },
@@ -2666,6 +2678,7 @@
             if (!corners.length) return target;
             zombie.detourX = corners[0].x;
             zombie.detourY = corners[0].y;
+            zombie.detourObstacleId = obstacle.id;
             zombie.detourUntil = now + 2600;
             return { ...target, ...corners[0], distance: this.dist(zombie.x, zombie.y, corners[0].x, corners[0].y) };
         },
