@@ -208,18 +208,24 @@
         }
 
         .skin-preview {
+            position: relative;
             display: grid;
             place-items: center;
             height: 128px;
             border: 1px solid rgba(249,115,22,.52);
-            background:
-                linear-gradient(180deg, rgba(249,115,22,.14), transparent),
-                #1c1917;
+            overflow: hidden;
+            background: radial-gradient(circle at 50% 62%, color-mix(in srgb, var(--skin-accent, #f97316) 28%, transparent), transparent 48%), #1c1917;
             color: #fff7ed;
             font-size: 34px;
             font-weight: 700;
             box-shadow: inset 0 -12px rgba(0,0,0,.25);
         }
+        .skin-preview::before { content:""; position:absolute; left:50%; top:18px; width:34px; height:34px; border:4px solid var(--skin-accent); border-radius:48%; background:var(--skin-body); transform:translateX(-50%); box-shadow:0 8px 0 -3px rgba(0,0,0,.3); }
+        .skin-preview::after { content:""; position:absolute; left:50%; top:51px; width:68px; height:76px; border:4px solid var(--skin-accent); border-radius:13px 13px 2px 2px; background:var(--skin-shirt); transform:translateX(-50%); clip-path:polygon(15% 0,85% 0,100% 100%,0 100%); }
+        .skin-preview > span { position:relative; z-index:2; margin-top:52px; padding:3px 7px; border:1px solid var(--skin-accent); color:#fff; background:rgba(0,0,0,.58); font-size:15px; }
+        .skin-preview.preview-hazmat::before { box-shadow:inset 0 0 0 7px var(--skin-shirt); }
+        .skin-preview.preview-armor::after { width:82px; clip-path:polygon(10% 0,90% 0,100% 74%,78% 100%,22% 100%,0 74%); }
+        .skin-preview.preview-tie::after { background:linear-gradient(90deg,var(--skin-shirt) 0 44%,var(--skin-accent) 44% 56%,var(--skin-shirt) 56%); }
 
         .field-label {
             display: block;
@@ -263,7 +269,28 @@
 
         .skin-card.selected { border-color: #f97316; background: rgba(124,45,18,.28); }
         .skin-card.locked { opacity: .55; }
-        .skin-swatch { width: 100%; height: 28px; margin-bottom: 8px; border: 1px solid rgba(255,255,255,.1); }
+        .skin-paper-doll {
+            position: relative;
+            width: 50px;
+            height: 54px;
+            margin: 0 auto 8px;
+            filter: drop-shadow(0 5px 3px rgba(0,0,0,.45));
+        }
+        .skin-paper-doll i { position: absolute; display: block; }
+        .skin-head { left: 18px; top: 1px; width: 15px; height: 15px; border: 2px solid var(--skin-accent); border-radius: 45% 45% 40% 40%; background: var(--skin-body); }
+        .skin-torso { left: 13px; top: 16px; width: 24px; height: 23px; border: 2px solid var(--skin-accent); border-radius: 5px 5px 2px 2px; background: var(--skin-shirt); }
+        .skin-arm { top: 19px; width: 8px; height: 24px; border-radius: 4px; background: var(--skin-body); }
+        .skin-arm.left { left: 5px; transform: rotate(12deg); }
+        .skin-arm.right { right: 5px; transform: rotate(-12deg); }
+        .skin-legs { left: 15px; top: 38px; width: 20px; height: 15px; border-left: 8px solid var(--skin-body); border-right: 8px solid var(--skin-body); }
+        .style-apron .skin-torso { clip-path: polygon(12% 0,88% 0,100% 100%,0 100%); }
+        .style-overalls .skin-torso { background: linear-gradient(90deg,var(--skin-body) 0 25%,var(--skin-shirt) 25% 75%,var(--skin-body) 75%); }
+        .style-hoodie .skin-head { box-shadow: 0 0 0 4px var(--skin-shirt); }
+        .style-hazmat .skin-head { border-radius: 50%; box-shadow: inset 0 0 0 3px var(--skin-shirt); }
+        .style-armor .skin-torso { width: 30px; left: 10px; clip-path: polygon(10% 0,90% 0,100% 78%,78% 100%,22% 100%,0 78%); }
+        .style-tie .skin-torso { background: linear-gradient(90deg,var(--skin-shirt) 0 43%,var(--skin-accent) 43% 57%,var(--skin-shirt) 57%); }
+        .style-runner .skin-arm { transform: rotate(30deg); }
+        .style-hunter .skin-torso { box-shadow: inset 5px 0 var(--skin-accent); }
         .skin-card h3 { margin: 0 0 2px; color: #fff; font-size: 12px; font-weight: 700; }
         .skin-card p { margin: 0; color: #a8a29e; font-size: 10px; line-height: 1.2; }
 
@@ -578,6 +605,60 @@
         .trader-item-card .btn { justify-self: stretch; width: 100%; }
         .trader-item-card .btn small { margin-left: 5px; color: inherit; }
         .trader-stock-code { color: #fb923c; font-size: 9px; font-weight: 800; letter-spacing: .12em; }
+
+        .item-title-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+        .info-tip { position: relative; display: inline-grid; flex: 0 0 auto; place-items: center; outline: none; }
+        .info-tip-icon {
+            display: grid;
+            place-items: center;
+            width: 20px;
+            height: 20px;
+            border: 1px solid rgba(251,146,60,.72);
+            border-radius: 50%;
+            color: #fdba74;
+            background: #171412;
+            font: 800 italic 12px Georgia, serif;
+            cursor: help;
+        }
+        .info-tip-bubble {
+            position: absolute;
+            right: -6px;
+            bottom: calc(100% + 9px);
+            z-index: 120;
+            width: min(260px, 70vw);
+            padding: 10px 12px;
+            border: 1px solid rgba(249,115,22,.7);
+            color: #e7e5e4;
+            background: #12100f;
+            box-shadow: 0 12px 28px rgba(0,0,0,.65);
+            font-size: 11px;
+            font-weight: 500;
+            line-height: 1.45;
+            letter-spacing: normal;
+            text-transform: none;
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(5px);
+            transition: opacity 120ms ease, transform 120ms ease;
+        }
+        .info-tip:hover .info-tip-bubble,
+        .info-tip:focus .info-tip-bubble,
+        .info-tip:focus-within .info-tip-bubble { opacity: 1; transform: translateY(0); }
+
+        .potion-counter-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; padding: 12px 14px; border-left: 4px solid #a855f7; background: #17121b; }
+        .potion-counter-head h3 { margin: 2px 0 0; color: #fff7ed; font-size: 20px; }
+        .potion-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; }
+        .potion-card { display: grid; grid-template-columns: 58px 1fr; gap: 12px; min-height: 142px; padding: 13px; border: 1px solid rgba(168,85,247,.34); border-top: 3px solid #a855f7; background: linear-gradient(145deg,rgba(88,28,135,.2),transparent 55%),#211d22; }
+        .potion-card-body { display: grid; align-content: start; gap: 8px; min-width: 0; }
+        .potion-card .btn { align-self: end; width: 100%; }
+        .potion-bottle { position: relative; align-self: center; width: 44px; height: 58px; border: 3px solid #d8b4fe; border-radius: 5px 5px 14px 14px; background: linear-gradient(180deg,transparent 25%,#9333ea 27%); box-shadow: inset 0 0 12px rgba(255,255,255,.24),0 7px 12px rgba(0,0,0,.4); }
+        .potion-bottle::before { content:""; position:absolute; left:10px; top:-12px; width:18px; height:12px; border:3px solid #d8b4fe; border-bottom:0; background:#292524; }
+        .potion-bottle i { position:absolute; left:8px; top:26px; width:8px; height:14px; border-radius:50%; background:rgba(255,255,255,.5); transform:rotate(28deg); }
+        .potion-instantHeal .potion-bottle { background:linear-gradient(180deg,transparent 25%,#ef4444 27%); }
+        .potion-armor .potion-bottle { background:linear-gradient(180deg,transparent 25%,#64748b 27%); }
+        .potion-loot .potion-bottle,.potion-resource .potion-bottle { background:linear-gradient(180deg,transparent 25%,#eab308 27%); }
+        .potion-sprint .potion-bottle { background:linear-gradient(180deg,transparent 25%,#22c55e 27%); }
+        .potion-fireRate .potion-bottle,.potion-crit .potion-bottle { background:linear-gradient(180deg,transparent 25%,#f97316 27%); }
 
         .game-overlay {
             position: absolute;
@@ -1276,7 +1357,7 @@
 
         .ammo-pack-card {
             display: grid;
-            grid-template-rows: auto auto 1fr auto auto;
+            grid-template-rows: auto 1fr auto auto;
             gap: 7px;
             min-height: 192px;
             padding: 12px;
@@ -1289,6 +1370,11 @@
         .ammo-pack-card .btn { width: 100%; }
         .trader-window .ammo-pack-grid { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
         .trader-window .station-header { background: linear-gradient(90deg, rgba(88,28,135,.28), transparent 45%), #100f0e; }
+
+        @media (max-width: 920px) {
+            .potion-grid { grid-template-columns: 1fr; }
+            .potion-card { min-height: 118px; }
+        }
 
         .workbench-actions {
             display: flex;

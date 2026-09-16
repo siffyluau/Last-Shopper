@@ -28,7 +28,7 @@ const SERVER_PLACEMENT_LIMITS = {
   turrets: 12,
   walls: 60,
   traps: 24,
-  buildings: 7
+  buildings: 9
 };
 
 const enemyTypes = {
@@ -372,7 +372,7 @@ function startWave(room) {
   world.domainEvent = null;
   world.supplyDrop = null;
   world.trader = null;
-  world.techTier = Math.max(world.techTier, Math.min(3, 1 + Math.floor((world.wave - 1) / 10)));
+  world.techTier = Math.max(world.techTier, Math.min(4, 1 + Math.floor(world.wave / 10)));
 }
 
 function startBossPreparation(room, seconds = 35) {
@@ -401,7 +401,7 @@ function startBossPreparation(room, seconds = 35) {
     world.trader = null;
   } else {
     world.supplyDrop = null;
-    world.trader = { x: 760, y: 790, interactionRadius: 78 };
+    world.trader = { id: `trader-wave-${world.wave + 1}`, x: 760, y: 790, interactionRadius: 78 };
   }
 }
 
@@ -410,17 +410,9 @@ function spawnZombie(room) {
   const activePlayers = [...room.players.values()].filter((player) =>
     Number.isFinite(player.x) && Number.isFinite(player.y) && !player.downed && nowMs() - player.lastSeen < 5000);
   const anchor = activePlayers[Math.floor(Math.random() * activePlayers.length)] || { x: 1100, y: 720 };
-  let spawnX = anchor.x;
-  let spawnY = anchor.y;
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    const spawnAngle = Math.random() * Math.PI * 2;
-    const spawnDistance = 620 + Math.random() * 220;
-    spawnX = anchor.x + Math.cos(spawnAngle) * spawnDistance;
-    spawnY = anchor.y + Math.sin(spawnAngle) * spawnDistance;
-    const blocked = (world.mapStructures || []).some((structure) =>
-      rectBlocked(spawnX, spawnY, 34, structure));
-    if (!blocked) break;
-  }
+  const spawnPoint = findSafeZombieSpawn(world, anchor, 34);
+  const spawnX = spawnPoint.x;
+  const spawnY = spawnPoint.y;
   let typeKey;
   if (world.bossesToSpawn > 0) {
     const pool = bossPool(world.wave);
@@ -458,6 +450,64 @@ function spawnZombie(room) {
     lastHeal: 0,
     lastWeld: 0
   });
+}
+
+function zombieSpawnBlocked(world, x, y, radius) {
+  const fixedBlockers = [SHOP_RECT, WORKBENCH_RECT];
+  return fixedBlockers.some((blocker) => rectBlocked(x, y, radius + 20, blocker))
+    || (world.mapStructures || []).some((structure) => rectBlocked(x, y, radius + 18, structure))
+    || (world.buildings || []).some((building) => rectBlocked(x, y, radius + 16, building));
+}
+
+function findSafeZombieSpawn(world, anchor, radius) {
+  for (let attempt = 0; attempt < 36; attempt += 1) {
+    const angle = Math.random() * Math.PI * 2;
+    const range = 620 + Math.random() * 300;
+    const point = { x: anchor.x + Math.cos(angle) * range, y: anchor.y + Math.sin(angle) * range };
+    if (!zombieSpawnBlocked(world, point.x, point.y, radius)) return point;
+  }
+  for (const range of [700, 850, 1000, 1150]) {
+    for (let step = 0; step < 32; step += 1) {
+      const angle = (step / 32) * Math.PI * 2;
+      const point = { x: anchor.x + Math.cos(angle) * range, y: anchor.y + Math.sin(angle) * range };
+      if (!zombieSpawnBlocked(world, point.x, point.y, radius)) return point;
+    }
+  }
+  let fallback = { x: anchor.x + 1200, y: anchor.y };
+  for (let step = 0; step < 200 && zombieSpawnBlocked(world, fallback.x, fallback.y, radius); step += 1) {
+    fallback = { x: fallback.x + 120, y: anchor.y + ((step % 5) - 2) * 90 };
+  }
+  return fallback;
+}
+
+function getZombieDetour(world, zombie, target, now) {
+  if (zombie.detourUntil > now && Number.isFinite(zombie.detourX) && Number.isFinite(zombie.detourY)) {
+    if (distance(zombie.x, zombie.y, zombie.detourX, zombie.detourY) > 28) {
+      return { ...target, x: zombie.detourX, y: zombie.detourY, distance: distance(zombie.x, zombie.y, zombie.detourX, zombie.detourY) };
+    }
+  }
+  zombie.detourUntil = 0;
+  const obstacle = (world.mapStructures || []).find((structure) =>
+    !WorldMap.pointInside(structure, zombie.x, zombie.y, 2)
+    && WorldMap.segmentHitsStructure(structure, zombie.x, zombie.y, target.x, target.y, zombie.size + 10));
+  if (!obstacle) return target;
+  const padding = zombie.size + 34;
+  const halfW = obstacle.width / 2 + padding;
+  const halfH = obstacle.height / 2 + padding;
+  const corners = [
+    { x: obstacle.x - halfW, y: obstacle.y - halfH },
+    { x: obstacle.x + halfW, y: obstacle.y - halfH },
+    { x: obstacle.x - halfW, y: obstacle.y + halfH },
+    { x: obstacle.x + halfW, y: obstacle.y + halfH }
+  ].filter((point) => !(world.mapStructures || []).some((structure) => rectBlocked(point.x, point.y, zombie.size + 8, structure)));
+  if (!corners.length) return target;
+  corners.sort((a, b) =>
+    distance(zombie.x, zombie.y, a.x, a.y) + distance(a.x, a.y, target.x, target.y)
+    - distance(zombie.x, zombie.y, b.x, b.y) - distance(b.x, b.y, target.x, target.y));
+  zombie.detourX = corners[0].x;
+  zombie.detourY = corners[0].y;
+  zombie.detourUntil = now + 2600;
+  return { ...target, ...corners[0], distance: distance(zombie.x, zombie.y, corners[0].x, corners[0].y) };
 }
 
 function getTargets(room, zombie, includeStructures = true) {
@@ -860,7 +910,7 @@ function updateZombies(room, dt) {
     if (!didAction) {
       const moveTarget = breachPlan
         ? { ...target, x: breachPlan.entry.x, y: breachPlan.entry.y, distance: breachPlan.distance }
-        : target;
+        : getZombieDetour(world, z, target, now);
       if (damageShelterEntry(world, z, breachPlan, now)) didAction = true;
       if (z.isCharger && now - (z.lastCharge || 0) > z.chargeRate && targetDist < 330) {
         z.lastCharge = now;
@@ -905,6 +955,7 @@ function updateZombies(room, dt) {
           WorldMap.wallSegments(structure).some((wall) => rectBlocked(z.x, z.y, z.size, wall)));
         const hitBuildingWall = isWallBlocked();
         if (hitBuildingWall) {
+          z.wallBlockedTicks = (z.wallBlockedTicks || 0) + 1;
           z.x = previousX;
           z.y = previousY;
           const turn = z.wallTurn || (z.wallTurn = Math.random() < 0.5 ? -1 : 1);
@@ -915,8 +966,10 @@ function updateZombies(room, dt) {
             z.y = previousY;
             z.wallTurn *= -1;
           }
+          if (z.wallBlockedTicks >= 3) z.detourUntil = 0;
         } else {
           z.wallTurn = 0;
+          z.wallBlockedTicks = 0;
         }
       }
     }
@@ -1062,7 +1115,8 @@ function updateSentries(room) {
   const world = room.latestWorld;
   const now = nowMs();
   const powerRelayOnline = world.buildings.some((building) => building.id === 'powerRelay' && building.health > 0);
-  const canRefill = powerRelayOnline && now - (world.lastPowerRelayTick || 0) >= 3000;
+  const armoryOnline = world.buildings.some((building) => building.id === 'emergencyArmory' && building.health > 0);
+  const canRefill = (powerRelayOnline || armoryOnline) && now - (world.lastPowerRelayTick || 0) >= (armoryOnline ? 1800 : 3000);
   if (canRefill) world.lastPowerRelayTick = now;
   for (let i = world.sentries.length - 1; i >= 0; i--) {
     const sentry = world.sentries[i];
@@ -1073,7 +1127,7 @@ function updateSentries(room) {
     if (sentry.isDisabled > now) continue;
     let closest = null;
     let closestDist = (sentry.range || 260) * (powerRelayOnline ? 1.15 : 1);
-    if (canRefill && sentry.ammo < sentry.maxAmmo) sentry.ammo++;
+    if (canRefill && sentry.ammo < sentry.maxAmmo) sentry.ammo = Math.min(sentry.maxAmmo, sentry.ammo + (armoryOnline ? 6 : 1));
     for (const z of world.zombies) {
       const d = distance(sentry.x, sentry.y, z.x, z.y);
       if (d < closestDist) {
@@ -1090,6 +1144,7 @@ function updateSentries(room) {
     const pellets = sentry.pellets || 0;
     const fireOne = (spread) => pushBullet(world, sentry.x, sentry.y, sentry.angle + spread, sentry.speed || 8, sentry.damage || 20, {
       explosive: sentry.explosive,
+      pierce: sentry.pierce || 0,
       fromTurret: true,
       size: sentry.bulletSize || 4,
       ownerId: sentry.ownerId

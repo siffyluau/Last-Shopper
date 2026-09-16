@@ -325,14 +325,14 @@
     };
 
     const weaponTypes = [
-        { id: 'pistol', name: 'Pistol', cost: 0, damage: 35, fireRate: 300, maxAmmo: 12, owned: true, speed: 8, bulletSize: 4, reloadTime: 1500 },
-        { id: 'shotgun', name: 'Shotgun', cost: 170, requiredWave: 2, damage: 12.5, fireRate: 600, maxAmmo: 8, owned: false, speed: 6, pellets: 16, bulletSize: 3, reloadTime: 2500 },
-        { id: 'smg', name: 'Checkout SMG', cost: 480, requiredWave: 4, damage: 17, fireRate: 78, maxAmmo: 45, owned: false, speed: 10, bulletSize: 3, reloadTime: 2100 },
-        { id: 'rifle', name: 'Assault Rifle', cost: 950, requiredWave: 6, damage: 29, fireRate: 115, maxAmmo: 32, owned: false, speed: 11, bulletSize: 3, reloadTime: 2050 },
-        { id: 'marksman', name: 'Marksman Rifle', cost: 1700, requiredWave: 9, damage: 118, fireRate: 560, maxAmmo: 8, owned: false, speed: 16, bulletSize: 5, pierce: 1, reloadTime: 2700 },
-        { id: 'minigun', name: 'Mini Gun', cost: 3300, requiredWave: 12, damage: 32, fireRate: 30, maxAmmo: 120, owned: false, speed: 12, bulletSize: 2, reloadTime: 4200 },
-        { id: 'grenadeLauncher', name: 'Grenade Launcher', cost: 5600, requiredWave: 15, damage: 300, fireRate: 1250, maxAmmo: 5, owned: false, speed: 6, explosive: true, bulletSize: 7, reloadTime: 3100, ammoCost: 85 },
-        { id: 'rpg', name: 'RPG', cost: 9000, requiredWave: 20, damage: 760, fireRate: 2100, maxAmmo: 3, owned: false, speed: 5, explosive: true, bulletSize: 8, reloadTime: 3500, ammoCost: 250 }
+        { id: 'pistol', name: 'Pistol', cost: 0, damage: 35, fireRate: 300, maxAmmo: 12, owned: true, speed: 8, bulletSize: 4, reloadTime: 1500, viewZoom: 1 },
+        { id: 'shotgun', name: 'Shotgun', cost: 170, requiredWave: 2, damage: 12.5, fireRate: 600, maxAmmo: 8, owned: false, speed: 6, pellets: 16, bulletSize: 3, reloadTime: 2500, viewZoom: 1.1 },
+        { id: 'smg', name: 'Checkout SMG', cost: 480, requiredWave: 4, damage: 17, fireRate: 78, maxAmmo: 45, owned: false, speed: 10, bulletSize: 3, reloadTime: 2100, viewZoom: 1.04 },
+        { id: 'rifle', name: 'Assault Rifle', cost: 950, requiredWave: 6, damage: 29, fireRate: 115, maxAmmo: 32, owned: false, speed: 11, bulletSize: 3, reloadTime: 2050, viewZoom: 0.96 },
+        { id: 'marksman', name: 'Marksman Rifle', cost: 1700, requiredWave: 9, damage: 118, fireRate: 560, maxAmmo: 8, owned: false, speed: 16, bulletSize: 5, pierce: 1, reloadTime: 2700, viewZoom: 0.84 },
+        { id: 'minigun', name: 'Mini Gun', cost: 3300, requiredWave: 12, damage: 32, fireRate: 30, maxAmmo: 120, owned: false, speed: 12, bulletSize: 2, reloadTime: 4200, viewZoom: 1.06 },
+        { id: 'grenadeLauncher', name: 'Grenade Launcher', cost: 5600, requiredWave: 15, damage: 300, fireRate: 1250, maxAmmo: 5, owned: false, speed: 6, explosive: true, bulletSize: 7, reloadTime: 3100, ammoCost: 85, viewZoom: 0.91 },
+        { id: 'rpg', name: 'RPG', cost: 9000, requiredWave: 20, damage: 760, fireRate: 2100, maxAmmo: 3, owned: false, speed: 5, explosive: true, bulletSize: 8, reloadTime: 3500, ammoCost: 250, viewZoom: 0.88 }
     ];
 
     const turretTypes = [
@@ -405,6 +405,12 @@
             maxAmmo: 220,
             radius: 18,
             isDisabled: 0
+        },
+        {
+            name: 'Rail Sentry', techLevel: 4, cost: { wood: 30, metal: 62, parts: 4 },
+            damage: 430, fireRate: 720, range: 620, speed: 20, pierce: 3,
+            color: [255, 214, 90], bulletSize: 6, health: 680, maxHealth: 680,
+            ammo: 54, maxAmmo: 54, radius: 20, isDisabled: 0
         }
     ];
 
@@ -460,6 +466,11 @@
             health: 1680,
             color: [185, 195, 205],
             armor: 0.15
+        },
+        {
+            name: 'Composite Shock Wall', techLevel: 4,
+            cost: { wood: 16, metal: 68, parts: 3 }, upgradeCost: { wood: 14, metal: 52, parts: 2 },
+            health: 2650, color: [235, 190, 70], armor: 0.24, isElectric: true, shockDamage: 65
         }
     ];
 
@@ -490,13 +501,18 @@
             color: [40, 210, 255],
             radius: 34,
             oneTimeUse: true
+        },
+        {
+            name: 'Cryo Charge', techLevel: 4, cost: { wood: 14, metal: 30, parts: 2 },
+            damage: 2100, color: [120, 225, 255], radius: 48, oneTimeUse: true
         }
     ];
 
     const workbenchLevels = [
         { level: 1, name: 'Field Bench', cost: null },
         { level: 2, name: 'Machine Bench', cost: { money: 900, wood: 24, metal: 18 } },
-        { level: 3, name: 'Powered Bench', cost: { money: 2600, wood: 40, metal: 48 } }
+        { level: 3, name: 'Powered Bench', cost: { money: 2600, wood: 40, metal: 48 } },
+        { level: 4, name: 'Blackout Fabricator', cost: { money: 8500, wood: 75, metal: 110, parts: 6 } }
     ];
 
     const buildingTypes = [
@@ -569,6 +585,12 @@
             width: 108,
             height: 76,
             color: [45, 212, 191]
+        },
+        {
+            id: 'emergencyArmory', name: 'Emergency Armory', techLevel: 4,
+            cost: { money: 10500, wood: 60, metal: 95, parts: 7 },
+            description: 'Tier IV station that rapidly resupplies every active turret while it remains standing.',
+            width: 120, height: 82, color: [234, 179, 8]
         }
     ];
 
@@ -616,63 +638,63 @@
         {
             id: 'shopper',
             name: 'The Shopper',
-            description: 'Default survivor jacket.',
+            description: 'Balanced store survivor. Starts with +5 wood and +5 metal.', perk: { type: 'starterPack', label: '+5 wood / +5 metal' }, style: 'jacket',
             unlock: { type: 'free', label: 'Unlocked' },
             colors: { body: '#f97316', shirt: '#1f2937', accent: '#fbbf24' }
         },
         {
             id: 'stocker',
             name: 'Night Stocker',
-            description: 'Earned after 25 zombie kills.',
+            description: 'Emergency reload every 40 seconds when a magazine runs dry.', perk: { type: 'emergencyReload', label: '40s emergency reload' }, style: 'hoodie',
             unlock: { type: 'kills', value: 25, label: '25 kills' },
             colors: { body: '#64748b', shirt: '#111827', accent: '#38bdf8' }
         },
         {
             id: 'cashier',
             name: 'Last Cashier',
-            description: 'Earned by reaching wave 5.',
+            description: 'Starts each run with $40 register cash.', perk: { type: 'cash', label: '+$40 start' }, style: 'apron',
             unlock: { type: 'wave', value: 5, label: 'Reach wave 5' },
             colors: { body: '#dc2626', shirt: '#292524', accent: '#fef3c7' }
         },
         {
             id: 'mechanic',
             name: 'Bench Mechanic',
-            description: 'Earned by building 3 defenses.',
+            description: 'Repairs cost 5% less.', perk: { type: 'repairDiscount', label: '-5% repair cost' }, style: 'overalls',
             unlock: { type: 'builds', value: 3, label: 'Build 3 defenses' },
             colors: { body: '#ca8a04', shirt: '#44403c', accent: '#f97316' }
         },
         {
             id: 'manager',
             name: 'Ex-Manager',
-            description: 'Earned by surviving a boss wave.',
+            description: 'Earn 3% more cash and salvage.', perk: { type: 'cashMultiplier', label: '+3% resources' }, style: 'tie',
             unlock: { type: 'bosses', value: 1, label: 'Defeat 1 boss' },
             colors: { body: '#7c2d12', shirt: '#0f172a', accent: '#fb923c' }
         },
         {
             id: 'runner',
             name: 'Supply Runner',
-            description: 'Earned by clearing early store routes.',
+            description: 'Moves 3% faster.', perk: { type: 'moveSpeed', label: '+3% move speed' }, style: 'runner',
             unlock: { type: 'wave', value: 10, label: 'Reach wave 10' },
             colors: { body: '#16a34a', shirt: '#1c1917', accent: '#facc15' }
         },
         {
             id: 'hazmat',
             name: 'Hazmat Shopper',
-            description: 'Earned after serious cleanup work.',
+            description: 'Takes 4% less incoming damage.', perk: { type: 'acidGuard', label: '-4% damage taken' }, style: 'hazmat',
             unlock: { type: 'kills', value: 250, label: '250 kills' },
             colors: { body: '#eab308', shirt: '#111827', accent: '#84cc16' }
         },
         {
             id: 'titanium',
             name: 'Titanium Tech',
-            description: 'Earned by committing to base building.',
+            description: 'Placed walls start with 3% more health.', perk: { type: 'wallHealth', label: '+3% wall health' }, style: 'armor',
             unlock: { type: 'builds', value: 20, label: 'Build 20 defenses' },
             colors: { body: '#94a3b8', shirt: '#0f172a', accent: '#38bdf8' }
         },
         {
             id: 'bossHunter',
             name: 'Boss Hunter',
-            description: 'Earned by beating multiple managers.',
+            description: 'Deals 3% more weapon damage.', perk: { type: 'bossDamage', label: '+3% weapon damage' }, style: 'hunter',
             unlock: { type: 'bosses', value: 5, label: 'Defeat 5 bosses' },
             colors: { body: '#991b1b', shirt: '#1c1917', accent: '#fef3c7' }
         }

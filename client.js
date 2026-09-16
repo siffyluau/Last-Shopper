@@ -219,7 +219,9 @@
                 shake: 0, 
                 shakeIntensity: 0,
                 targetX: 0,
-                targetY: 0
+                targetY: 0,
+                zoom: 1,
+                zoomPulseUntil: 0
             },
             
             // Weapons
@@ -626,8 +628,10 @@
                     w.upgradeLevel = 0;
                 });
                 this.selectedWeapon = 0;
+                this.skinPerkApplied = false;
+                this.applySkinRunPerk?.();
                 
-                this.camera = { x: 0, y: 0, shake: 0, shakeIntensity: 0, targetX: 0, targetY: 0 };
+                this.camera = { x: 0, y: 0, shake: 0, shakeIntensity: 0, targetX: 0, targetY: 0, zoom: 1, zoomPulseUntil: 0 };
                 
                 this.upgrades = { autoLoot: false, autoRefill: false, turretSpeed: false };
                 this.activePotions = { loot: 0, fireRate: 0, health: 0, sprint: 0, lifesteal: 0, armor: 0, crit: 0, resource: 0, infiniteAmmo: 0 };
@@ -833,6 +837,12 @@
                         z.chargeUntil = now + z.chargeDuration;
                     }
                     const moveSpeed = z.isCharger && now < (z.chargeUntil || 0) ? z.chargeSpeed : z.speed;
+                    const navigationTarget = !breachPlan && this.getZombieNavigationTarget
+                        ? this.getZombieNavigationTarget(z, nearestTarget, now)
+                        : nearestTarget;
+                    const navigationDist = navigationTarget
+                        ? Math.max(1, this.dist(z.x, z.y, navigationTarget.x, navigationTarget.y))
+                        : 1;
 
                     // --- RANGED ATTACK AI ---
                     if (!breachPlan && (z.type === 'spitter' || z.type === 'boss' || z.type === 'miniBoss' || z.isAcidRanger || z.isBoss || z.isMiniBoss) && targetDist < z.shootRange) {
@@ -885,10 +895,10 @@
                                     z.health = 0; // Kills itself
                                 } else {
                                     // Move towards target
-                                    const dx = nearestTarget.x - z.x;
-                                    const dy = nearestTarget.y - z.y;
-                                    z.x += (dx / targetDist) * moveSpeed;
-                                    z.y += (dy / targetDist) * moveSpeed;
+                                    const dx = navigationTarget.x - z.x;
+                                    const dy = navigationTarget.y - z.y;
+                                    z.x += (dx / navigationDist) * moveSpeed;
+                                    z.y += (dy / navigationDist) * moveSpeed;
                                 }
                             }
                         }
@@ -911,10 +921,10 @@
                                 }
                             } else {
                                 if (targetDist > 0) { 
-                                    const dx = nearestTarget.x - z.x;
-                                    const dy = nearestTarget.y - z.y;
-                                    z.x += (dx / targetDist) * moveSpeed;
-                                    z.y += (dy / targetDist) * moveSpeed;
+                                    const dx = navigationTarget.x - z.x;
+                                    const dy = navigationTarget.y - z.y;
+                                    z.x += (dx / navigationDist) * moveSpeed;
+                                    z.y += (dy / navigationDist) * moveSpeed;
                                 }
                             }
                         }
@@ -1114,7 +1124,8 @@
             updateSentries: function() {
                 const now = performance.now();
                 const powerRelayOnline = this.buildings.some((building) => building.id === 'powerRelay' && building.health > 0);
-                const canRefill = powerRelayOnline && now - (this.lastPowerRelayTick || 0) >= 3000;
+                const armoryOnline = this.buildings.some((building) => building.id === 'emergencyArmory' && building.health > 0);
+                const canRefill = (powerRelayOnline || armoryOnline) && now - (this.lastPowerRelayTick || 0) >= (armoryOnline ? 1800 : 3000);
                 if (canRefill) this.lastPowerRelayTick = now;
                 for (let i = this.sentries.length - 1; i >= 0; i--) {
                     const s = this.sentries[i];
@@ -1130,7 +1141,7 @@
 
                     let closestZombie = null;
                     let closestDist = s.range * (powerRelayOnline ? 1.15 : 1);
-                    if (canRefill && s.ammo < s.maxAmmo) s.ammo++;
+                    if (canRefill && s.ammo < s.maxAmmo) s.ammo = Math.min(s.maxAmmo, s.ammo + (armoryOnline ? 6 : 1));
                     
                     for (const z of this.zombies) {
                         const d = this.dist(s.x, s.y, z.x, z.y);
@@ -1165,6 +1176,7 @@
                                         vx: Math.cos(s.angle + spread) * s.speed,
                                         vy: Math.sin(s.angle + spread) * s.speed,
                                         damage: s.damage, explosive: s.explosive,
+                                        pierce: s.pierce || 0,
                                         size: s.bulletSize,
                                         ownerId: s.ownerId || this.localPlayerId,
                                         fromTurret: true
@@ -1176,6 +1188,7 @@
                                     vx: Math.cos(s.angle) * s.speed,
                                     vy: Math.sin(s.angle) * s.speed,
                                     damage: s.damage, explosive: s.explosive,
+                                    pierce: s.pierce || 0,
                                     size: s.bulletSize,
                                     ownerId: s.ownerId || this.localPlayerId,
                                     fromTurret: true
@@ -1289,8 +1302,12 @@
             },
             
             updateCamera: function() {
-                this.camera.targetX = this.player.x - canvas.width / 2;
-                this.camera.targetY = this.player.y - canvas.height / 2;
+                const weapon = this.weapons[this.selectedWeapon];
+                const pulseZoom = performance.now() < (this.camera.zoomPulseUntil || 0) ? 0.82 : 1;
+                const targetZoom = (weapon?.viewZoom || 1) * pulseZoom;
+                this.camera.zoom += (targetZoom - (this.camera.zoom || 1)) * 0.075;
+                this.camera.targetX = this.player.x - canvas.width / (2 * this.camera.zoom);
+                this.camera.targetY = this.player.y - canvas.height / (2 * this.camera.zoom);
                 
                 this.camera.x += (this.camera.targetX - this.camera.x) * 0.1;
                 this.camera.y += (this.camera.targetY - this.camera.y) * 0.1;
@@ -1333,7 +1350,7 @@
                 hud.skillPoints.textContent = this.player.skillPoints;
                 hud.xpText.textContent = `${this.player.xp} / ${this.player.xpToNext}`;
                 hud.xpBar.style.width = `${Math.min(100, (this.player.xp / this.player.xpToNext) * 100)}%`;
-                hud.techTier.textContent = `TECH ${['I', 'II', 'III'][this.techTier - 1]}`;
+                hud.techTier.textContent = `TECH ${['I', 'II', 'III', 'IV'][this.techTier - 1]}`;
                 
                 // Weapon
                 const weapon = this.weapons[this.selectedWeapon];
@@ -1429,6 +1446,7 @@
             
             draw: function() {
                 ctx.save();
+                ctx.scale(this.camera.zoom || 1, this.camera.zoom || 1);
                 ctx.translate(-this.camera.x + this.camera.shake, -this.camera.y + this.camera.shake);
                 
                 this.drawMap();
@@ -1463,15 +1481,16 @@
 
             drawMap: function() {
                 ctx.fillStyle = '#1A1A1A';
-                ctx.fillRect(this.camera.x - 120, this.camera.y - 120, canvas.width + 240, canvas.height + 240);
+                const viewZoom = this.camera.zoom || 1;
+                ctx.fillRect(this.camera.x - 120, this.camera.y - 120, canvas.width / viewZoom + 240, canvas.height / viewZoom + 240);
                 
                 ctx.strokeStyle = '#2A2A2A';
                 ctx.lineWidth = 1;
                 ctx.beginPath();
                 const left = Math.floor((this.camera.x - 120) / 100) * 100;
                 const top = Math.floor((this.camera.y - 120) / 100) * 100;
-                const right = this.camera.x + canvas.width + 120;
-                const bottom = this.camera.y + canvas.height + 120;
+                const right = this.camera.x + canvas.width / viewZoom + 120;
+                const bottom = this.camera.y + canvas.height / viewZoom + 120;
                 for (let x = left; x <= right; x += 100) {
                     ctx.moveTo(x, top);
                     ctx.lineTo(x, bottom);
@@ -1849,6 +1868,7 @@
                 if (!weapon.owned || weapon.isReloading) return;
                 
                 if (weapon.currentAmmo <= 0) {
+                    if (this.tryEmergencyReload?.(weapon)) return;
                     this.reloadWeapon();
                     return;
                 }

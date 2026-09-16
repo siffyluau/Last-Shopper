@@ -51,7 +51,21 @@
     }
 
     function roman(level) {
-        return ['I', 'II', 'III'][level - 1] || level;
+        return ['I', 'II', 'III', 'IV'][level - 1] || level;
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, (character) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        })[character]);
+    }
+
+    function infoTip(description, label = 'Item details') {
+        const text = escapeHtml(description);
+        return `<span class="info-tip" tabindex="0" aria-label="${escapeHtml(label)}: ${text}">
+            <span class="info-tip-icon" aria-hidden="true">i</span>
+            <span class="info-tip-bubble" role="tooltip">${text}</span>
+        </span>`;
     }
 
     Object.assign(game, {
@@ -124,6 +138,7 @@
 
         enterGameFromLobby: function () {
             this.applyLobbySelections();
+            this.applySkinRunPerk?.();
             this.roomStarted = true;
             lobbyScreen.classList.add('hidden');
             gameContainer.classList.remove('hidden');
@@ -154,8 +169,9 @@
         },
 
         updateMouseWorld: function () {
-            this.mouse.worldX = this.mouse.x + this.camera.x;
-            this.mouse.worldY = this.mouse.y + this.camera.y;
+            const zoom = this.camera.zoom || 1;
+            this.mouse.worldX = this.mouse.x / zoom + this.camera.x;
+            this.mouse.worldY = this.mouse.y / zoom + this.camera.y;
         },
 
         getSurvivorRank: function () {
@@ -167,6 +183,42 @@
 
         getSkin: function (id) {
             return content.skins.find((skin) => skin.id === id) || content.skins[0];
+        },
+
+        applySkinRunPerk: function () {
+            if (this.skinPerkApplied) return;
+            this.skinPerkApplied = true;
+            const skin = this.getSkin(this.player.skinId || this.selectedSkinId);
+            this.skinPerk = skin.perk || null;
+            this.nextEmergencyReloadAt = 0;
+            if (this.skinPerk?.type === 'starterPack') {
+                this.player.wood += 5;
+                this.player.metal += 5;
+            } else if (this.skinPerk?.type === 'cash') {
+                this.player.money += 40;
+            } else if (this.skinPerk?.type === 'moveSpeed') {
+                this.player.speed *= 1.03;
+            }
+        },
+
+        tryEmergencyReload: function (weapon) {
+            const now = performance.now();
+            if (this.skinPerk?.type !== 'emergencyReload' || now < (this.nextEmergencyReloadAt || 0)) return false;
+            weapon.currentAmmo = weapon.maxAmmo;
+            this.player.reserveAmmo += 50;
+            weapon.isReloading = false;
+            this.nextEmergencyReloadAt = now + 40000;
+            this.camera.zoomPulseUntil = now + 850;
+            for (let i = 0; i < 22; i++) {
+                this.particles.push({
+                    x: this.player.x, y: this.player.y,
+                    vx: (Math.random() - 0.5) * 5, vy: (Math.random() - 0.5) * 5,
+                    life: 35, maxLife: 35, color: [56, 189, 248], size: 3
+                });
+            }
+            this.showWaveStatus('EMERGENCY RELOAD / +50 RESERVE', 1800);
+            this.updateHUD();
+            return true;
         },
 
         isSkinUnlocked: function (skin) {
@@ -199,9 +251,11 @@
                 card.className = `skin-card ${skin.id === this.selectedSkinId ? 'selected' : ''} ${unlocked ? '' : 'locked'}`;
                 card.disabled = !unlocked;
                 card.innerHTML = `
-                    <div class="skin-swatch" style="background:linear-gradient(90deg, ${skin.colors.body} 0 50%, ${skin.colors.shirt} 50% 100%); border-color:${skin.colors.accent}"></div>
+                    <div class="skin-paper-doll style-${skin.style || 'jacket'}" style="--skin-body:${skin.colors.body};--skin-shirt:${skin.colors.shirt};--skin-accent:${skin.colors.accent}">
+                        <i class="skin-head"></i><i class="skin-torso"></i><i class="skin-arm left"></i><i class="skin-arm right"></i><i class="skin-legs"></i>
+                    </div>
                     <h3>${skin.name}</h3>
-                    <p>${unlocked ? skin.description : skin.unlock.label}</p>
+                    <p>${unlocked ? skin.perk?.label || skin.description : skin.unlock.label}</p>
                 `;
                 card.onclick = () => this.selectSkin(skin.id);
                 skinList.appendChild(card);
@@ -210,7 +264,10 @@
 
         updateSkinPreview: function () {
             const skin = this.getSkin(this.selectedSkinId);
-            skinPreview.style.background = `linear-gradient(180deg, ${skin.colors.body}, ${skin.colors.shirt})`;
+            skinPreview.className = `skin-preview preview-${skin.style || 'jacket'}`;
+            skinPreview.style.setProperty('--skin-body', skin.colors.body);
+            skinPreview.style.setProperty('--skin-shirt', skin.colors.shirt);
+            skinPreview.style.setProperty('--skin-accent', skin.colors.accent);
             skinPreview.style.borderColor = skin.colors.accent;
             skinPreviewInitial.textContent = (playerNameInput.value.trim() || 'P1').slice(0, 2).toUpperCase();
             selectedSkinName.textContent = skin.name;
@@ -412,6 +469,7 @@
             const wasDowned = Boolean(this.player.downed);
             this.serverTime = world.serverTime || this.serverTime;
             this.dayTime = Number.isFinite(world.dayTime) ? world.dayTime : this.dayTime;
+            if (!Number.isFinite(this.visualDayTime)) this.visualDayTime = this.dayTime;
             this.dayNumber = world.dayNumber || this.dayNumber;
             if (world.gameStarted && !this.gameStarted) {
                 this.setMultiplayerStatus(world.wave > 0 ? 'Joining active game...' : 'Host starting game...', 'online');
@@ -601,19 +659,28 @@
         },
 
         drawDayNight: function () {
-            const time = Number.isFinite(this.dayTime) ? this.dayTime : 0.34;
-            const daylight = Math.max(0, Math.sin((time - 0.25) * Math.PI * 2));
-            const darkness = Math.min(0.68, (1 - daylight) * 0.68);
+            const targetTime = Number.isFinite(this.dayTime) ? this.dayTime : 0.34;
+            if (!Number.isFinite(this.visualDayTime)) this.visualDayTime = targetTime;
+            const clockDelta = ((targetTime - this.visualDayTime + 1.5) % 1) - 0.5;
+            this.visualDayTime = (this.visualDayTime + clockDelta * 0.045 + 1) % 1;
+            const time = this.visualDayTime;
+            const rawSun = Math.max(0, Math.min(1, (Math.sin((time - 0.25) * Math.PI * 2) + 0.12) / 1.12));
+            const daylight = rawSun * rawSun * (3 - 2 * rawSun);
+            const darkness = (1 - daylight) * 0.68;
             if (darkness > 0.03) {
-                const dusk = Math.abs(time - 0.25) < 0.08 || Math.abs(time - 0.75) < 0.08;
+                const cycleDistance = (a, b) => Math.abs(((a - b + 1.5) % 1) - 0.5);
+                const twilight = Math.max(0, 1 - Math.min(cycleDistance(time, 0.25), cycleDistance(time, 0.75)) / 0.11);
+                const red = Math.round(4 + 55 * twilight);
+                const green = Math.round(10 + 18 * twilight);
+                const blue = Math.round(24 + 8 * twilight);
                 ctx.save();
-                ctx.fillStyle = dusk
-                    ? `rgba(48,24,30,${darkness * 0.72})`
-                    : `rgba(4,10,24,${darkness})`;
+                ctx.fillStyle = `rgba(${red},${green},${blue},${darkness * (1 - twilight * 0.14)})`;
                 ctx.fillRect(0, 0, canvas.width, canvas.height);
                 const addLight = (x, y, radius, color) => {
-                    const screenX = x - this.camera.x;
-                    const screenY = y - this.camera.y;
+                    const zoom = this.camera.zoom || 1;
+                    const screenX = (x - this.camera.x) * zoom;
+                    const screenY = (y - this.camera.y) * zoom;
+                    radius *= zoom;
                     const glow = ctx.createRadialGradient(screenX, screenY, 0, screenX, screenY, radius);
                     glow.addColorStop(0, color);
                     glow.addColorStop(0.35, color.replace(/[^,]+\)$/, '0.12)'));
@@ -1044,11 +1111,29 @@
             ctx.arc(0, -5, 9, 0, Math.PI * 2);
             ctx.fill();
 
+            ctx.strokeStyle = skin.colors.accent;
+            ctx.lineWidth = skin.style === 'armor' ? 4 : 2;
+            ctx.beginPath();
+            ctx.moveTo(-6, 8);
+            ctx.lineTo(-7, 18);
+            ctx.moveTo(6, 8);
+            ctx.lineTo(7, 18);
+            ctx.stroke();
+
             ctx.rotate(angle);
             ctx.fillStyle = skin.colors.shirt;
-            ctx.fillRect(-10, -12, 20, 24);
+            if (skin.style === 'armor') ctx.fillRect(-13, -12, 26, 24);
+            else ctx.fillRect(-10, -12, 20, 24);
             ctx.fillStyle = skin.colors.accent;
-            ctx.fillRect(-2, -12, 4, 24);
+            if (skin.style === 'tie') ctx.fillRect(-2, -10, 4, 18);
+            else if (skin.style === 'overalls') {
+                ctx.fillRect(-8, -12, 4, 24);
+                ctx.fillRect(4, -12, 4, 24);
+            } else if (skin.style === 'hazmat') {
+                ctx.strokeStyle = skin.colors.accent;
+                ctx.lineWidth = 3;
+                ctx.strokeRect(-8, -11, 16, 12);
+            } else ctx.fillRect(-2, -12, 4, 24);
             ctx.fillStyle = '#d6d3d1';
             ctx.fillRect(10, -3, 15, 6);
             ctx.restore();
@@ -1085,10 +1170,11 @@
         },
 
         isOnScreen: function (x, y, padding = 120) {
+            const zoom = this.camera.zoom || 1;
             return x >= this.camera.x - padding
-                && x <= this.camera.x + canvas.width + padding
+                && x <= this.camera.x + canvas.width / zoom + padding
                 && y >= this.camera.y - padding
-                && y <= this.camera.y + canvas.height + padding;
+                && y <= this.camera.y + canvas.height / zoom + padding;
         },
 
         resolvePlayerEnvironmentCollision: function (previousX, previousY) {
@@ -2196,13 +2282,15 @@
             return 1
                 + this.player.skillLevels.resourceMultiplier * 0.1
                 + (this.runUpgradeCounts.salvage || 0) * 0.15
-                + (this.activePotions.resource > performance.now() ? 0.75 : 0);
+                + (this.activePotions.resource > performance.now() ? 0.75 : 0)
+                + (this.skinPerk?.type === 'cashMultiplier' ? 0.03 : 0);
         },
 
         getPlayerDamageMultiplier: function () {
             return 1
                 + this.player.skillLevels.bulletDamage * 0.1
-                + (this.runUpgradeCounts.caliber || 0) * 0.12;
+                + (this.runUpgradeCounts.caliber || 0) * 0.12
+                + (this.skinPerk?.type === 'bossDamage' ? 0.03 : 0);
         },
 
         getPlayerBulletDamage: function (baseDamage) {
@@ -2214,7 +2302,8 @@
         },
 
         applyPlayerDamage: function (amount) {
-            const reduction = this.activePotions.armor > performance.now() ? 0.35 : 0;
+            const reduction = (this.activePotions.armor > performance.now() ? 0.35 : 0)
+                + (this.skinPerk?.type === 'acidGuard' ? 0.04 : 0);
             this.player.health -= amount * (1 - reduction);
         },
 
@@ -2527,12 +2616,67 @@
             return true;
         },
 
+        isZombieSpawnBlocked: function (x, y, radius = 34) {
+            const blockers = [this.shop, this.workbench, ...(this.buildings || [])];
+            return blockers.some((blocker) => this.rectBlocked(x, y, radius + 18, blocker))
+                || (this.mapStructures || []).some((structure) => this.rectBlocked(x, y, radius + 18, structure));
+        },
+
+        findSafeZombieSpawn: function (anchor, radius = 34) {
+            for (let attempt = 0; attempt < 36; attempt++) {
+                const angle = Math.random() * Math.PI * 2;
+                const range = 620 + Math.random() * 300;
+                const point = { x: anchor.x + Math.cos(angle) * range, y: anchor.y + Math.sin(angle) * range };
+                if (!this.isZombieSpawnBlocked(point.x, point.y, radius)) return point;
+            }
+            for (const range of [700, 850, 1000, 1150]) {
+                for (let step = 0; step < 32; step++) {
+                    const angle = (step / 32) * Math.PI * 2;
+                    const point = { x: anchor.x + Math.cos(angle) * range, y: anchor.y + Math.sin(angle) * range };
+                    if (!this.isZombieSpawnBlocked(point.x, point.y, radius)) return point;
+                }
+            }
+            let fallback = { x: anchor.x + 1200, y: anchor.y };
+            for (let step = 0; step < 200 && this.isZombieSpawnBlocked(fallback.x, fallback.y, radius); step++) {
+                fallback = { x: fallback.x + 120, y: anchor.y + ((step % 5) - 2) * 90 };
+            }
+            return fallback;
+        },
+
+        getZombieNavigationTarget: function (zombie, target, now) {
+            const worldMap = window.LastShopperWorld;
+            if (!worldMap || !target) return target;
+            if (zombie.detourUntil > now && this.dist(zombie.x, zombie.y, zombie.detourX, zombie.detourY) > 28) {
+                return { ...target, x: zombie.detourX, y: zombie.detourY, distance: this.dist(zombie.x, zombie.y, zombie.detourX, zombie.detourY) };
+            }
+            zombie.detourUntil = 0;
+            const obstacle = (this.mapStructures || []).find((structure) =>
+                !worldMap.pointInside(structure, zombie.x, zombie.y, 2)
+                && worldMap.segmentHitsStructure(structure, zombie.x, zombie.y, target.x, target.y, zombie.size + 10));
+            if (!obstacle) return target;
+            const padding = zombie.size + 34;
+            const corners = [
+                { x: obstacle.x - obstacle.width / 2 - padding, y: obstacle.y - obstacle.height / 2 - padding },
+                { x: obstacle.x + obstacle.width / 2 + padding, y: obstacle.y - obstacle.height / 2 - padding },
+                { x: obstacle.x - obstacle.width / 2 - padding, y: obstacle.y + obstacle.height / 2 + padding },
+                { x: obstacle.x + obstacle.width / 2 + padding, y: obstacle.y + obstacle.height / 2 + padding }
+            ].filter((point) => !(this.mapStructures || []).some((structure) => this.rectBlocked(point.x, point.y, zombie.size + 8, structure)));
+            corners.sort((a, b) => this.dist(zombie.x, zombie.y, a.x, a.y) + this.dist(a.x, a.y, target.x, target.y)
+                - this.dist(zombie.x, zombie.y, b.x, b.y) - this.dist(b.x, b.y, target.x, target.y));
+            if (!corners.length) return target;
+            zombie.detourX = corners[0].x;
+            zombie.detourY = corners[0].y;
+            zombie.detourUntil = now + 2600;
+            return { ...target, ...corners[0], distance: this.dist(zombie.x, zombie.y, corners[0].x, corners[0].y) };
+        },
+
         resolveZombieStructureCollision: function (zombie, previousX, previousY) {
             if (window.LastShopperWorld) {
                 const blocked = (this.mapStructures || []).some((structure) =>
                     window.LastShopperWorld.wallSegments(structure).some((wall) =>
                         this.rectBlocked(zombie.x, zombie.y, zombie.size, wall)));
                 if (blocked) {
+                    zombie.wallBlockedTicks = (zombie.wallBlockedTicks || 0) + 1;
                     const moveX = zombie.x - previousX;
                     const moveY = zombie.y - previousY;
                     zombie.x = previousX;
@@ -2548,9 +2692,11 @@
                         zombie.y = previousY;
                         zombie.wallTurn *= -1;
                     }
+                    if (zombie.wallBlockedTicks >= 3) zombie.detourUntil = 0;
                     return;
                 }
                 zombie.wallTurn = 0;
+                zombie.wallBlockedTicks = 0;
             }
             const blockers = [
                 ...this.walls.filter((wall) => !wall.isWorkbench),
@@ -2815,7 +2961,7 @@
                 prepEventDetail.textContent = 'A relief crate landed in the parking lot. Reach it and press [E].';
             } else {
                 this.supplyDrop = null;
-                this.trader = { x: 760, y: 790, interactionRadius: 78 };
+                this.trader = { id: `trader-wave-${this.wave + 1}`, x: 760, y: 790, interactionRadius: 78 };
                 prepEventLabel.textContent = 'TRAVELING TRADER';
                 prepEventDetail.textContent = 'Discount stock is parked beside the shop. Press [E] to trade.';
             }
@@ -2938,6 +3084,13 @@
             return cost;
         },
 
+        ensureTraderStock: function () {
+            const eventId = this.trader?.id || `trader-wave-${this.wave + 1}`;
+            if (this.traderStockEventId === eventId && this.traderStock) return;
+            this.traderStockEventId = eventId;
+            this.traderStock = { wood: 3, metal: 3, ammo: 3, repairs: 2, parts: 1, small: 2, medium: 2, large: 1, full: 1 };
+        },
+
         getAmmoStoreHtml: function (source = 'shop', discount = 1, packIds = null) {
             const packs = content.ammoPacks.filter((pack) => !packIds || packIds.includes(pack.id));
             const sourceLabel = source === 'trader' ? 'DISCOUNT AMMO' : source === 'workbench' ? 'BENCH AMMO' : 'SHOP AMMO';
@@ -2953,14 +3106,15 @@
                     <div class="ammo-pack-grid">
                         ${packs.map((pack) => {
                             const cost = this.getAmmoPackCost(pack, discount);
-                            const canAfford = hasCost(this.player, cost);
+                            if (source === 'trader') this.ensureTraderStock();
+                            const remaining = source === 'trader' ? (this.traderStock?.[pack.id] || 0) : Infinity;
+                            const canAfford = remaining > 0 && hasCost(this.player, cost);
                             return `<article class="ammo-pack-card">
                                 <span class="window-kicker">${pack.id === 'full' ? 'FULL REFILL' : `+${pack.ammo} AMMO`}</span>
-                                <div class="workbench-item-title">${pack.name}</div>
-                                <p class="workbench-item-desc">${pack.description}</p>
+                                <div class="item-title-row"><div class="workbench-item-title">${pack.name}</div>${infoTip(pack.description, pack.name)}</div>
                                 <div class="workbench-cost-row">${costChips(this.player, cost)}</div>
                                 <button class="btn ${canAfford ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.buyAmmoPack('${pack.id}', '${source}', ${discount})">
-                                    ${canAfford ? 'Buy Ammo' : 'Need Cash'}
+                                    ${remaining <= 0 ? 'Sold Out' : canAfford ? `Buy Ammo${source === 'trader' ? ` / ${remaining} left` : ''}` : 'Need Cash'}
                                 </button>
                             </article>`;
                         }).join('')}
@@ -2971,9 +3125,14 @@
         buyAmmoPack: function (id, source = 'shop', discount = 1) {
             const pack = content.ammoPacks.find((entry) => entry.id === id);
             if (!pack) return;
+            if (source === 'trader') {
+                this.ensureTraderStock();
+                if ((this.traderStock?.[id] || 0) <= 0) return;
+            }
             const cost = this.getAmmoPackCost(pack, discount);
             if (!hasCost(this.player, cost)) return;
             payCost(this.player, cost);
+            if (source === 'trader') this.traderStock[id]--;
             this.player.reserveAmmo += pack.ammo || 0;
             if (pack.refillWeapons) {
                 this.weapons.filter((weapon) => weapon.owned).forEach((weapon) => {
@@ -3001,6 +3160,7 @@
         },
 
         populateTrader: function () {
+            this.ensureTraderStock();
             if (this.trader && !this.trader.ammoDeals) {
                 const shuffled = content.ammoPacks.map((pack) => pack.id).sort(() => Math.random() - 0.5);
                 this.trader.ammoDeals = shuffled.slice(0, Math.random() < 0.55 ? 2 : 3);
@@ -3017,17 +3177,19 @@
                 <div class="trader-stock">${items.map((item) => `
                     <article class="trader-item-card">
                         <span class="trader-stock-code">${item.id === 'parts' ? 'RARE STOCK' : 'SALVAGE LOT'}</span>
-                        <div><h3>${item.name}</h3><p>${item.description}</p></div>
-                        <button class="btn ${this.player.money >= item.cost ? 'btn-primary' : 'btn-secondary opacity-50'}"
-                            ${this.player.money >= item.cost ? '' : 'disabled'} onclick="game.buyTraderItem('${item.id}')">BUY <small>$${item.cost}</small></button>
+                        <div class="item-title-row"><h3>${item.name}</h3>${infoTip(item.description, item.name)}</div>
+                        <button class="btn ${this.player.money >= item.cost && (this.traderStock[item.id] || 0) > 0 ? 'btn-primary' : 'btn-secondary opacity-50'}"
+                            ${this.player.money >= item.cost && (this.traderStock[item.id] || 0) > 0 ? '' : 'disabled'} onclick="game.buyTraderItem('${item.id}')">${(this.traderStock[item.id] || 0) > 0 ? `BUY / ${this.traderStock[item.id]} LEFT` : 'SOLD OUT'} <small>$${item.cost}</small></button>
                     </article>`).join('')}</div>`;
         },
 
         buyTraderItem: function (id) {
             const costs = { wood: 55, metal: 80, ammo: 45, repairs: 135, parts: 280 };
             const cost = costs[id];
-            if (!cost || this.player.money < cost) return;
+            this.ensureTraderStock();
+            if (!cost || this.player.money < cost || (this.traderStock[id] || 0) <= 0) return;
             this.player.money -= cost;
+            this.traderStock[id]--;
             if (id === 'wood') this.player.wood += 12;
             if (id === 'metal') this.player.metal += 9;
             if (id === 'ammo') this.player.reserveAmmo += 75;
@@ -3064,15 +3226,16 @@
             buildingTitle.textContent = building.name.toUpperCase();
 
             if (building.id === 'potionHut') {
-                buildingContent.innerHTML = `<p class="window-copy">Temporary boosts crafted from salvage. Potion effects are timed and visible on the HUD.</p>
-                    <div class="workbench-grid">${content.potionRecipes.map((recipe) => {
+                buildingContent.innerHTML = `<div class="potion-counter-head"><div><span class="window-kicker">MIXING COUNTER</span><h3>Choose a formula</h3></div>${infoTip('Potion effects are timed and appear as compact icons on the HUD.', 'Potion help')}</div>
+                    <div class="potion-grid">${content.potionRecipes.map((recipe) => {
                         const canAfford = hasCost(this.player, recipe.cost);
-                        return `<article class="workbench-item workbench-consumable">
-                            <span class="window-kicker">POTION</span>
-                            <div class="workbench-item-title">${recipe.name}</div>
-                            <p class="workbench-item-desc">${recipe.description}</p>
+                        const duration = recipe.duration ? `${Math.round(recipe.duration / 1000)}S` : 'INSTANT';
+                        return `<article class="potion-card potion-${recipe.type}">
+                            <div class="potion-bottle" aria-hidden="true"><i></i></div>
+                            <div class="potion-card-body"><span class="window-kicker">${duration}</span>
+                            <div class="item-title-row"><div class="workbench-item-title">${recipe.name}</div>${infoTip(recipe.description, recipe.name)}</div>
                             <div class="workbench-cost-row">${costChips(this.player, recipe.cost)}</div>
-                            <button class="btn ${canAfford ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.buyPotionRecipe('${recipe.id}')">Craft</button>
+                            <button class="btn ${canAfford ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.buyPotionRecipe('${recipe.id}')">Mix</button></div>
                         </article>`;
                     }).join('')}</div>`;
                 return;
@@ -3088,7 +3251,7 @@
                         ].map(([id, name, desc, cost]) => `<article class="workbench-item workbench-consumable">
                             <span class="window-kicker">FORGE</span>
                             <div class="workbench-item-title">${name}</div>
-                            <p class="workbench-item-desc">${desc}</p>
+                            ${infoTip(desc, name)}
                             <div class="workbench-cost-row">${costChips(this.player, cost)}</div>
                             <button class="btn ${hasCost(this.player, cost) ? 'btn-primary' : 'btn-secondary opacity-50'}" ${hasCost(this.player, cost) ? '' : 'disabled'} onclick="game.buyAmmoForge('${id}')">Forge</button>
                         </article>`).join('')}
@@ -3106,7 +3269,7 @@
                         return `<article class="workbench-item workbench-upgrade">
                             <span class="window-kicker">WEAPON CORE LV ${level} / 5</span>
                             <div class="workbench-item-title">${weapon.name}</div>
-                            <p class="workbench-item-desc">Next level: +damage, faster reload/fire rate, bigger magazine, stronger bullet trail.</p>
+                            ${infoTip('Next level: +damage, faster reload and fire rate, bigger magazine, and a stronger bullet trail.', weapon.name)}
                             <div class="workbench-cost-row">${level >= 5 ? '<span class="workbench-cost-item affordable">Maxed</span>' : costChips(this.player, cost)}</div>
                             <button class="btn ${canAfford ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.upgradeWeapon(${index})">${level >= 5 ? 'Maxed' : 'Overclock'}</button>
                         </article>`;
@@ -3154,6 +3317,12 @@
                         <div class="workbench-item-title">Defensive Power Network</div>
                         <p class="workbench-item-desc">Keep the relay standing. It is a priority target for Demolition Sappers.</p>
                     </article>`;
+                return;
+            }
+
+            if (building.id === 'emergencyArmory') {
+                buildingContent.innerHTML = `<div class="potion-counter-head"><div><span class="window-kicker">TIER IV GRID</span><h3>Emergency Armory Online</h3></div>${infoTip('Every 1.8 seconds, each active turret recovers up to 6 rounds. This stacks with the Power Relay range bonus.', 'Armory effect')}</div>
+                    <article class="workbench-item workbench-upgrade"><span class="window-kicker">PASSIVE SUPPORT</span><div class="workbench-item-title">Rapid Turret Resupply</div><div class="workbench-cost-row"><span class="workbench-cost-item affordable">6 rounds / 1.8s</span></div></article>`;
             }
         },
 
@@ -3223,7 +3392,7 @@
                 turrets: 4 + benchLevel * 2 + (hasAdvancedBench ? 2 : 0),
                 walls: 18 + benchLevel * 10,
                 traps: 6 + benchLevel * 4 + (hasTrapBench ? 4 : 0),
-                buildings: 7
+                buildings: 9
             };
         },
 
@@ -3394,7 +3563,7 @@
             const nextLevel = content.workbenchLevels[bench.workbenchLevel];
             workbenchTitle.textContent = `WORKBENCH LEVEL ${bench.workbenchLevel}`;
             this.workbenchTab ||= 'turrets';
-            const nextTechCost = this.techTier < 3 ? { money: 1800 * this.techTier, wood: 25 * this.techTier, metal: 30 * this.techTier, parts: this.techTier } : null;
+            const nextTechCost = this.techTier < 4 ? { money: 1800 * this.techTier, wood: 25 * this.techTier, metal: 30 * this.techTier, parts: this.techTier } : null;
 
             const nextLevelButton = nextLevel ? (() => {
                 const techReady = this.techTier >= nextLevel.level;
@@ -3410,16 +3579,10 @@
             })() : '<span class="bench-maxed">MAX BENCH</span>';
 
             const tabButtons = [
-                ['turrets', '01', 'Turrets', 'Build and tune'],
-                ['walls', '02', 'Walls', 'Defense tiers'],
-                ['traps', '03', 'Traps', 'Area control'],
-                ['buildings', '04', 'Buildings', 'Store stations'],
-                ['ammo', '05', 'Ammo', 'Restock'],
-                ['repairs', '06', 'Repairs', 'Restore defenses'],
-                ['tech', '07', 'Tech', 'Unlock tiers'],
-                ['skills', '08', 'Skills', 'Spend points']
-            ].map(([id, number, label, detail]) => `
-                <button class="workbench-tab ${this.workbenchTab === id ? 'active' : ''}" onclick="game.setWorkbenchTab('${id}')"><b>${number}</b><span>${label}<small>${detail}</small></span></button>
+                ['turrets', '01', 'Turrets'], ['walls', '02', 'Walls'], ['traps', '03', 'Traps'], ['buildings', '04', 'Buildings'],
+                ['ammo', '05', 'Ammo'], ['repairs', '06', 'Repairs'], ['tech', '07', 'Tech'], ['skills', '08', 'Skills']
+            ].map(([id, number, label]) => `
+                <button class="workbench-tab ${this.workbenchTab === id ? 'active' : ''}" onclick="game.setWorkbenchTab('${id}')"><b>${number}</b><span>${label}</span></button>
             `).join('');
 
             const turretCraftHtml = this.sentryTypes
@@ -3431,8 +3594,7 @@
                     return `
                     <article class="workbench-item workbench-turret">
                         <span class="window-kicker">TURRET / TECH ${roman(item.techLevel)}</span>
-                        <div class="workbench-item-title">${item.name}</div>
-                        <p class="workbench-item-desc">Automated defense. ${item.damage}${item.pellets ? ' x' + item.pellets : ''} damage, ${item.range} range, ${item.maxAmmo} ammo. Current cap: ${this.sentries.length}/${limit}.</p>
+                        <div class="item-title-row"><div class="workbench-item-title">${item.name}</div>${infoTip(`Automated defense. ${item.damage}${item.pellets ? ' x' + item.pellets : ''} damage, ${item.range} range, ${item.maxAmmo} ammo. Current cap: ${this.sentries.length}/${limit}.`, item.name)}</div>
                         <div class="workbench-cost-row">${costChips(this.player, item.cost)}</div>
                         <button class="btn ${canAfford ? 'btn-success' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.startPlacingSentry(${item.index})">Fabricate Turret</button>
                     </article>`;
@@ -3446,8 +3608,7 @@
                     return `
                     <article class="workbench-item workbench-trap">
                         <span class="window-kicker">TRAP / TECH ${roman(item.techLevel)}</span>
-                        <div class="workbench-item-title">${item.name}</div>
-                        <p class="workbench-item-desc">${item.damage} burst damage. One-use floor control. Current cap: ${this.traps.length}/${this.getPlacementLimits().traps}.</p>
+                        <div class="item-title-row"><div class="workbench-item-title">${item.name}</div>${infoTip(`${item.damage} burst damage. One-use floor control. Current cap: ${this.traps.length}/${this.getPlacementLimits().traps}.`, item.name)}</div>
                         <div class="workbench-cost-row">${costChips(this.player, item.cost)}</div>
                         <button class="btn ${canAfford ? 'btn-success' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.startPlacingTrap(${item.index})">Craft Trap</button>
                     </article>`;
@@ -3524,8 +3685,7 @@
                 const canAfford = !owned && hasCost(this.player, upgrade.cost);
                 return `
                     <article class="workbench-item workbench-consumable">
-                        <div class="workbench-item-title">${upgrade.name}</div>
-                        <p class="workbench-item-desc">${upgrade.description}</p>
+                        <div class="item-title-row"><div class="workbench-item-title">${upgrade.name}</div>${infoTip(upgrade.description, upgrade.name)}</div>
                         <div class="workbench-cost-row">${owned ? '<span class="workbench-cost-item affordable">Owned</span>' : costChips(this.player, upgrade.cost)}</div>
                         <button class="btn ${canAfford ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.buyUpgrade('${upgrade.id}')">${owned ? 'Installed' : 'Install'}</button>
                     </article>`;
@@ -3534,15 +3694,13 @@
             const techHtml = `
                 <article class="workbench-item workbench-upgrade">
                     <span class="window-kicker">TECH TIER</span>
-                    <div class="workbench-item-title">Store Tech Tier ${roman(this.techTier)}</div>
-                    <p class="workbench-item-desc">Boss waves unlock tech naturally. This emergency upgrade lets a strong run push tech early.</p>
+                    <div class="item-title-row"><div class="workbench-item-title">Store Tech Tier ${roman(this.techTier)}</div>${infoTip('Boss waves unlock tech naturally. This emergency upgrade lets a strong run push tech early.', 'Tech tier')}</div>
                     <div class="workbench-cost-row">${nextTechCost ? costChips(this.player, nextTechCost) : '<span class="workbench-cost-item affordable">Max tech reached</span>'}</div>
                     <button class="btn ${nextTechCost && hasCost(this.player, nextTechCost) ? 'btn-primary' : 'btn-secondary opacity-50'}" ${nextTechCost && hasCost(this.player, nextTechCost) ? '' : 'disabled'} onclick="game.upgradeTechTier()">Upgrade Tech Tier</button>
                 </article>
                 <article class="workbench-item workbench-upgrade">
                     <span class="window-kicker">WORKBENCH FRAME</span>
-                    <div class="workbench-item-title">Workbench Level ${bench.workbenchLevel}</div>
-                    <p class="workbench-item-desc">Higher bench levels unlock stronger turrets, walls, traps, buildings, and higher upgrade caps.</p>
+                    <div class="item-title-row"><div class="workbench-item-title">Workbench Level ${bench.workbenchLevel}</div>${infoTip('Higher bench levels unlock stronger turrets, walls, traps, buildings, and higher upgrade caps.', 'Workbench level')}</div>
                     <div class="workbench-cost-row">${nextLevel ? costChips(this.player, nextLevel.cost) : '<span class="workbench-cost-item affordable">Max bench reached</span>'}</div>
                     ${nextLevelButton}
                 </article>
@@ -3555,8 +3713,7 @@
                 return `
                     <article class="workbench-item workbench-building">
                         <span class="window-kicker">BUILDING / TECH ${roman(building.techLevel)}</span>
-                        <div class="workbench-item-title">${building.name}</div>
-                        <p class="workbench-item-desc">${building.description} ${built ? 'Already built in the parking lot.' : 'Builds as a physical station with [E] interaction.'}</p>
+                        <div class="item-title-row"><div class="workbench-item-title">${building.name}</div>${infoTip(`${building.description} ${built ? 'Already built.' : 'Placed as an interactive station.'}`, building.name)}</div>
                         <div class="workbench-cost-row">${built ? '<span class="workbench-cost-item affordable">Built</span>' : costChips(this.player, building.cost)}</div>
                         <button class="btn ${canAfford ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.startPlacingBuilding('${building.id}')">${built ? 'Built' : unlocked ? 'Place Building' : `Bench L${building.techLevel}`}</button>
                     </article>`;
@@ -3583,8 +3740,7 @@
                 return `
                     <article class="workbench-item workbench-skill">
                         <span class="window-kicker">SKILL LEVEL ${level} / ${skill.max}</span>
-                        <div class="workbench-item-title">${skill.name}</div>
-                        <p class="workbench-item-desc">${skill.description}. Skill points available: ${this.player.skillPoints}.</p>
+                        <div class="item-title-row"><div class="workbench-item-title">${skill.name}</div>${infoTip(`${skill.description}. Skill points available: ${this.player.skillPoints}.`, skill.name)}</div>
                         <button class="btn ${canBuy ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canBuy ? '' : 'disabled'} onclick="game.buySkill('${skill.id}')">${level >= skill.max ? 'Maxed' : 'Spend Point'}</button>
                     </article>`;
             }).join('');
@@ -3668,7 +3824,7 @@
 
         upgradeWorkbench: function () {
             const bench = this.getActiveWorkbench();
-            if (!bench || bench.workbenchLevel >= 3) return;
+            if (!bench || bench.workbenchLevel >= content.workbenchLevels.length) return;
             const next = content.workbenchLevels[bench.workbenchLevel];
             if (this.techTier < next.level || !hasCost(this.player, next.cost)) return;
             payCost(this.player, next.cost);
@@ -3679,7 +3835,7 @@
         },
 
         upgradeTechTier: function () {
-            if (this.techTier >= 3) return;
+            if (this.techTier >= 4) return;
             const cost = { money: 1800 * this.techTier, wood: 25 * this.techTier, metal: 30 * this.techTier, parts: this.techTier };
             if (!hasCost(this.player, cost)) return;
             payCost(this.player, cost);
@@ -3691,10 +3847,11 @@
         getRepairAllCost: function () {
             const defenses = [...this.sentries, ...this.walls.filter((wall) => !wall.isWorkbench), ...this.buildings, this.workbench];
             const missing = defenses.reduce((total, defense) => total + Math.max(0, (defense.maxHealth || 0) - (defense.health || 0)), 0);
+            const discount = this.skinPerk?.type === 'repairDiscount' ? 0.95 : 1;
             return {
-                money: Math.ceil(missing / 28),
-                wood: Math.ceil(missing / 95),
-                metal: Math.ceil(missing / 125)
+                money: Math.ceil(missing / 28 * discount),
+                wood: Math.ceil(missing / 95 * discount),
+                metal: Math.ceil(missing / 125 * discount)
             };
         },
 
@@ -3886,7 +4043,7 @@
                 ownerId: this.localPlayerId,
                 ownerName: this.player.name || 'P1'
             };
-            wall.maxHealth = (wall.maxHealth || wall.health) * fortify;
+            wall.maxHealth = (wall.maxHealth || wall.health) * fortify * (this.skinPerk?.type === 'wallHealth' ? 1.03 : 1);
             wall.health = wall.maxHealth;
             if (!wall.isWorkbench && wall.wallStage === undefined) wall.wallStage = 0;
             this.commitPlacedEntity('wall', this.walls, wall);
@@ -4018,8 +4175,6 @@
         },
 
         spawnZombie: function () {
-            const spawnAngle = Math.random() * Math.PI * 2;
-            const spawnRange = 620 + Math.random() * 220;
             let typeKey;
             if (this.bossesToSpawn > 0) {
                 const bossPool = progression.bossPool ? progression.bossPool(this.wave) : ['boss'];
@@ -4039,12 +4194,13 @@
             const health = Math.floor(type.health * plan.healthScale * eliteScale);
             const reward = Math.floor(type.reward * plan.rewardScale);
             const shieldHealth = type.shieldHealth ? Math.floor(type.shieldHealth * plan.healthScale) : 0;
+            const spawnPoint = this.findSafeZombieSpawn(this.player, type.size || 34);
 
             this.zombies.push({
                 ...type,
                 type: typeKey,
-                x: this.player.x + Math.cos(spawnAngle) * spawnRange,
-                y: this.player.y + Math.sin(spawnAngle) * spawnRange,
+                x: spawnPoint.x,
+                y: spawnPoint.y,
                 speed: type.speed * Math.min(1.25, 1 + this.wave * 0.004),
                 health,
                 maxHealth: health,

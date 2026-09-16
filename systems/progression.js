@@ -35,7 +35,7 @@
         }
 
         unlockedTechForWave(wave) {
-            return Math.min(3, 1 + Math.floor(wave / 10));
+            return Math.min(4, 1 + Math.floor(wave / 10));
         }
 
         pickUpgradeCards(count, ownedCounts) {
