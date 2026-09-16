@@ -5,7 +5,7 @@
         const gameContainer = document.getElementById('game-container');
         const canvas = document.getElementById('game-canvas');
         const ctx = canvas.getContext('2d');
-        
+
         // HUD Elements
         const hud = {
             waveText: document.getElementById('hud-wave-text'),
@@ -441,7 +441,7 @@
                     } else if (e.key.toLowerCase() === 'b') {
                         if (!this.isInputBlocked?.()) this.activateSkinAbility?.();
                     } else if (e.key.toLowerCase() === 'e') {
-                        if (!this.craftingOpen && !this.skillsOpen) {
+                        if (!this.craftingOpen && !this.skillsOpen && !e.repeat) {
                             const teammate = this.getNearbyDownedTeammate ? this.getNearbyDownedTeammate() : null;
                             const station = this.getNearbyStation ? this.getNearbyStation() : null;
                             if (teammate) {
@@ -463,7 +463,7 @@
                             }
                         }
                     } else if (e.key.toLowerCase() === 'g') {
-                        this.refillNearbyTurret();
+                        if (!e.repeat) this.refillNearbyTurret();
                     }
                     
                     if (e.key >= '1' && e.key <= '8') {
@@ -1480,6 +1480,23 @@
             },
             
             updateHUD: function() {
+                const cache = this.hudCache || (this.hudCache = {});
+                const hudNode = (key) => {
+                    const node = hud[key];
+                    return node;
+                };
+                const setText = (key, value) => {
+                    const text = String(value);
+                    if (cache[key] === text) return;
+                    cache[key] = text;
+                    hudNode(key).textContent = text;
+                };
+                const setWidth = (key, value) => {
+                    const width = `${value}%`;
+                    if (cache[`w:${key}`] === width) return;
+                    cache[`w:${key}`] = width;
+                    hudNode(key).style.width = width;
+                };
                 // Wave
                 const progress = this.totalZombiesInWave > 0 ? this.zombiesKilled / this.totalZombiesInWave : 0;
                 const percentage = Math.floor(progress * 100);
@@ -1487,47 +1504,47 @@
                     ? `BOSS WAVE ${this.wave}`
                     : this.wave % 5 === 0 ? `MINI-BOSS WAVE ${this.wave}` : `WAVE ${this.wave}`;
                 
-                hud.waveText.textContent = waveText;
-                hud.waveProgressText.textContent = `${this.zombiesKilled} / ${this.totalZombiesInWave}`;
-                hud.waveProgressBar.style.width = `${percentage}%`;
+                setText('waveText', waveText);
+                setText('waveProgressText', `${this.zombiesKilled} / ${this.totalZombiesInWave}`);
+                setWidth('waveProgressBar', percentage);
                 
                 // Player
                 const healthPercent = Math.max(0, this.player.health) / this.player.maxHealth;
-                hud.healthBar.style.width = `${healthPercent * 100}%`;
-                hud.healthText.textContent = `${Math.max(0, Math.floor(this.player.health))}/${this.player.maxHealth}`;
+                setWidth('healthBar', Math.round(healthPercent * 1000) / 10);
+                setText('healthText', `${Math.max(0, Math.floor(this.player.health))}/${Math.floor(this.player.maxHealth)}`);
                 const staminaPercent = Math.max(0, this.player.stamina) / this.player.maxStamina;
-                hud.staminaBar.style.width = `${staminaPercent * 100}%`;
-                hud.staminaText.textContent = `${Math.floor(this.player.stamina)} / ${this.player.maxStamina}`;
-                
-                hud.money.textContent = this.player.money;
-                hud.wood.textContent = this.player.wood;
-                hud.metal.textContent = this.player.metal;
-                hud.reserveAmmo.textContent = this.player.reserveAmmo;
-                hud.rareParts.textContent = this.player.rareTurretParts;
-                hud.level.textContent = `LV ${this.player.level}`;
-                hud.skillPoints.textContent = this.player.skillPoints;
-                hud.xpText.textContent = `${this.player.xp} / ${this.player.xpToNext}`;
-                hud.xpBar.style.width = `${Math.min(100, (this.player.xp / this.player.xpToNext) * 100)}%`;
-                hud.techTier.textContent = `TECH ${['I', 'II', 'III', 'IV'][this.techTier - 1]}`;
+                setWidth('staminaBar', Math.round(staminaPercent * 1000) / 10);
+                setText('staminaText', `${Math.floor(this.player.stamina)} / ${this.player.maxStamina}`);
+
+                setText('money', Math.floor(this.player.money));
+                setText('wood', this.player.wood);
+                setText('metal', this.player.metal);
+                setText('reserveAmmo', this.player.reserveAmmo);
+                setText('rareParts', this.player.rareTurretParts);
+                setText('level', `LV ${this.player.level}`);
+                setText('skillPoints', this.player.skillPoints);
+                setText('xpText', `${this.player.xp} / ${this.player.xpToNext}`);
+                setWidth('xpBar', Math.min(100, Math.round((this.player.xp / this.player.xpToNext) * 1000) / 10));
+                setText('techTier', `TECH ${['I', 'II', 'III', 'IV'][this.techTier - 1] || 'I'}`);
                 
                 // Weapon
                 const weapon = this.weapons[this.selectedWeapon];
-                hud.weaponName.textContent = weapon.name;
-                hud.weaponLevel.textContent = `CORE LV ${weapon.upgradeLevel || 0}`;
+                setText('weaponName', weapon.name);
+                setText('weaponLevel', `CORE LV ${weapon.upgradeLevel || 0}`);
                 
                 if (weapon.isReloading) {
-                    hud.ammoCurrent.textContent = 'R';
-                    hud.ammoMax.textContent = '...';
+                    setText('ammoCurrent', 'R');
+                    setText('ammoMax', '...');
                 } else {
                     if (weapon.currentAmmo === 0 && this.player.reserveAmmo === 0) {
-                        hud.ammoCurrent.textContent = 0;
-                        hud.ammoMax.textContent = '/ 0';
+                        setText('ammoCurrent', 0);
+                        setText('ammoMax', '/ 0');
                     } else {
-                        hud.ammoCurrent.textContent = weapon.currentAmmo;
+                        setText('ammoCurrent', weapon.currentAmmo);
                         if (weapon.maxAmmo > 0) {
-                            hud.ammoMax.textContent = `/ ${this.player.reserveAmmo}`;
+                            setText('ammoMax', `/ ${this.player.reserveAmmo}`);
                         } else {
-                            hud.ammoMax.textContent = '/ INF';
+                            setText('ammoMax', '/ INF');
                         }
                     }
                 }
@@ -1885,8 +1902,11 @@
             },
 
             drawBullets: function() {
+                const serverMode = Boolean(this.multiplayer?.serverAuthoritative);
+                const frameNow = performance.now();
                 for (const b of this.bullets) {
                     if (this.isOnScreen && !this.isOnScreen(b.x, b.y, 80)) continue;
+                    if (serverMode && !b.fromTurret && !b.fromZombie && b.ownerId === this.localPlayerId && frameNow - (b.networkCreatedAt || 0) < 160) continue;
                     if (b.acid) { 
                         ctx.fillStyle = '#96F93C';
                         ctx.shadowColor = 'white';
@@ -1901,8 +1921,7 @@
                         ctx.shadowBlur = 8;
                     } else {
                         ctx.fillStyle = '#FDE047';
-                        ctx.shadowColor = '#FDE047';
-                        ctx.shadowBlur = 8;
+                        ctx.shadowBlur = 0;
                     }
                     const size = b.size || 4;
                     
@@ -2152,6 +2171,14 @@
                 for (const s of this.sentries) {
                     if (this.dist(this.player.x, this.player.y, s.x, s.y) < 50) {
                         if (s.ammo < s.maxAmmo) {
+                            if (this.multiplayer?.serverAuthoritative) {
+                                // The server owns turret ammo: ask it to refill and pay up front (refunded if it rejects).
+                                if (this.sendPaidAction({ kind: 'refillTurret', networkId: s.networkId }, { wood: 1, metal: 1 })) {
+                                    s.ammo = s.maxAmmo;
+                                    this.playSfx?.('reload');
+                                }
+                                return;
+                            }
                             s.ammo = s.maxAmmo;
                             this.player.wood -= 1;
                             this.player.metal -= 1;
@@ -2556,12 +2583,14 @@
                 this.activePotions[potion.type] = now + potion.duration;
 
                 if (potion.type === 'health') {
+                    const before = this.player.health;
                     if (this.player.maxHealth === this.player.baseMaxHealth) {
                         this.player.maxHealth *= potion.multiplier;
                         this.player.health *= potion.multiplier;
                     } else {
                         this.player.health = this.player.maxHealth;
                     }
+                    if (this.requestHeal) this.requestHeal(Math.max(1, this.player.health - before));
                 }
                 
                 this.populateWorkbench();

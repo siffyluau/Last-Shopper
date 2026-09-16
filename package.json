@@ -6,10 +6,11 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check client.js && node --check systems/audio.js && node --check systems/content.js && node --check systems/progression.js && node --check systems/multiplayer.js && node --check systems/world.js && node --check systems/spatial-hash.js && node --check systems/survival.js && node --check server.js && node --check tests/performance-benchmark.js",
+    "check": "node --check client.js && node --check systems/audio.js && node --check systems/content.js && node --check systems/progression.js && node --check systems/multiplayer.js && node --check systems/world.js && node --check systems/spatial-hash.js && node --check systems/survival.js && node --check server.js && node --check tests/performance-benchmark.js && node --check tests/multiplayer-economy.js && node --check tests/multiplayer-smoke.js",
     "benchmark:performance": "node tests/performance-benchmark.js",
     "smoke:multiplayer": "node tests/multiplayer-smoke.js",
-    "smoke:navigation": "node tests/navigation-smoke.js"
+    "smoke:navigation": "node tests/navigation-smoke.js",
+    "smoke:economy": "node tests/multiplayer-economy.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

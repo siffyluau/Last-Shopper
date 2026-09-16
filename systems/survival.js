@@ -382,7 +382,25 @@
         },
 
         getMultiplayerState: function () {
+            const now = performance.now();
+            this.stateSeq = (this.stateSeq || 0) + 1;
+            if (!this.positionHistory) this.positionHistory = [];
+            this.positionHistory.push({ seq: this.stateSeq, x: this.player.x, y: this.player.y });
+            if (this.positionHistory.length > 120) this.positionHistory.splice(0, this.positionHistory.length - 120);
+            const fireRatePotion = this.activePotions?.fireRate > now ? 0.5 : 1;
             return {
+                seq: this.stateSeq,
+                upgrades: {
+                    autoRefill: Boolean(this.upgrades?.autoRefill),
+                    turretSpeed: Boolean(this.upgrades?.turretSpeed),
+                    autoLoot: Boolean(this.upgrades?.autoLoot)
+                },
+                damageMultiplier: this.getPlayerDamageMultiplier ? this.getPlayerDamageMultiplier() : 1,
+                fireRateMultiplier: fireRatePotion * Math.pow(0.9, this.runUpgradeCounts?.rapidFire || 0),
+                armorMultiplier: 1 - ((this.activePotions?.armor > now ? 0.35 : 0) + (this.skinPerk?.type === 'acidGuard' ? 0.04 : 0)),
+                critChance: this.activePotions?.crit > now ? 0.18 : 0,
+                lifesteal: Boolean(this.activePotions?.lifesteal > now),
+                pickupRadius: (this.upgrades?.autoLoot ? 300 : 30) + (this.player.skillLevels?.pickupRange || 0) * 25,
                 name: this.player.name || this.metaProgression.playerName || 'The Shopper',
                 skinId: this.player.skinId || this.selectedSkinId,
                 x: this.player.x,
@@ -507,24 +525,7 @@
             }
         },
 
-        advanceNetworkInterpolation: function () {
-            if (!this.multiplayer?.serverAuthoritative) return;
-            const now = performance.now();
-            const smooth = (entities) => {
-                for (const entity of entities || []) {
-                    if (!Number.isFinite(entity.networkToX) || !Number.isFinite(entity.networkToY)) continue;
-                    const progress = Math.max(0, Math.min(1, (now - entity.networkReceivedAt) / Math.max(16, entity.networkDuration || 100)));
-                    const eased = progress * progress * (3 - 2 * progress);
-                    entity.x = entity.networkFromX + (entity.networkToX - entity.networkFromX) * eased;
-                    entity.y = entity.networkFromY + (entity.networkToY - entity.networkFromY) * eased;
-                }
-            };
-            smooth(this.zombies);
-            smooth(this.bullets);
-            smooth(this.remotePlayers);
-        },
-
-        applyWorldSnapshot: function (world) {
+        applyLocalWorldSnapshot: function (world) {
             if (!world || this.isWorldHost()) return;
             const snapshotReceivedAt = performance.now();
             if (this.lastNetworkSnapshotAt) {
@@ -633,6 +634,434 @@
             if (wasDowned && !this.player.downed) this.playSfx?.('revive');
         },
 
+        // ---------------------------------------------------------------
+        // Server-authoritative (v3) snapshot handling: in-place merges, events, reconciliation.
+        // ---------------------------------------------------------------
+        applyWorldSnapshot: function (world) {
+            if (!world || this.isWorldHost()) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.applyServerWorldSnapshot(world);
+                return;
+            }
+            this.applyLocalWorldSnapshot(world);
+        },
+
+        resetNetworkEntities: function () {
+            this.networkMaps = {};
+            this.zombies = [];
+            this.bullets = [];
+            this.sentries = [];
+            this.walls = [];
+            this.traps = [];
+            this.buildings = [];
+            this.drops = [];
+            this.acidPools = [];
+            this.remotePlayers = [];
+            this.mapStructures = [];
+            this.mapStructureMap = new Map();
+        },
+
+        mergeServerList: function (key, incoming, options = {}) {
+            if (!incoming) return;
+            const idField = options.idField || 'id';
+            const maps = this.networkMaps || (this.networkMaps = {});
+            const map = maps[key] || (maps[key] = new Map());
+            const now = performance.now();
+            const duration = Math.max(16, (this.networkInterpolationDelay || 50) * (options.durationScale || 1));
+            const next = [];
+            const seen = new Set();
+            for (const entry of incoming) {
+                const id = entry[idField] ?? entry.id;
+                if (id === undefined || id === null) continue;
+                let entity = map.get(id);
+                if (!entity) {
+                    entity = { ...entry };
+                    entity.networkCreatedAt = now;
+                    entity.networkUpdatedAt = now;
+                    if (options.interpolate) {
+                        entity.networkFromX = entity.x;
+                        entity.networkFromY = entity.y;
+                        entity.networkToX = entity.x;
+                        entity.networkToY = entity.y;
+                        entity.networkReceivedAt = now;
+                        entity.networkDuration = duration;
+                    }
+                    map.set(id, entity);
+                } else {
+                    const hasX = entry.x !== undefined;
+                    const hasY = entry.y !== undefined;
+                    if (options.interpolate && (hasX || hasY)) {
+                        const targetX = hasX ? entry.x : (entity.networkToX ?? entity.x);
+                        const targetY = hasY ? entry.y : (entity.networkToY ?? entity.y);
+                        const teleported = Math.hypot(targetX - entity.x, targetY - entity.y) > 240;
+                        entity.networkFromX = teleported ? targetX : entity.x;
+                        entity.networkFromY = teleported ? targetY : entity.y;
+                        entity.networkToX = targetX;
+                        entity.networkToY = targetY;
+                        entity.networkReceivedAt = now;
+                        entity.networkDuration = duration;
+                        if (teleported) {
+                            entity.x = targetX;
+                            entity.y = targetY;
+                        }
+                        for (const field in entry) {
+                            if (field !== 'x' && field !== 'y') entity[field] = entry[field];
+                        }
+                    } else if (options.extrapolate) {
+                        for (const field in entry) {
+                            if (field !== 'x' && field !== 'y') entity[field] = entry[field];
+                        }
+                    } else {
+                        Object.assign(entity, entry);
+                    }
+                }
+                if (options.onMerge) options.onMerge(entity, entry);
+                seen.add(id);
+                next.push(entity);
+            }
+            for (const id of map.keys()) {
+                if (!seen.has(id)) map.delete(id);
+            }
+            this[key] = next;
+        },
+
+        applyServerWorldSnapshot: function (world) {
+            const receivedAt = performance.now();
+            if (this.lastNetworkSnapshotAt) {
+                const gap = receivedAt - this.lastNetworkSnapshotAt;
+                this.networkSnapshotGap = this.networkSnapshotGap ? this.networkSnapshotGap * 0.8 + Math.min(gap, 400) * 0.2 : gap;
+                this.networkInterpolationDelay = Math.max(35, Math.min(140, this.networkSnapshotGap * 1.05));
+            }
+            this.lastNetworkSnapshotAt = receivedAt;
+            if (world.full) this.resetNetworkEntities();
+            if (!this.mapStructureMap) this.mapStructureMap = new Map();
+            const wasDowned = Boolean(this.player.downed);
+            const has = (field) => world[field] !== undefined;
+            if (has('serverTime')) this.serverTime = world.serverTime;
+            if (has('dayTime') && Number.isFinite(world.dayTime)) {
+                this.dayTime = world.dayTime;
+                if (!Number.isFinite(this.visualDayTime)) this.visualDayTime = this.dayTime;
+            }
+            if (has('dayNumber') && world.dayNumber) this.dayNumber = world.dayNumber;
+            if (has('gameStarted') && world.gameStarted && !this.gameStarted) {
+                this.setMultiplayerStatus(world.wave > 0 ? 'Joining active game...' : 'Host starting game...', 'online');
+                this.enterGameFromLobby();
+            }
+            for (const field of ['wave', 'zombiesKilled', 'totalZombiesInWave', 'bossesToSpawn', 'miniBossesToSpawn', 'escortsToSpawn', 'techTier', 'bossDefeats']) {
+                if (has(field) && world[field] !== null) this[field] = world[field];
+            }
+            if (has('waveActive')) this.waveActive = Boolean(world.waveActive);
+            if (has('currentWavePlan') && world.currentWavePlan) {
+                const localPlan = progression.wavePlan(world.currentWavePlan.wave || this.wave || 1);
+                this.currentWavePlan = { ...world.currentWavePlan, waveReward: world.currentWavePlan.waveReward || localPlan.waveReward };
+            }
+            if (has('preparationActive')) this.preparationActive = Boolean(world.preparationActive);
+            if (has('preparationEvent')) this.preparationEvent = world.preparationEvent || null;
+            if (has('preparationEndsIn')) this.preparationEndsAt = this.preparationActive ? receivedAt + (world.preparationEndsIn || 0) : 0;
+            if (has('supplyDrop')) this.supplyDrop = world.supplyDrop || null;
+            if (has('trader')) this.trader = world.trader || null;
+            if (has('lootBeacon')) this.lootBeacon = world.lootBeacon || null;
+            if (has('domainEvent')) this.domainEvent = world.domainEvent || null;
+            if (has('mapSeed') && world.mapSeed) this.mapSeed = world.mapSeed;
+
+            this.mergeServerList('zombies', world.zombies, { interpolate: true });
+            this.mergeServerList('bullets', world.bullets, { extrapolate: true });
+            const now = performance.now();
+            this.mergeServerList('sentries', world.sentries, {
+                idField: 'networkId',
+                onMerge: (entity, entry) => {
+                    if (entry.disabledMs !== undefined) entity.isDisabled = entry.disabledMs > 0 ? now + entry.disabledMs : 0;
+                }
+            });
+            this.mergeServerList('walls', world.walls, { idField: 'networkId' });
+            this.mergeServerList('traps', world.traps, { idField: 'networkId' });
+            this.mergeServerList('buildings', world.buildings, { idField: 'networkId' });
+            this.mergeServerList('drops', world.drops, { extrapolate: true });
+            this.mergeServerList('acidPools', world.acidPools, { extrapolate: true });
+
+            if (world.mapStructures) {
+                for (const structure of world.mapStructures) {
+                    const existing = this.mapStructureMap.get(structure.id);
+                    if (existing) {
+                        Object.assign(existing, structure);
+                    } else {
+                        this.mapStructureMap.set(structure.id, structure);
+                        this.mapStructures.push(structure);
+                    }
+                }
+            }
+            if (world.mapStructuresRemoved && world.mapStructuresRemoved.length) {
+                const removed = new Set(world.mapStructuresRemoved);
+                for (const id of removed) this.mapStructureMap.delete(id);
+                this.mapStructures = this.mapStructures.filter((structure) => !removed.has(structure.id));
+            }
+            if (world.mapStructureStates) this.applyMapStructureStates(world.mapStructureStates);
+
+            if (world.players) {
+                const localEntry = world.players.find((player) => player.id === this.localPlayerId);
+                if (localEntry) this.applyLocalPlayerState(localEntry);
+                this.mergeServerList('remotePlayers', world.players.filter((player) => player.id !== this.localPlayerId), {
+                    interpolate: true,
+                    onMerge: (entity) => { entity.lastSeen = now; }
+                });
+                this.team.playerCount = Math.max(1, this.remotePlayers.length + 1);
+                const partySignature = this.remotePlayers.map((player) => `${player.id}:${player.name}:${player.downed ? 1 : 0}:${Math.round((player.health || 0) / 10)}`).join('|');
+                if (partySignature !== this.lastPartySignature) {
+                    this.lastPartySignature = partySignature;
+                    this.updatePartyList();
+                }
+            }
+
+            if (world.events) this.applyServerEvents(world.events);
+
+            this.updateDownedUi();
+            if (!wasDowned && this.player.downed) this.playSfx?.('downed');
+            if (wasDowned && !this.player.downed) this.playSfx?.('revive');
+        },
+
+        applyLocalPlayerState: function (entry) {
+            const local = this.networkLocalPlayer || (this.networkLocalPlayer = {});
+            Object.assign(local, entry);
+            if (Number.isFinite(local.x) && Number.isFinite(local.y) && (entry.x !== undefined || entry.y !== undefined || entry.seq !== undefined)) {
+                this.reconcileLocalPosition(local);
+            }
+            if (local.health !== undefined) this.player.health = local.health;
+            if (local.maxHealth !== undefined) this.player.maxHealth = local.maxHealth;
+            this.player.downed = Boolean(local.downed);
+            this.player.downedAt = local.downedAt || 0;
+            this.player.respawnAt = local.respawnAt || 0;
+            this.player.giveUpAt = local.giveUpAt || 0;
+            this.player.reviveProgress = local.reviveProgress || 0;
+            this.player.reviverId = local.reviverId || null;
+            this.player.emergencyRespawns = local.emergencyRespawns || 0;
+        },
+
+        reconcileLocalPosition: function (serverPlayer) {
+            const history = this.positionHistory || [];
+            const seq = serverPlayer.seq;
+            const entry = Number.isFinite(seq) ? history.find((item) => item.seq === seq) : null;
+            let errX;
+            let errY;
+            if (entry) {
+                errX = serverPlayer.x - entry.x;
+                errY = serverPlayer.y - entry.y;
+            } else {
+                errX = serverPlayer.x - this.player.x;
+                errY = serverPlayer.y - this.player.y;
+                const distance = Math.hypot(errX, errY);
+                if (distance <= 400) return;
+            }
+            const distance = Math.hypot(errX, errY);
+            if (distance <= 6) return;
+            if (this.performanceDebug) {
+                this.performanceStats.reconciliation.push({ at: performance.now(), distance });
+                if (this.performanceStats.reconciliation.length > 1200) this.performanceStats.reconciliation.shift();
+            }
+            if (distance > 220 || this.player.downed) {
+                this.player.x += errX;
+                this.player.y += errY;
+                for (const item of history) {
+                    item.x += errX;
+                    item.y += errY;
+                }
+                return;
+            }
+            const nudgeX = errX * 0.35;
+            const nudgeY = errY * 0.35;
+            this.player.x += nudgeX;
+            this.player.y += nudgeY;
+            for (const item of history) {
+                if (item.seq >= seq) {
+                    item.x += nudgeX;
+                    item.y += nudgeY;
+                }
+            }
+        },
+
+        advanceNetworkInterpolation: function () {
+            if (!this.multiplayer?.serverAuthoritative) return;
+            const now = performance.now();
+            const smooth = (entities) => {
+                for (const entity of entities || []) {
+                    if (!Number.isFinite(entity.networkToX) || !Number.isFinite(entity.networkToY)) continue;
+                    const progress = Math.max(0, Math.min(1, (now - entity.networkReceivedAt) / Math.max(16, entity.networkDuration || 50)));
+                    entity.x = entity.networkFromX + (entity.networkToX - entity.networkFromX) * progress;
+                    entity.y = entity.networkFromY + (entity.networkToY - entity.networkFromY) * progress;
+                }
+            };
+            smooth(this.zombies);
+            smooth(this.remotePlayers);
+            for (const bullet of this.bullets || []) {
+                const elapsed = Math.min(250, now - (bullet.networkUpdatedAt || now));
+                bullet.networkUpdatedAt = now;
+                if (!elapsed) continue;
+                const frames = elapsed / 16.67;
+                bullet.x += (bullet.vx || 0) * frames;
+                bullet.y += (bullet.vy || 0) * frames;
+                if (bullet.life !== undefined) bullet.life -= frames;
+            }
+            for (const pool of this.acidPools || []) {
+                const elapsed = Math.min(250, now - (pool.networkUpdatedAt || now));
+                pool.networkUpdatedAt = now;
+                if (pool.life !== undefined) pool.life = Math.max(1, pool.life - elapsed / 16.67);
+            }
+        },
+
+        applyServerEvents: function (events) {
+            if (!events || !events.length) return;
+            if (!this.appliedServerEvents) this.appliedServerEvents = new Set();
+            for (const event of events) {
+                if (!event || !event.id || this.appliedServerEvents.has(event.id)) continue;
+                this.appliedServerEvents.add(event.id);
+                if (this.appliedServerEvents.size > 2000) {
+                    const kept = [...this.appliedServerEvents].slice(1000);
+                    this.appliedServerEvents = new Set(kept);
+                }
+                try {
+                    this.applyServerEvent(event);
+                } catch (error) {
+                    console.warn('Event failed', event.kind, error);
+                }
+            }
+        },
+
+        applyServerEvent: function (event) {
+            const me = this.localPlayerId;
+            if (event.kind === 'killReward') {
+                const mine = !event.ownerId || event.ownerId === me;
+                const share = mine ? 1 : 0.5;
+                const multiplier = this.getResourceMultiplier();
+                this.player.money += Math.max(1, Math.floor((event.money || 0) * share * multiplier));
+                this.gainXp(Math.max(1, Math.floor((event.xp || 0) * share)));
+                if (mine) {
+                    this.player.rareTurretParts += event.parts || 0;
+                    this.recordKill({ type: event.zombieType, isBoss: Boolean(event.boss) });
+                }
+                if (Number.isFinite(event.x) && this.isOnScreen(event.x, event.y, 60)) {
+                    this.createDeath({ x: event.x, y: event.y });
+                    if (event.boss || event.miniBoss) this.addCameraShake?.(event.boss ? 10 : 5);
+                }
+                return;
+            }
+            if (event.kind === 'loot') {
+                if (event.playerId !== me) return;
+                const multiplier = this.getResourceMultiplier();
+                const amount = event.amount || 1;
+                if (event.type === 'money') this.player.money += Math.floor(amount * multiplier);
+                else if (event.type === 'wood') this.player.wood += Math.max(1, Math.round(amount * multiplier));
+                else if (event.type === 'metal') this.player.metal += Math.max(1, Math.round(amount * multiplier));
+                else if (event.type === 'ammo') this.player.reserveAmmo += amount;
+                // medkits are applied by the server to our health directly
+                this.playSfx?.('pickup');
+                return;
+            }
+            if (event.kind === 'waveCleared') {
+                this.handleServerWaveCleared(event);
+                return;
+            }
+            if (event.kind === 'shot') {
+                if (event.shooterId === me || !this.spawnPredictedShot) return;
+                const weapon = this.weapons.find((entry) => entry.id === event.weaponId) || {};
+                this.spawnPredictedShot({
+                    ...weapon,
+                    id: event.weaponId,
+                    speed: event.speed || weapon.speed || 8,
+                    pellets: event.pellets ?? weapon.pellets ?? 0,
+                    bulletSize: event.bulletSize || weapon.bulletSize || 4,
+                    explosive: event.explosive ?? weapon.explosive
+                }, event.angle, { x: event.x, y: event.y });
+                return;
+            }
+            if (event.kind === 'buildRejected') {
+                const cost = this.pendingBuildCosts?.get(event.networkId);
+                if (cost) {
+                    refundCost(this.player, cost);
+                    this.pendingBuildCosts.delete(event.networkId);
+                }
+                this.showPlacementError?.(event.reason || 'Placement rejected. Resources refunded.');
+                this.updateHUD();
+                return;
+            }
+            if (event.kind === 'actionRejected') {
+                const key = `${event.action}:${event.networkId}`;
+                const pending = this.pendingActionCosts?.get(key);
+                if (pending && pending.length) {
+                    refundCost(this.player, pending.shift());
+                    if (!pending.length) this.pendingActionCosts.delete(key);
+                }
+                this.showWaveStatus?.(event.reason || 'Action rejected. Cost refunded.', 1800);
+                this.updateHUD();
+                return;
+            }
+            if (event.kind === 'respawned') {
+                if (event.emergency) {
+                    this.player.money = Math.floor(this.player.money * 0.8);
+                    this.showWaveStatus?.('EMERGENCY LOSS: owned turrets scrapped / 20% cash lost', 3800);
+                }
+                return;
+            }
+            if (event.kind === 'supplyCollected') {
+                if (this.supplyDrop) this.supplyDrop.collected = true;
+                if (event.playerId !== me) {
+                    this.showWaveStatus?.('A teammate secured the supply drop.', 2600);
+                    return;
+                }
+                const rewards = event.rewards || {};
+                this.player.money += rewards.money || 0;
+                this.player.wood += rewards.wood || 0;
+                this.player.metal += rewards.metal || 0;
+                this.player.reserveAmmo += rewards.ammo || 0;
+                this.showWaveStatus(`Supplies secured: +${rewards.money || 0}, +${rewards.wood || 0} wood, +${rewards.metal || 0} metal, +${rewards.ammo || 0} ammo`);
+                this.updateHUD();
+            }
+        },
+
+        handleServerWaveCleared: function (event) {
+            if (event.wave) this.wave = event.wave;
+            const basePlan = progression.wavePlan(this.wave || 1);
+            this.currentWavePlan = { ...(this.currentWavePlan || basePlan), waveReward: basePlan.waveReward };
+            this.waveActive = false;
+            if (this.gameStarted) this.showWaveReward();
+        },
+
+        requestHeal: function (amount) {
+            if (!this.multiplayer?.serverAuthoritative) return false;
+            const clean = Math.max(1, Math.min(250, Math.floor(amount || 0)));
+            this.multiplayer.sendAction({ kind: 'heal', amount: clean });
+            return true;
+        },
+
+        sendPaidAction: function (action, cost) {
+            if (!this.multiplayer?.serverAuthoritative) return false;
+            if (cost) {
+                if (!hasCost(this.player, cost)) return false;
+                payCost(this.player, cost);
+                if (!this.pendingActionCosts) this.pendingActionCosts = new Map();
+                const key = `${action.kind}:${action.networkId}`;
+                const pending = this.pendingActionCosts.get(key) || [];
+                pending.push(cost);
+                this.pendingActionCosts.set(key, pending);
+                setTimeout(() => {
+                    const list = this.pendingActionCosts?.get(key);
+                    if (list && list.includes(cost)) {
+                        list.splice(list.indexOf(cost), 1);
+                        if (!list.length) this.pendingActionCosts.delete(key);
+                    }
+                }, 4000);
+            }
+            this.multiplayer.sendAction(action);
+            if (this.workbenchOpen) setTimeout(() => { if (this.workbenchOpen) this.populateWorkbench(); }, 180);
+            this.updateHUD();
+            return true;
+        },
+
+        resolveNetworkEntity: function (list, ref) {
+            if (typeof ref === 'number') return list[ref] || null;
+            if (ref === undefined || ref === null) return null;
+            const key = String(ref);
+            return list.find((entry) => entry.networkId === key) || list[Number(key)] || null;
+        },
+
         getNearbyDownedTeammate: function () {
             let nearest = null;
             for (const teammate of this.remotePlayers || []) {
@@ -736,6 +1165,14 @@
             this.toggleBuilding(false);
             this.multiplayer?.disconnect();
             this.resetGame();
+            this.resetNetworkEntities?.();
+            this.appliedServerEvents = new Set();
+            this.pendingActionCosts = new Map();
+            this.pendingBuildCosts = new Map();
+            this.positionHistory = [];
+            this.networkLocalPlayer = null;
+            this.lastNetworkSnapshotAt = 0;
+            this.lastPartySignature = '';
             downedOverlay.classList.add('hidden');
             downedOverlay.classList.remove('flex');
             gameOverModal.classList.add('hidden');
@@ -2848,6 +3285,7 @@
                 this.player.skillPoints++;
                 this.player.xpToNext = progression.xpToNext(this.player.level);
                 this.player.health = Math.min(this.player.maxHealth, this.player.health + 15);
+                this.requestHeal(15);
             }
         },
 
@@ -2895,6 +3333,7 @@
                 this.player.baseMaxHealth += 20;
                 this.player.maxHealth += 20;
                 this.player.health += 20;
+                this.requestHeal(20);
             } else if (id === 'moveSpeed') {
                 this.player.speed *= 1.05;
             }
@@ -2946,10 +3385,15 @@
             if (!upgrade) return null;
             this.runUpgradeCounts[id] = (this.runUpgradeCounts[id] || 0) + 1;
 
+            if (this.multiplayer?.serverAuthoritative && ['turretCore', 'fortify', 'longShot', 'fieldRepair'].includes(id)) {
+                this.multiplayer.sendAction({ kind: 'runUpgrade', id });
+                return upgrade;
+            }
             if (id === 'vitality') {
                 this.player.baseMaxHealth += 25;
                 this.player.maxHealth += 25;
                 this.player.health = Math.min(this.player.maxHealth, this.player.health + 25);
+                this.requestHeal(25);
             } else if (id === 'turretCore') {
                 this.sentries.forEach((sentry) => {
                     sentry.damage *= 1.15;
@@ -3029,6 +3473,7 @@
         },
 
         finishWaveBreak: function () {
+            if (this.multiplayer?.serverAuthoritative) return;
             if ((this.wave + 1) % 10 === 0) {
                 this.startBossPreparation(35);
                 return;
@@ -3180,6 +3625,10 @@
             const drop = this.supplyDrop;
             if (!drop || drop.collected) return;
             if (this.dist(this.player.x, this.player.y, drop.x, drop.y) > drop.interactionRadius) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'collectSupply' });
+                return;
+            }
             const rewards = drop.rewards;
             this.player.money += rewards.money;
             this.player.wood += rewards.wood;
@@ -3307,7 +3756,8 @@
             if (id === 'ammo') this.player.reserveAmmo += 75;
             if (id === 'parts') this.player.rareTurretParts++;
             if (id === 'repairs') {
-                [...this.sentries, ...this.walls].forEach((defense) => { defense.health = defense.maxHealth; });
+                if (this.multiplayer?.serverAuthoritative) this.multiplayer.sendAction({ kind: 'repairAll' });
+                else [...this.sentries, ...this.walls].forEach((defense) => { defense.health = defense.maxHealth; });
                 this.workbench.health = this.workbench.maxHealth;
             }
             this.populateTrader();
@@ -3748,11 +4198,11 @@
                             <span>Range Lv <strong>${levels.range}</strong></span>
                         </div>
                         <div class="turret-upgrade-grid">
-                            ${this.turretUpgradeButton(index, 'damage', levels.damage, cap)}
-                            ${this.turretUpgradeButton(index, 'fireRate', levels.fireRate, cap)}
-                            ${this.turretUpgradeButton(index, 'range', levels.range, cap)}
-                            ${this.turretUpgradeButton(index, 'ammo', levels.ammo, cap)}
-                            ${this.turretRepairButton(index)}
+                            ${this.turretUpgradeButton(sentry.networkId || index, 'damage', levels.damage, cap)}
+                            ${this.turretUpgradeButton(sentry.networkId || index, 'fireRate', levels.fireRate, cap)}
+                            ${this.turretUpgradeButton(sentry.networkId || index, 'range', levels.range, cap)}
+                            ${this.turretUpgradeButton(sentry.networkId || index, 'ammo', levels.ammo, cap)}
+                            ${this.turretRepairButton(sentry.networkId || index)}
                         </div>
                     </article>`;
             }).join('') : '<p class="workbench-empty">No turrets placed. Fabricate one, then return here to tune it.</p>';
@@ -3786,8 +4236,8 @@
                         <p class="workbench-item-desc">${Math.ceil(wall.health)} / ${Math.ceil(wall.maxHealth)} HP. Upgrade ladder continues through Titanium.</p>
                         <div class="workbench-cost-row">${next ? costChips(this.player, next.upgradeCost) : '<span class="workbench-cost-item affordable">Max tier</span>'}</div>
                         <div class="workbench-actions">
-                            <button class="btn btn-secondary" onclick="game.repairWall(${index})">Repair</button>
-                            ${next ? `<button class="btn ${canUpgrade ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canUpgrade ? '' : 'disabled'} onclick="game.upgradeWall(${index})">Upgrade to ${next.name}</button>` : '<span class="bench-maxed">MAXED</span>'}
+                            <button class="btn btn-secondary" onclick="game.repairWall('${wall.networkId || index}')">Repair</button>
+                            ${next ? `<button class="btn ${canUpgrade ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canUpgrade ? '' : 'disabled'} onclick="game.upgradeWall('${wall.networkId || index}')">Upgrade to ${next.name}</button>` : '<span class="bench-maxed">MAXED</span>'}
                         </div>
                     </article>`;
             }).join('') : '<p class="workbench-empty">No walls placed yet. Build any unlocked tier from the wall ladder.</p>';
@@ -3907,7 +4357,7 @@
             const cost = { money: 80 + level * 80, wood: 2 + level, metal: 3 + level * 2 };
             const canAfford = !maxed && hasCost(this.player, cost);
             return `<button class="turret-upgrade-button ${canAfford ? '' : 'disabled'}"
-                ${canAfford ? '' : 'disabled'} onclick="game.upgradeTurret(${index}, '${stat}')">
+                ${canAfford ? '' : 'disabled'} onclick="game.upgradeTurret('${index}', '${stat}')">
                 <span>${labels[stat]}</span>
                 <b>Lv ${level}/${cap}</b>
                 <small>${effects[stat]}</small>
@@ -3922,11 +4372,11 @@
         },
 
         turretRepairButton: function (index) {
-            const sentry = this.sentries[index];
+            const sentry = this.resolveNetworkEntity(this.sentries, index);
             const cost = this.getTurretRepairCost(sentry);
             const canAfford = cost && hasCost(this.player, cost);
             return `<button class="turret-upgrade-button repair ${canAfford ? '' : 'disabled'}"
-                ${canAfford ? '' : 'disabled'} onclick="game.repairTurret(${index})">
+                ${canAfford ? '' : 'disabled'} onclick="game.repairTurret('${index}')">
                 <span>Repair</span>
                 <b>${sentry && sentry.maxHealth ? Math.ceil((sentry.health / sentry.maxHealth) * 100) : 100}% HP</b>
                 <small>Restore this turret to full health</small>
@@ -3952,6 +4402,7 @@
             if (!hasCost(this.player, cost)) return;
             payCost(this.player, cost);
             this.techTier++;
+            if (this.multiplayer?.serverAuthoritative) this.multiplayer.sendAction({ kind: 'upgradeTechTier', tier: this.techTier });
             this.populateWorkbench();
             this.updateHUD();
         },
@@ -3970,6 +4421,12 @@
         repairAllDefenses: function () {
             const cost = this.getRepairAllCost();
             if (!hasCost(this.player, cost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.workbench.health = this.workbench.maxHealth;
+                this.sendPaidAction({ kind: 'repairAll', networkId: 'all' }, cost);
+                this.populateWorkbench();
+                return;
+            }
             payCost(this.player, cost);
             [...this.sentries, ...this.walls, ...this.buildings, this.workbench].forEach((defense) => {
                 defense.health = defense.maxHealth;
@@ -3991,13 +4448,17 @@
 
         upgradeTurret: function (index, stat) {
             const bench = this.getActiveWorkbench();
-            const sentry = this.sentries[index];
+            const sentry = this.resolveNetworkEntity(this.sentries, index);
             if (!bench || !sentry) return;
             sentry.upgradeLevels ||= { damage: 0, fireRate: 0, range: 0, ammo: 0 };
             const level = sentry.upgradeLevels[stat];
             if (level >= this.getTurretUpgradeCap(bench)) return;
             const cost = { money: 80 + level * 80, wood: 2 + level, metal: 3 + level * 2 };
             if (!hasCost(this.player, cost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.sendPaidAction({ kind: 'upgradeTurret', networkId: sentry.networkId, stat }, cost);
+                return;
+            }
             payCost(this.player, cost);
             sentry.upgradeLevels[stat]++;
             if (stat === 'damage') sentry.damage *= 1.2;
@@ -4011,21 +4472,29 @@
         },
 
         repairTurret: function (index) {
-            const sentry = this.sentries[index];
+            const sentry = this.resolveNetworkEntity(this.sentries, index);
             if (!sentry || sentry.health >= sentry.maxHealth) return;
             const cost = this.getTurretRepairCost(sentry);
             if (!hasCost(this.player, cost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.sendPaidAction({ kind: 'repairStructure', structureKind: 'turret', networkId: sentry.networkId }, cost);
+                return;
+            }
             payCost(this.player, cost);
             sentry.health = sentry.maxHealth;
             this.populateWorkbench();
         },
 
         repairWall: function (index) {
-            const wall = this.walls[index];
+            const wall = this.resolveNetworkEntity(this.walls, index);
             if (!wall || wall.isWorkbench || wall.health >= wall.maxHealth) return;
             const missing = 1 - wall.health / wall.maxHealth;
             const cost = { wood: Math.max(1, Math.ceil(missing * 5)), metal: wall.wallStage >= 2 ? Math.max(1, Math.ceil(missing * 4)) : 0 };
             if (!hasCost(this.player, cost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.sendPaidAction({ kind: 'repairStructure', structureKind: 'wall', networkId: wall.networkId }, cost);
+                return;
+            }
             payCost(this.player, cost);
             wall.health = wall.maxHealth;
             this.populateWorkbench();
@@ -4033,11 +4502,15 @@
 
         upgradeWall: function (index) {
             const bench = this.getActiveWorkbench();
-            const wall = this.walls[index];
+            const wall = this.resolveNetworkEntity(this.walls, index);
             if (!bench || !wall || wall.isWorkbench) return;
             const nextStage = (wall.wallStage || 0) + 1;
             const next = content.wallStages[nextStage];
             if (!next || next.techLevel > bench.workbenchLevel || !hasCost(this.player, next.upgradeCost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.sendPaidAction({ kind: 'upgradeWall', networkId: wall.networkId, stage: nextStage }, next.upgradeCost);
+                return;
+            }
             payCost(this.player, next.upgradeCost);
             const healthRatio = wall.health / wall.maxHealth;
             Object.assign(wall, next, {
@@ -4053,7 +4526,7 @@
             const sentry = this.sentryTypes[index];
             const allowedLevel = sentry.techLevel === 1 ? 1 : (this.getActiveWorkbench()?.workbenchLevel || 0);
             if (!sentry || sentry.techLevel > allowedLevel || !hasCost(this.player, sentry.cost)) return;
-            if (this.sentries.length >= this.getPlacementLimits().turrets) {
+            if (this.sentries.filter((entry) => !entry.ownerId || entry.ownerId === this.localPlayerId).length >= this.getPlacementLimits().turrets) {
                 this.showPlacementError(`Turret cap reached: ${this.getPlacementLimits().turrets}. Upgrade tech or build a turret bench.`);
                 return;
             }
@@ -4106,6 +4579,10 @@
         commitPlacedEntity: function (kind, collection, entity) {
             if (this.isWorldHost()) {
                 collection.push(entity);
+            } else if (this.multiplayer?.serverAuthoritative && entity.networkId && (entity.paidCost || entity.cost)) {
+                if (!this.pendingBuildCosts) this.pendingBuildCosts = new Map();
+                this.pendingBuildCosts.set(entity.networkId, entity.paidCost || entity.cost);
+                setTimeout(() => this.pendingBuildCosts?.delete(entity.networkId), 5000);
             }
             this.recordBuild();
             this.playSfx?.('build');

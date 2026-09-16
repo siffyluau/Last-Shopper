@@ -12,6 +12,11 @@ const ROOT = __dirname;
 const PERF_DEBUG = process.env.PERF_DEBUG === '1';
 const TICK_MS = 50;
 const SNAPSHOT_MS = 50;
+const PROTOCOL_VERSION = 'authoritative-world-v3';
+const MAX_EVENT_QUEUE = 400;
+const BACKPRESSURE_SKIP_BYTES = 512 * 1024;
+const BACKPRESSURE_KILL_BYTES = 4 * 1024 * 1024;
+const HEARTBEAT_MS = 25000;
 const BUILD_COMMIT = process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'local';
 const TARGET_UPDATE_MS = 300;
 const PATH_UPDATE_MS = 650;
@@ -32,11 +37,22 @@ const MIME = {
 const SHOP_RECT = { x: 980, y: 615, width: 390, height: 260 };
 const WORKBENCH_RECT = { x: 1285, y: 820, width: 118, height: 62 };
 const SERVER_PLACEMENT_LIMITS = {
-  turrets: 12,
+  turrets: 14,
   walls: 60,
-  traps: 24,
+  traps: 26,
   buildings: 9
 };
+
+// Mirror of systems/content.js wallStages (the server cannot load that browser-only file).
+const WALL_STAGES = [
+  { name: 'Wood Wall', techLevel: 1, health: 240, color: [139, 82, 35] },
+  { name: 'Reinforced Wood', techLevel: 1, health: 430, color: [125, 88, 52] },
+  { name: 'Metal Wall', techLevel: 2, health: 780, color: [130, 145, 155] },
+  { name: 'Reinforced Metal', techLevel: 3, health: 1080, color: [105, 120, 132], armor: 0.1 },
+  { name: 'Electric Wall', techLevel: 3, health: 1280, color: [30, 165, 245], isElectric: true, shockDamage: 28 },
+  { name: 'Titanium Wall', techLevel: 3, health: 1680, color: [185, 195, 205], armor: 0.15 },
+  { name: 'Composite Shock Wall', techLevel: 4, health: 2650, color: [235, 190, 70], armor: 0.24, isElectric: true, shockDamage: 65 }
+];
 
 const enemyTypes = {
   normal: { color: [45, 80, 22], speed: 1, health: 100, reward: 10, xp: 10, size: 15, contactDamage: 8 },
@@ -84,6 +100,8 @@ const weaponTypes = {
 
 const rooms = new Map();
 let nextBulletId = 1;
+let nextAcidPoolId = 1;
+let nextEventId = 1;
 const eventLoopDelay = PERF_DEBUG ? monitorEventLoopDelay({ resolution: 20 }) : null;
 if (eventLoopDelay) eventLoopDelay.enable();
 
@@ -110,6 +128,8 @@ function createPerformanceMetrics() {
     },
     outgoingMessages: 0,
     outgoingBytes: 0,
+    skippedSnapshots: 0,
+    wireBytesBaseline: 0,
     snapshotMessages: 0,
     snapshotBytes: 0,
     snapshotEntities: 0,
@@ -147,11 +167,21 @@ function performanceReport(room) {
     structures: room.latestWorld.sentries.length + room.latestWorld.walls.length + room.latestWorld.traps.length + room.latestWorld.buildings.length,
     outgoingMessagesPerSecond: perf.outgoingMessages / elapsedSeconds,
     outgoingBytesPerSecond: perf.outgoingBytes / elapsedSeconds,
+    outgoingWireBytesPerSecond: (wireBytesWritten(room) - perf.wireBytesBaseline) / elapsedSeconds,
+    skippedSnapshots: perf.skippedSnapshots,
+    snapshotIntervalMs: room.snapshotIntervalMs,
+    tickEmaMs: room.tickEma,
     averageSnapshotBytes: perf.snapshotMessages ? perf.snapshotBytes / perf.snapshotMessages : 0,
     averageSnapshotEntities: perf.snapshotMessages ? perf.snapshotEntities / perf.snapshotMessages : 0,
     eventLoopDelayMeanMs: eventLoopDelay ? eventLoopDelay.mean / 1e6 : 0,
     eventLoopDelayMaxMs: eventLoopDelay ? eventLoopDelay.max / 1e6 : 0
   };
+}
+
+function wireBytesWritten(room) {
+  let total = 0;
+  for (const client of room.clients.values()) total += client._socket?.bytesWritten || 0;
+  return total;
 }
 
 function createSpatialIndexes() {
@@ -169,6 +199,9 @@ function rebuildSpatialIndexes(room, zombiesOnly = false) {
   const world = room.latestWorld;
   room.spatial.zombies.rebuild(world.zombies);
   if (zombiesOnly) return;
+  const structureSignature = `${room.structuresRevision}:${world.traps.length}:${world.walls.length}:${world.sentries.length}:${world.buildings.length}:${(world.mapStructures || []).length}`;
+  if (structureSignature === room.lastSpatialSignature) return;
+  room.lastSpatialSignature = structureSignature;
   room.spatial.traps.rebuild(world.traps);
   room.spatial.walls.rebuild(world.walls);
   room.spatial.sentries.rebuild(world.sentries);
@@ -320,7 +353,12 @@ function wavePlan(wave, playerCount) {
     enemyCount: Math.ceil((bossWave ? 8 + Math.floor(wave * 0.85) : baseCount) * playerScale),
     healthScale: (1.1 + completed * 0.047 + completed * completed * 0.0009) * healthPlayerScale,
     damageScale: 1.05 + completed * 0.019,
-    rewardScale: 1 + completed * 0.055
+    rewardScale: (1 + completed * 0.055) * (1 + Math.max(0, playerCount - 1) * 0.18),
+    waveReward: {
+      money: Math.floor(28 * Math.pow(wave, 1.12)),
+      wood: Math.max(2, Math.floor(1 + wave * 0.55)),
+      metal: Math.max(1, Math.floor(wave * 0.36))
+    }
   };
 }
 
@@ -354,7 +392,6 @@ function createWorld(seed) {
   return {
     mapSeed: seed || `last-shopper-${nowMs()}`,
     mapStructures: [],
-    lootEvents: [],
     lootBeacon: null,
     nextWorldDropAt: nowMs() + 45000,
     serverTime: nowMs(),
@@ -380,7 +417,6 @@ function createWorld(seed) {
     trader: null,
     zombies: [],
     bullets: [],
-    shotEvents: [],
     sentries: [],
     walls: [],
     traps: [],
@@ -389,7 +425,6 @@ function createWorld(seed) {
     acidPools: [],
     domainEvent: null,
     bossDefeats: 0,
-    killRewards: [],
     mapRevision: 0,
     structureStateRevision: 0
   };
@@ -411,8 +446,12 @@ function getRoom(code) {
       spatial: createSpatialIndexes(),
       worldChunkSignature: '',
       clientEntityKnowledge: new Map(),
-      lastMapSnapshotRevision: -1,
-      lastStructureStateRevision: -1,
+      clientEvents: new Map(),
+      structuresRevision: 0,
+      lastSpatialSignature: '',
+      snapshotIntervalMs: SNAPSHOT_MS,
+      tickEma: 0,
+      governorRecoverAt: 0,
       lastTick: nowMs(),
       lastSnapshot: 0,
       snapshotAccumulator: 0,
@@ -423,10 +462,10 @@ function getRoom(code) {
 }
 
 function send(ws, packet, room = ws.room) {
-  if (ws.readyState !== WebSocket.OPEN) return;
+  if (ws.readyState !== WebSocket.OPEN) return false;
   const payload = JSON.stringify(packet);
   ws.send(payload);
-  if (!PERF_DEBUG || !room?.perf) return;
+  if (!PERF_DEBUG || !room?.perf) return true;
   const bytes = Buffer.byteLength(payload);
   room.perf.outgoingMessages += 1;
   room.perf.outgoingBytes += bytes;
@@ -441,6 +480,7 @@ function send(ws, packet, room = ws.room) {
       + (packet.world?.traps?.length || 0)
       + (packet.world?.buildings?.length || 0);
   }
+  return true;
 }
 
 function broadcast(room, packet, except) {
@@ -449,8 +489,126 @@ function broadcast(room, packet, except) {
   }
 }
 
-function getMapStructureStates(world, structures = world.mapStructures || []) {
-  return structures.map((structure) => ({
+// --- Per-client reliable event queue (kill rewards, loot, wave clears, shots, rejections) ---
+function queueEvent(room, event, targetId = null, exceptId = null) {
+  event.id = event.id || `e${nextEventId++}`;
+  event.at = event.at || nowMs();
+  const push = (clientId) => {
+    let queue = room.clientEvents.get(clientId);
+    if (!queue) {
+      queue = [];
+      room.clientEvents.set(clientId, queue);
+    }
+    queue.push(event);
+    if (queue.length > MAX_EVENT_QUEUE) queue.splice(0, queue.length - MAX_EVENT_QUEUE);
+  };
+  if (targetId) {
+    if (room.clients.has(targetId)) push(targetId);
+    return;
+  }
+  for (const clientId of room.clients.keys()) {
+    if (clientId !== exceptId) push(clientId);
+  }
+}
+
+function rejectAction(room, clientId, action, networkId, reason) {
+  queueEvent(room, { kind: 'actionRejected', action, networkId: networkId || null, reason }, clientId);
+}
+
+const round1 = (value) => Math.round(value * 10) / 10;
+const round2 = (value) => Math.round(value * 100) / 100;
+const roundInt = (value) => Math.round(value);
+const identity = (value) => value;
+
+const ZOMBIE_SERVER_ONLY = new Set([
+  'targetId', 'targetKind', 'nextTargetAt', 'nextPathAt', 'detourX', 'detourY', 'detourUntil', 'detourObstacleId',
+  'breachTargetId', 'lastShot', 'lastSlam', 'lastMelee', 'lastHeal', 'lastWeld', 'lastBreachHit', 'lastCharge',
+  'lastSpawn', 'lastBurrow', 'lastEmp', 'lastPuddle', 'lastDodge', 'lastHitBy', 'wallTurn', 'wallBlockedTicks',
+  'flankSign', 'emergeAt', 'emergeX', 'emergeY', 'domainCastUsed', 'chargeAngle', 'empChargeUntil', 'empPulseUntil'
+]);
+
+const ZOMBIE_DYNAMIC = {
+  x: round1, y: round1, health: roundInt, shieldHealth: roundInt, maxShieldHealth: roundInt, hidden: identity, phase: identity,
+  burrowWarning: identity, warningLine: identity, chargeWindupUntil: identity, chargeUntil: identity, dodgeUntil: identity,
+  weakSpotUntil: identity, stunnedUntil: identity, domainCastingUntil: identity, empChargeUntil: identity, empPulseUntil: identity
+};
+const SENTRY_DYNAMIC = {
+  x: round1, y: round1, angle: round2, health: roundInt, maxHealth: roundInt, ammo: roundInt, maxAmmo: roundInt,
+  damage: round2, fireRate: round2, range: round1, upgradeLevels: identity, disabledMs: identity
+};
+const WALL_DYNAMIC = {
+  x: round1, y: round1, health: roundInt, maxHealth: roundInt, isElectric: identity, shockDamage: identity,
+  wallStage: identity, name: identity, color: identity, armor: identity
+};
+const TRAP_DYNAMIC = { x: round1, y: round1 };
+const BUILDING_DYNAMIC = { x: round1, y: round1, health: roundInt, maxHealth: roundInt };
+const PLAYER_DYNAMIC = {
+  x: round1, y: round1, angle: round2, health: roundInt, maxHealth: roundInt, downed: identity, downedAt: identity,
+  respawnAt: identity, giveUpAt: identity, reviveProgress: identity, reviverId: identity, emergencyRespawns: identity,
+  seq: identity, name: identity, skinId: identity, level: identity, wave: identity, weapons: identity
+};
+const PLAYER_SERVER_ONLY = new Set(['lastSeen', 'lastReviveTick', 'invulnerableUntil', 'upgrades', 'damageMultiplier',
+  'fireRateMultiplier', 'armorMultiplier', 'critChance', 'lifesteal', 'disconnectedAt']);
+
+function stableValue(value) {
+  if (value === undefined) return null;
+  if (value !== null && typeof value === 'object') return JSON.stringify(value);
+  return value;
+}
+
+function prepareEntity(entity, serverOnly, dynamic, extra) {
+  const record = {};
+  for (const key of Object.keys(entity)) {
+    if (serverOnly && serverOnly.has(key)) continue;
+    const value = entity[key];
+    if (value === undefined || typeof value === 'function') continue;
+    record[key] = dynamic[key] && typeof value === 'number' ? dynamic[key](value) : value;
+  }
+  if (extra) Object.assign(record, extra);
+  return record;
+}
+
+// Sends the full record the first time this client sees an entity, then only the id plus fields that changed.
+function diffKnownEntities(knowledge, key, entities, idField, dynamic, options = {}) {
+  const previous = knowledge[key] || new Map();
+  const next = new Map();
+  const result = [];
+  for (const entity of entities) {
+    const id = entity[idField] || entity.id;
+    if (!id) continue;
+    const extra = options.extra ? options.extra(entity) : null;
+    const record = prepareEntity(entity, options.serverOnly, dynamic, extra);
+    const last = previous.get(id);
+    const snapshotValues = {};
+    for (const field of Object.keys(dynamic)) snapshotValues[field] = stableValue(record[field]);
+    next.set(id, snapshotValues);
+    if (!last) {
+      result.push(record);
+      continue;
+    }
+    if (options.staticAfterSpawn) {
+      result.push({ [idField]: id });
+      continue;
+    }
+    const compact = { [idField]: id };
+    for (const field of Object.keys(dynamic)) {
+      if (snapshotValues[field] !== last[field]) compact[field] = record[field] === undefined ? null : record[field];
+    }
+    result.push(compact);
+  }
+  knowledge[key] = next;
+  return result;
+}
+
+function withinInterest(entity, anchor, radius = INTEREST_RADIUS) {
+  if (!anchor || !Number.isFinite(anchor.x) || !Number.isFinite(anchor.y)) return true;
+  const dx = entity.x - anchor.x;
+  const dy = entity.y - anchor.y;
+  return dx * dx + dy * dy <= radius * radius;
+}
+
+function structureState(structure) {
+  return {
     id: structure.id,
     door: {
       open: Boolean(structure.door.open),
@@ -463,110 +621,122 @@ function getMapStructureStates(world, structures = world.mapStructures || []) {
       health: Number(entry.health)
     })),
     lootClaimed: Boolean(structure.loot.claimed)
-  }));
-}
-
-function worldSnapshot(room, options = {}) {
-  const world = room.latestWorld;
-  const { mapStructures, ...dynamicWorld } = world;
-  const includeMap = options.includeMap !== false;
-  const includeMapStates = options.includeMapStates !== false;
-  return {
-    ...dynamicWorld,
-    ...(includeMap ? { mapStructures } : {}),
-    ...(includeMapStates ? { mapStructureStates: getMapStructureStates(world) } : {}),
-    gameStarted: room.gameStarted,
-    preparationEndsIn: world.preparationActive ? Math.max(0, world.preparationEndsAt - nowMs()) : 0,
-    players: [...room.players.values()]
   };
 }
 
-function withinInterest(entity, anchor, radius = INTEREST_RADIUS) {
-  if (!anchor || !Number.isFinite(anchor.x) || !Number.isFinite(anchor.y)) return true;
-  const dx = entity.x - anchor.x;
-  const dy = entity.y - anchor.y;
-  return dx * dx + dy * dy <= radius * radius;
+function bumpStructureState(world, structure) {
+  structure.stateRevision = (structure.stateRevision || 0) + 1;
+  world.structureStateRevision = (world.structureStateRevision || 0) + 1;
 }
 
-function compactKnownEntities(knowledge, key, entities, idSelector, dynamicFields) {
-  const previousKnown = knowledge[key] || new Set();
-  const nextKnown = new Set();
-  const result = [];
-  for (const entity of entities) {
-    const id = idSelector(entity);
-    if (!id) continue;
-    nextKnown.add(id);
-    if (!previousKnown.has(id)) {
-      result.push(entity);
-      continue;
-    }
-    const compact = {};
-    for (const field of dynamicFields) {
-      if (entity[field] !== undefined) compact[field] = entity[field];
-    }
-    result.push(compact);
-  }
-  knowledge[key] = nextKnown;
-  return result;
-}
-
-function networkWorldSnapshot(room, clientId, options = {}) {
+function networkWorldSnapshot(room, clientId) {
   const world = room.latestWorld;
+  const now = nowMs();
   const anchor = room.players.get(clientId) || null;
-  const knowledge = room.clientEntityKnowledge.get(clientId) || {};
-  room.clientEntityKnowledge.set(clientId, knowledge);
-  const {
-    mapStructures,
-    zombies,
-    bullets,
-    sentries,
-    walls,
-    traps,
-    buildings,
-    drops,
-    acidPools,
-    shotEvents,
-    ...globalWorld
-  } = world;
-  const interestedZombies = zombies.filter((entity) => entity.isBoss || entity.isMiniBoss || withinInterest(entity, anchor));
-  const interestedBullets = bullets.filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 350));
-  const interestedSentries = sentries.filter((entity) => withinInterest(entity, anchor));
-  const interestedWalls = walls.filter((entity) => withinInterest(entity, anchor));
-  const interestedTraps = traps.filter((entity) => withinInterest(entity, anchor));
-  const interestedBuildings = buildings.filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 300));
-  const interestedMap = mapStructures.filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 650));
-  const playerList = [...room.players.values()];
-  return {
-    ...globalWorld,
-    zombies: compactKnownEntities(knowledge, 'zombies', interestedZombies, (entity) => entity.id, [
-      'id', 'x', 'y', 'health', 'shieldHealth', 'hidden', 'phase', 'burrowWarning', 'warningLine',
-      'chargeWindupUntil', 'chargeUntil', 'dodgeUntil', 'weakSpotUntil', 'stunnedUntil', 'domainCastingUntil'
-    ]),
-    bullets: compactKnownEntities(knowledge, 'bullets', interestedBullets, (entity) => entity.id, ['id', 'x', 'y', 'life']),
-    sentries: compactKnownEntities(knowledge, 'sentries', interestedSentries, (entity) => entity.networkId || entity.id, [
-      'networkId', 'id', 'x', 'y', 'angle', 'health', 'ammo', 'isDisabled'
-    ]),
-    walls: compactKnownEntities(knowledge, 'walls', interestedWalls, (entity) => entity.networkId || entity.id, [
-      'networkId', 'id', 'x', 'y', 'health', 'isElectric'
-    ]),
-    traps: compactKnownEntities(knowledge, 'traps', interestedTraps, (entity) => entity.networkId || entity.id, [
-      'networkId', 'id', 'x', 'y'
-    ]),
-    buildings: compactKnownEntities(knowledge, 'buildings', interestedBuildings, (entity) => entity.networkId || entity.id, [
-      'networkId', 'id', 'x', 'y', 'health'
-    ]),
-    drops: drops.filter((entity) => withinInterest(entity, anchor)),
-    acidPools: acidPools.filter((entity) => withinInterest(entity, anchor)),
-    shotEvents: shotEvents.filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 350)),
-    ...(options.includeMap ? { mapStructures: interestedMap } : {}),
-    ...(options.includeMapStates ? { mapStructureStates: getMapStructureStates(world, interestedMap) } : {}),
+  let knowledge = room.clientEntityKnowledge.get(clientId);
+  const full = !knowledge || knowledge.full;
+  if (!knowledge) {
+    knowledge = {};
+    room.clientEntityKnowledge.set(clientId, knowledge);
+  }
+  if (knowledge.full) {
+    for (const key of Object.keys(knowledge)) delete knowledge[key];
+  }
+  const snapshot = {};
+  if (full) snapshot.full = true;
+
+  const globals = {
     gameStarted: room.gameStarted,
-    preparationEndsIn: world.preparationActive ? Math.max(0, world.preparationEndsAt - nowMs()) : 0,
-    players: compactKnownEntities(knowledge, 'players', playerList, (entity) => entity.id, [
-      'id', 'x', 'y', 'angle', 'health', 'maxHealth', 'downed', 'downedAt', 'respawnAt', 'giveUpAt',
-      'reviveProgress', 'reviverId', 'emergencyRespawns', 'lastSeen'
-    ])
+    wave: world.wave,
+    waveActive: world.waveActive,
+    zombiesKilled: world.zombiesKilled,
+    totalZombiesInWave: world.totalZombiesInWave,
+    bossesToSpawn: world.bossesToSpawn,
+    miniBossesToSpawn: world.miniBossesToSpawn,
+    escortsToSpawn: world.escortsToSpawn,
+    currentWavePlan: world.currentWavePlan,
+    techTier: world.techTier,
+    dayTime: Math.round(world.dayTime * 10000) / 10000,
+    dayNumber: world.dayNumber,
+    preparationActive: world.preparationActive,
+    preparationEvent: world.preparationEvent,
+    supplyDrop: world.supplyDrop,
+    trader: world.trader,
+    lootBeacon: world.lootBeacon,
+    domainEvent: world.domainEvent,
+    bossDefeats: world.bossDefeats,
+    mapSeed: world.mapSeed
   };
+  const lastGlobals = knowledge.globals || (knowledge.globals = {});
+  for (const [field, value] of Object.entries(globals)) {
+    const stable = stableValue(value);
+    if (lastGlobals[field] !== stable) {
+      lastGlobals[field] = stable;
+      snapshot[field] = value === undefined ? null : value;
+    }
+  }
+  snapshot.serverTime = now;
+  snapshot.preparationEndsIn = world.preparationActive ? Math.max(0, world.preparationEndsAt - now) : 0;
+
+  const interestedZombies = world.zombies.filter((entity) => entity.isBoss || entity.isMiniBoss || withinInterest(entity, anchor));
+  const interestedBullets = world.bullets.filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 350));
+  const interestedSentries = world.sentries.filter((entity) => withinInterest(entity, anchor));
+  const interestedWalls = world.walls.filter((entity) => withinInterest(entity, anchor));
+  const interestedTraps = world.traps.filter((entity) => withinInterest(entity, anchor));
+  const interestedBuildings = world.buildings.filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 300));
+  const interestedMap = (world.mapStructures || []).filter((entity) => withinInterest(entity, anchor, INTEREST_RADIUS + 650));
+
+  snapshot.zombies = diffKnownEntities(knowledge, 'zombies', interestedZombies, 'id', ZOMBIE_DYNAMIC, { serverOnly: ZOMBIE_SERVER_ONLY });
+  snapshot.bullets = diffKnownEntities(knowledge, 'bullets', interestedBullets, 'id', { x: round1, y: round1 }, {
+    serverOnly: new Set(['hitIds', 'pierce', 'damage']),
+    staticAfterSpawn: true
+  });
+  snapshot.sentries = diffKnownEntities(knowledge, 'sentries', interestedSentries, 'networkId', SENTRY_DYNAMIC, {
+    serverOnly: new Set(['lastShot', 'isDisabled']),
+    extra: (sentry) => ({ disabledMs: sentry.isDisabled > now ? Math.ceil((sentry.isDisabled - now) / 250) * 250 : 0 })
+  });
+  snapshot.walls = diffKnownEntities(knowledge, 'walls', interestedWalls, 'networkId', WALL_DYNAMIC);
+  snapshot.traps = diffKnownEntities(knowledge, 'traps', interestedTraps, 'networkId', TRAP_DYNAMIC, { serverOnly: new Set(['consumed']) });
+  snapshot.buildings = diffKnownEntities(knowledge, 'buildings', interestedBuildings, 'networkId', BUILDING_DYNAMIC);
+  snapshot.drops = diffKnownEntities(knowledge, 'drops', world.drops.filter((entity) => withinInterest(entity, anchor)), 'id', { x: round1, y: round1 }, {
+    serverOnly: new Set(['life']),
+    staticAfterSpawn: true
+  });
+  snapshot.acidPools = diffKnownEntities(knowledge, 'acidPools', world.acidPools.filter((entity) => withinInterest(entity, anchor)), 'id', { x: round1, y: round1 }, {
+    staticAfterSpawn: true
+  });
+  snapshot.players = diffKnownEntities(knowledge, 'players', [...room.players.values()], 'id', PLAYER_DYNAMIC, { serverOnly: PLAYER_SERVER_ONLY });
+
+  // Map structures: per-client add/remove plus per-structure state revisions.
+  const knownMap = knowledge.mapStructures || (knowledge.mapStructures = new Map());
+  const nextMap = new Map();
+  const addedStructures = [];
+  const changedStates = [];
+  for (const structure of interestedMap) {
+    const seenRevision = knownMap.get(structure.id);
+    const revision = structure.stateRevision || 0;
+    if (seenRevision === undefined) {
+      addedStructures.push(structure);
+    } else if (revision !== seenRevision) {
+      changedStates.push(structureState(structure));
+    }
+    nextMap.set(structure.id, revision);
+  }
+  const removedStructures = [];
+  for (const id of knownMap.keys()) {
+    if (!nextMap.has(id)) removedStructures.push(id);
+  }
+  knowledge.mapStructures = nextMap;
+  if (addedStructures.length) snapshot.mapStructures = addedStructures;
+  if (removedStructures.length) snapshot.mapStructuresRemoved = removedStructures;
+  if (changedStates.length) snapshot.mapStructureStates = changedStates;
+
+  const events = room.clientEvents.get(clientId);
+  if (events && events.length) {
+    snapshot.events = events;
+    room.clientEvents.set(clientId, []);
+  }
+  return snapshot;
 }
 
 function announceRoom(room) {
@@ -576,6 +746,7 @@ function announceRoom(room) {
   broadcast(room, {
     type: 'server',
     authoritative: true,
+    protocol: PROTOCOL_VERSION,
     room: room.code,
     hostId: room.hostId,
     clientCount: room.clients.size,
@@ -585,22 +756,36 @@ function announceRoom(room) {
 
 function registerClient(room, ws, packet) {
   if (!packet.id) return;
-  if (ws.clientId === packet.id && room.clients.has(packet.id)) return;
+  if (ws.clientId === packet.id && room.clients.get(packet.id) === ws) return;
   if (ws.clientId && room.clients.get(ws.clientId) === ws) {
     room.clients.delete(ws.clientId);
   }
+  const existing = room.clients.get(packet.id);
+  if (existing && existing !== ws) {
+    // Same player id reconnecting (page reload / network blip): replace the stale socket, keep the player.
+    existing.replacedByReconnect = true;
+    try { existing.terminate(); } catch {}
+  }
   ws.clientId = packet.id;
   room.clients.set(packet.id, ws);
-  room.clientEntityKnowledge.delete(packet.id);
+  room.clientEntityKnowledge.set(packet.id, { full: true });
+  if (!room.clientEvents.has(packet.id)) room.clientEvents.set(packet.id, []);
+  const player = room.players.get(packet.id);
+  if (player) {
+    player.lastSeen = nowMs();
+    player.disconnectedAt = 0;
+  }
   if (!room.hostId) room.hostId = packet.id;
+  if (PERF_DEBUG && room.perf) room.perf.wireBytesBaseline += ws._socket?.bytesWritten || 0;
   send(ws, {
     type: 'server',
     authoritative: true,
+    protocol: PROTOCOL_VERSION,
     room: room.code,
     hostId: room.hostId,
     clientCount: room.clients.size,
     roomStarted: room.gameStarted,
-    latestWorld: worldSnapshot(room)
+    gameStarted: room.gameStarted
   });
   announceRoom(room);
 }
@@ -851,6 +1036,18 @@ function getTargets(zombie, context, now, includeStructures = true) {
   return { ...nearest, x: nearest.entity.x, y: nearest.entity.y, distance: Math.sqrt(nearestDistanceSquared) };
 }
 
+function damagePlayer(player, amount, now = nowMs()) {
+  if (!player || player.downed) return;
+  if (now < (player.invulnerableUntil || 0)) return;
+  const scaled = amount * (Number.isFinite(player.armorMultiplier) ? player.armorMultiplier : 1);
+  player.health = Math.max(0, (player.health || 100) - scaled);
+}
+
+function healPlayer(player, amount) {
+  if (!player || player.downed || !(amount > 0)) return;
+  player.health = Math.min(player.maxHealth || 100, (player.health || 0) + amount);
+}
+
 function damageZombie(zombie, amount) {
   if (zombie.weakSpotUntil && nowMs() < zombie.weakSpotUntil) amount *= 1.35;
   let remaining = amount;
@@ -871,9 +1068,15 @@ function sanitizePlayerState(previous, incoming, id, now) {
   const requestedY = Number(incoming.y);
   let x = Number.isFinite(requestedX) ? requestedX : (Number(previous.x) || 1100);
   let y = Number.isFinite(requestedY) ? requestedY : (Number(previous.y) || 720);
+  const seq = Math.floor(Number(incoming.seq));
+  if (Number.isFinite(previous.seq) && Number.isFinite(seq) && seq <= previous.seq) {
+    // Out-of-order or duplicate packet: keep the newer position.
+    x = previous.x;
+    y = previous.y;
+  }
   if (Number.isFinite(previous.x) && Number.isFinite(previous.y)) {
     const elapsed = Math.max(16, Math.min(500, now - (previous.lastSeen || now - 50)));
-    const maxTravel = 24 + elapsed * 0.65;
+    const maxTravel = 30 + elapsed * 0.9;
     const travel = distance(previous.x, previous.y, x, y);
     if (travel > maxTravel) {
       const scale = maxTravel / travel;
@@ -887,14 +1090,28 @@ function sanitizePlayerState(previous, incoming, id, now) {
   }
   const weapons = Array.isArray(incoming.weapons)
     ? incoming.weapons.slice(0, 12).map((weapon) => ({
-      id: String(weapon.id || '').slice(0, 32),
-      owned: Boolean(weapon.owned),
-      upgradeLevel: clamp(Math.floor(Number(weapon.upgradeLevel) || 0), 0, 5)
+      id: String(weapon?.id || '').slice(0, 32),
+      owned: Boolean(weapon?.owned),
+      upgradeLevel: clamp(Math.floor(Number(weapon?.upgradeLevel) || 0), 0, 5)
     }))
     : previous.weapons;
+  const upgrades = incoming.upgrades && typeof incoming.upgrades === 'object'
+    ? { autoRefill: Boolean(incoming.upgrades.autoRefill), turretSpeed: Boolean(incoming.upgrades.turretSpeed), autoLoot: Boolean(incoming.upgrades.autoLoot) }
+    : (previous.upgrades || { autoRefill: false, turretSpeed: false, autoLoot: false });
+  const maxHealth = clamp(Number(incoming.maxHealth ?? previous.maxHealth) || 100, 1, 1000);
+  const numberOr = (value, fallback, min, max) => (Number.isFinite(Number(value)) ? clamp(Number(value), min, max) : fallback);
   return {
     ...previous,
     id,
+    seq: Number.isFinite(seq) ? Math.max(seq, previous.seq || 0) : (previous.seq || 0),
+    upgrades,
+    damageMultiplier: numberOr(incoming.damageMultiplier, previous.damageMultiplier ?? 1, 1, 4),
+    fireRateMultiplier: numberOr(incoming.fireRateMultiplier, previous.fireRateMultiplier ?? 1, 0.25, 1),
+    armorMultiplier: numberOr(incoming.armorMultiplier, previous.armorMultiplier ?? 1, 0.5, 1),
+    critChance: numberOr(incoming.critChance, previous.critChance ?? 0, 0, 0.5),
+    pickupRadius: numberOr(incoming.pickupRadius, previous.pickupRadius ?? 30, 30, 340),
+    lifesteal: incoming.lifesteal === undefined ? Boolean(previous.lifesteal) : Boolean(incoming.lifesteal),
+    wave: clamp(Math.floor(Number(incoming.wave ?? previous.wave) || 0), 0, 9999),
     name: String(incoming.name ?? previous.name ?? 'Shopper').slice(0, 24),
     skinId: String(incoming.skinId ?? previous.skinId ?? 'shopper').slice(0, 32),
     x,
@@ -902,8 +1119,8 @@ function sanitizePlayerState(previous, incoming, id, now) {
     angle: Number.isFinite(Number(incoming.angle)) ? Number(incoming.angle) : (previous.angle || 0),
     level: clamp(Math.floor(Number(incoming.level ?? previous.level) || 1), 1, 999),
     weapons,
-    health: previous.health ?? clamp(Number(incoming.health) || 100, 0, 1000),
-    maxHealth: clamp(Number(incoming.maxHealth ?? previous.maxHealth) || 100, 1, 1000),
+    health: Math.min(maxHealth, previous.health ?? clamp(Number(incoming.health) || 100, 0, 1000)),
+    maxHealth,
     downed: Boolean(previous.downed),
     downedAt: previous.downedAt || 0,
     respawnAt: previous.respawnAt || 0,
@@ -913,6 +1130,7 @@ function sanitizePlayerState(previous, incoming, id, now) {
     lastReviveTick: previous.lastReviveTick || 0,
     invulnerableUntil: previous.invulnerableUntil || 0,
     emergencyRespawns: previous.emergencyRespawns || 0,
+    disconnectedAt: 0,
     lastSeen: now
   };
 }
@@ -1076,7 +1294,7 @@ function runBossMechanics(room, z, target, dt, now) {
 
   if (z.bossKind === 'toxic' && now - (z.lastPuddle || 0) > (z.puddleRate || 1200)) {
     z.lastPuddle = now;
-    world.acidPools.push({ x: z.x, y: z.y, radius: 42, life: 260, damage: 0.55, toxicBoss: true });
+    world.acidPools.push({ id: `ap-${nextAcidPoolId++}`, x: z.x, y: z.y, radius: 42, life: 260, damage: 0.55, toxicBoss: true });
   }
 
   return false;
@@ -1125,16 +1343,27 @@ function spawnRemoteShot(room, player, weapon) {
   if (!shooter || !type || !ownedWeapon || !world.waveActive || world.wave < (type.requiredWave || 0)) return;
   const now = nowMs();
   const level = clamp(Math.floor(Number(ownedWeapon.upgradeLevel) || 0), 0, 5);
-  const cooldown = type.fireRate * Math.pow(0.92, level);
+  const fireRateMultiplier = clamp(Number(shooter.fireRateMultiplier) || 1, 0.25, 1);
+  const cooldown = type.fireRate * Math.pow(0.92, level) * fireRateMultiplier;
   const cooldownKey = `${player.id}:${weapon.id}`;
-  if (now - (room.weaponCooldowns.get(cooldownKey) || 0) < cooldown) return;
-  room.weaponCooldowns.set(cooldownKey, now);
+  // The client is the real rate limiter; only reject clearly impossible bursts (frame timing makes legit shots jittery).
+  const gate = room.weaponCooldowns.get(cooldownKey) || { last: 0, windowStart: now, count: 0 };
+  if (now - gate.last < cooldown * 0.55) return;
+  if (now - gate.windowStart > 1000) {
+    gate.windowStart = now;
+    gate.count = 0;
+  }
+  if (gate.count >= Math.ceil(1000 / cooldown) * 1.35 + 2) return;
+  gate.count += 1;
+  gate.last = now;
+  room.weaponCooldowns.set(cooldownKey, gate);
   const requestedAngle = Number(weapon.angle);
   const angle = Number.isFinite(requestedAngle) ? requestedAngle : (Number.isFinite(shooter.angle) ? shooter.angle : 0);
   const originX = shooter.x + Math.cos(angle) * 15;
   const originY = shooter.y + Math.sin(angle) * 15;
   const pellets = type.pellets || 0;
-  const damage = type.damage * Math.pow(1.18, level);
+  let damage = type.damage * Math.pow(1.18, level) * clamp(Number(shooter.damageMultiplier) || 1, 1, 4);
+  if (Math.random() < clamp(Number(shooter.critChance) || 0, 0, 0.5)) damage *= 2;
   const fireOne = (spread) => pushBullet(world, originX, originY, angle + spread, type.speed, damage, {
     explosive: type.explosive,
     pierce: type.pierce,
@@ -1146,19 +1375,18 @@ function spawnRemoteShot(room, player, weapon) {
   } else {
     fireOne(0);
   }
-  world.shotEvents.push({
-    id: `shot-${player.id}-${now}-${Math.random().toString(36).slice(2, 6)}`,
+  queueEvent(room, {
+    kind: 'shot',
     shooterId: player.id,
     weaponId: weapon.id,
-    x: originX,
-    y: originY,
-    angle,
+    x: round1(originX),
+    y: round1(originY),
+    angle: round2(angle),
     speed: type.speed,
     pellets,
     bulletSize: type.bulletSize || 4,
     explosive: Boolean(type.explosive)
-  });
-  if (world.shotEvents.length > 80) world.shotEvents.splice(0, world.shotEvents.length - 80);
+  }, null, player.id);
 }
 
 function getShelterBreachPlan(world, zombie, target) {
@@ -1225,7 +1453,7 @@ function damageShelterEntry(world, zombie, breachPlan, now) {
   } else {
     return true;
   }
-  world.structureStateRevision = (world.structureStateRevision || 0) + 1;
+  bumpStructureState(world, breachPlan.structure);
   if (entry.health <= 0) {
     entry.health = 0;
     if (breachPlan.entry.kind === 'door') {
@@ -1253,6 +1481,13 @@ function updateZombies(room, dt) {
           other.health = Math.min(other.maxHealth, other.health + z.healAmount);
           break;
         }
+      }
+    } else if (z.isDisruptor && now - (z.lastEmp || 0) > (z.empRate || 10000)) {
+      z.lastEmp = now;
+      z.empPulseUntil = now + 600;
+      const radius = z.empRadius || 200;
+      for (const sentry of room.spatial.sentries.queryRadius(z.x, z.y, radius)) {
+        if (distance(z.x, z.y, sentry.x, sentry.y) < radius) sentry.isDisabled = now + 5000;
       }
     } else if (z.isEngineer && now - z.lastWeld > z.weldRate) {
       z.lastWeld = now;
@@ -1311,15 +1546,18 @@ function updateZombies(room, dt) {
       } else if (!breachPlan && targetDist <= z.size + target.radius) {
         if (z.isBomber) {
           if (target.kind === 'structure') target.entity.health -= z.explosionDamage;
-          else if (now >= (target.entity.invulnerableUntil || 0)) target.entity.health = Math.max(0, (target.entity.health || 100) - z.explosionDamage * 0.35);
+          else damagePlayer(target.entity, z.explosionDamage * 0.35, now);
           z.health = 0;
         } else if (now - (z.lastMelee || 0) > (z.attackRate || 700)) {
           z.lastMelee = now;
           const amount = (z.contactDamage || 8) * (z.damageScale || 1);
           if (target.kind === 'structure') target.entity.health -= amount;
-          else if (now >= (target.entity.invulnerableUntil || 0)) target.entity.health = Math.max(0, (target.entity.health || 100) - amount);
+          else damagePlayer(target.entity, amount, now);
           if (z.isLeech) z.health = Math.min(z.maxHealth, z.health + (z.leechAmount || 6));
-          if (target.entity.isElectric) damageZombie(z, target.entity.shockDamage || 20);
+          if (target.entity.isElectric) {
+            z.lastHitBy = target.entity.ownerId || z.lastHitBy || null;
+            damageZombie(z, target.entity.shockDamage || 20);
+          }
         }
       } else {
         const moveDistance = Math.max(1, moveTarget.distance);
@@ -1367,11 +1605,15 @@ function updateZombies(room, dt) {
     const nearbyTraps = room.spatial.traps.queryRadius(z.x, z.y, 100);
     for (const trap of nearbyTraps) {
       if (z.health <= 0) break;
+      if (trap.consumed) continue;
       if (distance(z.x, z.y, trap.x, trap.y) < trap.radius) {
+        z.lastHitBy = trap.ownerId || z.lastHitBy || null;
         damageZombie(z, trap.damage || 250);
         if (trap.oneTimeUse) {
+          trap.consumed = true;
           const trapIndex = world.traps.indexOf(trap);
           if (trapIndex >= 0) world.traps.splice(trapIndex, 1);
+          room.structuresRevision += 1;
         }
       }
     }
@@ -1469,7 +1711,7 @@ function updateBullets(room, dt) {
           if (segmentCircleHit(previousX, previousY, b.x, b.y, player.x, player.y, 12 + (b.size || 4))) {
             const sheltered = (world.mapStructures || []).some((structure) =>
               WorldMap.pointInside(structure, player.x, player.y, 2));
-            if (!sheltered && now >= (player.invulnerableUntil || 0)) player.health = Math.max(0, (player.health || 100) - b.damage);
+            if (!sheltered) damagePlayer(player, b.damage, now);
             hit = true;
             break;
           }
@@ -1484,14 +1726,19 @@ function updateBullets(room, dt) {
         if (segmentCircleHit(previousX, previousY, b.x, b.y, z.x, z.y, z.size + (b.size || 4))) {
           z.lastHitBy = b.ownerId || z.lastHitBy || null;
           if (b.explosive) {
+            damageZombie(z, b.damage);
             for (const nearby of room.spatial.zombies.queryRadius(b.x, b.y, 105)) {
-              if (distance(b.x, b.y, nearby.x, nearby.y) < 95) {
+              if (nearby !== z && distance(b.x, b.y, nearby.x, nearby.y) < 95) {
                 nearby.lastHitBy = b.ownerId || nearby.lastHitBy || null;
                 damageZombie(nearby, b.damage * 0.5);
               }
             }
           } else {
             damageZombie(z, b.damage);
+            if (!b.fromTurret && b.ownerId) {
+              const owner = room.players.get(b.ownerId);
+              if (owner && owner.lifesteal) healPlayer(owner, b.damage * 0.08);
+            }
           }
           if (b.pierce > 0 && !b.explosive) {
             b.pierce--;
@@ -1517,12 +1764,14 @@ function updateSentries(room) {
     const sentry = world.sentries[i];
     if (sentry.health <= 0) {
       world.sentries.splice(i, 1);
+      room.structuresRevision += 1;
       continue;
     }
     if (sentry.isDisabled > now) continue;
     let closest = null;
     let closestDist = (sentry.range || 260) * (powerRelayOnline ? 1.15 : 1);
     if (canRefill && sentry.ammo < sentry.maxAmmo) sentry.ammo = Math.min(sentry.maxAmmo, sentry.ammo + (armoryOnline ? 6 : 1));
+    const ownerUpgrades = room.players.get(sentry.ownerId)?.upgrades;
     for (const z of room.spatial.zombies.queryRadius(sentry.x, sentry.y, closestDist + 55)) {
       const d = distance(sentry.x, sentry.y, z.x, z.y);
       if (d < closestDist) {
@@ -1532,8 +1781,11 @@ function updateSentries(room) {
     }
     if (!closest) continue;
     sentry.angle = Math.atan2(closest.y - sentry.y, closest.x - sentry.x);
-    if (now - (sentry.lastShot || 0) <= (sentry.fireRate || 200)) continue;
-    if ((sentry.ammo || 0) <= 0) continue;
+    if (now - (sentry.lastShot || 0) <= (sentry.fireRate || 200) / (ownerUpgrades?.turretSpeed ? 1.5 : 1)) continue;
+    if ((sentry.ammo || 0) <= 0) {
+      if (ownerUpgrades?.autoRefill) sentry.ammo = sentry.maxAmmo || 0;
+      if ((sentry.ammo || 0) <= 0) continue;
+    }
     sentry.lastShot = now;
     sentry.ammo -= 1;
     const pellets = sentry.pellets || 0;
@@ -1620,6 +1872,7 @@ function ensureWorldChunks(room) {
   room.generatedChunks = desiredChunks;
   room.worldChunkSignature = signature;
   world.mapRevision = (world.mapRevision || 0) + 1;
+  room.structuresRevision += 1;
 }
 
 function spawnWorldDrop(room) {
@@ -1638,44 +1891,75 @@ function spawnWorldDrop(room) {
 
 function collectNearbyDrops(room) {
   const world = room.latestWorld;
-  for (let i = world.drops.length - 1; i >= 0; i -= 1) {
-    const drop = world.drops[i];
-    const player = [...room.players.values()].find((candidate) =>
-      Number.isFinite(candidate.x) && distance(drop.x, drop.y, candidate.x, candidate.y) < 30);
-    if (!player) continue;
-    const amount = drop.type === 'ammo' ? 24 : drop.type === 'money' ? 8 : drop.type === 'medkit' ? 30 : 1;
-    world.lootEvents.push({ id: `loot-${drop.id}-${player.id}`, playerId: player.id, type: drop.type, amount, createdAt: nowMs() });
-    world.drops.splice(i, 1);
+  if (!world.drops.length) {
+    if (world.lootBeacon) world.lootBeacon = null;
+    return;
   }
-  if (world.lootEvents.length > 80) world.lootEvents.splice(0, world.lootEvents.length - 80);
-  if (world.lootBeacon && (nowMs() > world.lootBeacon.expiresAt || !world.drops.length)) world.lootBeacon = null;
+  const now = nowMs();
+  const players = [];
+  for (const player of room.players.values()) {
+    if (!Number.isFinite(player.x) || player.downed || now - player.lastSeen > 5000) continue;
+    const pickup = clamp(Number(player.pickupRadius) || 30, 30, 340);
+    players.push({ player, pickup });
+  }
+  if (players.length) {
+    for (let i = world.drops.length - 1; i >= 0; i -= 1) {
+      const drop = world.drops[i];
+      let collector = null;
+      for (const entry of players) {
+        if (distance(drop.x, drop.y, entry.player.x, entry.player.y) < entry.pickup) {
+          collector = entry.player;
+          break;
+        }
+      }
+      if (!collector) continue;
+      const amount = drop.type === 'ammo' ? 24 : drop.type === 'money' ? 8 : drop.type === 'medkit' ? 30 : 1;
+      if (drop.type === 'medkit') healPlayer(collector, amount);
+      queueEvent(room, { kind: 'loot', playerId: collector.id, type: drop.type, amount, x: round1(drop.x), y: round1(drop.y) }, collector.id);
+      world.drops.splice(i, 1);
+    }
+  }
+  if (world.lootBeacon && (now > world.lootBeacon.expiresAt || !world.drops.length)) world.lootBeacon = null;
 }
 
 function recordKillReward(room, zombie) {
   const world = room.latestWorld;
   if (zombie.isBoss) world.bossDefeats = (world.bossDefeats || 0) + 1;
-  const reward = {
-    id: `reward-${nowMs()}-${Math.random().toString(36).slice(2, 6)}`,
+  queueEvent(room, {
+    kind: 'killReward',
     zombieId: zombie.id,
     zombieType: zombie.type,
     boss: Boolean(zombie.isBoss),
     miniBoss: Boolean(zombie.isMiniBoss),
     ownerId: zombie.lastHitBy || null,
+    x: round1(zombie.x),
+    y: round1(zombie.y),
     money: Math.max(1, Math.floor((zombie.reward || 0) * 0.55)),
     xp: zombie.xp || 0,
-    parts: zombie.isBoss ? 1 : 0,
-    createdAt: nowMs()
-  };
-  world.killRewards.push(reward);
-  if (world.killRewards.length > 40) {
-    world.killRewards.splice(0, world.killRewards.length - 40);
+    parts: zombie.isBoss ? 1 : 0
+  });
+}
+
+function updateAcidPoolDamage(room, dt) {
+  const world = room.latestWorld;
+  if (!world.acidPools.length) return;
+  const now = nowMs();
+  for (const player of room.players.values()) {
+    if (!Number.isFinite(player.x) || player.downed) continue;
+    for (const pool of world.acidPools) {
+      if (distance(pool.x, pool.y, player.x, player.y) < (pool.radius || 30) + 12) {
+        damagePlayer(player, (pool.damage || 0.3) * (dt / 16.67), now);
+      }
+    }
   }
 }
 
-function cleanupWorld(world, dt) {
+function cleanupWorld(room, world, dt) {
+  const before = world.walls.length + world.sentries.length + world.buildings.length;
   world.walls = world.walls.filter((wall) => wall.health > 0);
   world.sentries = world.sentries.filter((sentry) => sentry.health > 0);
   world.buildings = world.buildings.filter((building) => building.health > 0);
+  if (world.walls.length + world.sentries.length + world.buildings.length !== before) room.structuresRevision += 1;
   for (let i = world.acidPools.length - 1; i >= 0; i--) {
     world.acidPools[i].life -= dt / 16.67;
     if (world.acidPools[i].life <= 0) world.acidPools.splice(i, 1);
@@ -1709,11 +1993,13 @@ function updateWaveState(room) {
   }
   if (world.zombiesKilled >= world.totalZombiesInWave && world.zombies.length === 0) {
     world.waveActive = false;
-    if ((world.wave + 1) % 10 === 0) {
+    const bossPrep = (world.wave + 1) % 10 === 0;
+    if (bossPrep) {
       startBossPreparation(room, 35);
     } else {
       world.nextWaveAt = now + 4000;
     }
+    queueEvent(room, { kind: 'waveCleared', wave: world.wave, playerCount: Math.max(1, room.players.size), nextWaveIn: bossPrep ? 35000 : 4000, bossPrep });
   }
 }
 
@@ -1748,17 +2034,24 @@ function updatePlayerLifeStates(room, now) {
       if (player.reviveProgress === 0) player.reviverId = null;
     }
     if (now >= player.respawnAt || (activeCount === 0 && now - player.downedAt >= 6000)) {
-      worldScrapPlayerTurrets(room.latestWorld, player.id);
-      player.emergencyRespawns = (player.emergencyRespawns || 0) + 1;
-      player.x = 980;
-      player.y = 850;
-      revivePlayer(player, 0.45);
+      emergencyRespawn(room, player);
     }
   }
 }
 
-function worldScrapPlayerTurrets(world, playerId) {
+function worldScrapPlayerTurrets(room, world, playerId) {
+  const before = world.sentries.length;
   world.sentries = world.sentries.filter((sentry) => sentry.ownerId !== playerId);
+  if (world.sentries.length !== before) room.structuresRevision += 1;
+}
+
+function emergencyRespawn(room, player) {
+  worldScrapPlayerTurrets(room, room.latestWorld, player.id);
+  player.emergencyRespawns = (player.emergencyRespawns || 0) + 1;
+  player.x = 980;
+  player.y = 850;
+  revivePlayer(player, 0.45);
+  queueEvent(room, { kind: 'respawned', emergency: true }, player.id);
 }
 
 function updateDayNight(world, now) {
@@ -1768,7 +2061,7 @@ function updateDayNight(world, now) {
 }
 
 function tickRoom(room) {
-  const tickStartedAt = PERF_DEBUG ? performance.now() : 0;
+  const tickStartedAt = performance.now();
   const now = nowMs();
   const dt = Math.min(200, Math.max(1, now - room.lastTick));
   room.lastTick = now;
@@ -1777,7 +2070,11 @@ function tickRoom(room) {
   updateDayNight(room.latestWorld, now);
 
   for (const [id, player] of room.players) {
-    if (now - player.lastSeen > 15000) room.players.delete(id);
+    const idleLimit = player.disconnectedAt ? 6000 : 15000;
+    if (now - player.lastSeen > idleLimit) {
+      room.players.delete(id);
+      worldScrapPlayerTurrets(room, room.latestWorld, id);
+    }
   }
   updatePlayerLifeStates(room, now);
 
@@ -1787,37 +2084,58 @@ function tickRoom(room) {
   collectNearbyDrops(room);
 
   measureStage(room, 'wave', () => updateWaveState(room));
-  if (room.latestWorld.waveActive) {
+  if (room.latestWorld.zombies.length) {
     measureStage(room, 'zombies', () => updateZombies(room, dt));
     measureStage(room, 'spatial', () => rebuildSpatialIndexes(room, true));
-    measureStage(room, 'bullets', () => updateBullets(room, dt));
-    measureStage(room, 'sentries', () => updateSentries(room));
-    measureStage(room, 'cleanup', () => cleanupWorld(room.latestWorld, dt));
   }
+  // Bullets, turrets, acid and cleanup keep running between waves so nothing freezes mid-air.
+  measureStage(room, 'bullets', () => updateBullets(room, dt));
+  measureStage(room, 'sentries', () => updateSentries(room));
+  updateAcidPoolDamage(room, dt);
+  measureStage(room, 'cleanup', () => cleanupWorld(room, room.latestWorld, dt));
 
-  if (room.snapshotAccumulator >= SNAPSHOT_MS) {
-    room.snapshotAccumulator %= SNAPSHOT_MS;
+  if (room.snapshotAccumulator >= room.snapshotIntervalMs) {
+    room.snapshotAccumulator %= room.snapshotIntervalMs;
     room.lastSnapshot = now;
-    const includeMap = room.lastMapSnapshotRevision !== room.latestWorld.mapRevision;
-    const includeMapStates = includeMap || room.lastStructureStateRevision !== room.latestWorld.structureStateRevision;
-    if (includeMap) room.lastMapSnapshotRevision = room.latestWorld.mapRevision;
-    if (includeMapStates) room.lastStructureStateRevision = room.latestWorld.structureStateRevision;
     measureStage(room, 'snapshots', () => {
       for (const [clientId, client] of room.clients) {
+        const buffered = client.bufferedAmount || 0;
+        if (buffered > BACKPRESSURE_KILL_BYTES) {
+          console.warn(`[room:${room.code}] dropping client ${clientId}: ${Math.round(buffered / 1024)} KB unsent`);
+          try { client.terminate(); } catch {}
+          continue;
+        }
+        if (buffered > BACKPRESSURE_SKIP_BYTES) {
+          room.perf.skippedSnapshots += 1;
+          continue;
+        }
         send(client, {
           type: 'world',
           id: 'server',
           authoritative: true,
           room: room.code,
-          world: networkWorldSnapshot(room, clientId, { includeMap, includeMapStates })
+          world: networkWorldSnapshot(room, clientId)
         }, room);
       }
-      room.latestWorld.shotEvents.length = 0;
     });
   }
 
+  // Overload governor: back off the snapshot rate when a tick costs more than the budget, recover when it is cheap again.
+  const tickCost = performance.now() - tickStartedAt;
+  room.tickEma = room.tickEma ? room.tickEma * 0.9 + tickCost * 0.1 : tickCost;
+  if (room.tickEma > 45) {
+    room.snapshotIntervalMs = 100;
+    room.governorRecoverAt = now + 3000;
+  } else if (room.tickEma > 30) {
+    if (room.snapshotIntervalMs < 66) room.snapshotIntervalMs = 66;
+    room.governorRecoverAt = now + 3000;
+  } else if (room.snapshotIntervalMs !== SNAPSHOT_MS && now >= room.governorRecoverAt && room.tickEma < 18) {
+    room.snapshotIntervalMs = room.snapshotIntervalMs === 100 ? 66 : SNAPSHOT_MS;
+    room.governorRecoverAt = now + 3000;
+  }
+
   if (PERF_DEBUG) {
-    const tickMs = performance.now() - tickStartedAt;
+    const tickMs = tickCost;
     room.perf.ticks += 1;
     room.perf.tickTotalMs += tickMs;
     room.perf.tickWorstMs = Math.max(room.perf.tickWorstMs, tickMs);
@@ -1831,11 +2149,32 @@ function tickRoom(room) {
   }
 }
 
+function cleanId(value, max = 48) {
+  return typeof value === 'string' || typeof value === 'number' ? String(value).slice(0, max) : '';
+}
+
+function findByNetworkId(list, networkId) {
+  if (!networkId) return null;
+  return list.find((entry) => entry.networkId === networkId || entry.id === networkId) || null;
+}
+
 function handleAction(room, packet) {
-  const action = packet.action || {};
+  try {
+    handleActionUnsafe(room, packet);
+  } catch (error) {
+    console.warn(`[room:${room.code}] action ${packet?.action?.kind} from ${packet?.id} failed: ${error.message}`);
+  }
+}
+
+function handleActionUnsafe(room, packet) {
+  const action = packet.action && typeof packet.action === 'object' ? packet.action : {};
   const world = room.latestWorld;
-  if (PERF_DEBUG && action.kind === 'debugPopulate' && packet.id === room.hostId) {
-    const anchor = room.players.get(packet.id) || { x: 1100, y: 720 };
+  const clientId = cleanId(packet.id);
+  const kind = cleanId(action.kind, 32);
+  const player = room.players.get(clientId) || null;
+  const now = nowMs();
+  if (PERF_DEBUG && kind === 'debugPopulate' && clientId === room.hostId) {
+    const anchor = player || { x: 1100, y: 720 };
     const zombieCount = clamp(Math.floor(Number(action.zombies) || 0), 0, 800);
     const projectileCount = clamp(Math.floor(Number(action.projectiles) || 0), 0, 1000);
     const sentryCount = clamp(Math.floor(Number(action.sentries) || 0), 0, 100);
@@ -1861,6 +2200,8 @@ function handleAction(room, packet) {
         maxHealth: type.health,
         shieldHealth: type.shieldHealth || 0,
         maxShieldHealth: type.shieldHealth || 0,
+        reward: type.reward,
+        xp: type.xp,
         damageScale: 1,
         lastShot: 0,
         lastSlam: 0,
@@ -1890,94 +2231,207 @@ function handleAction(room, packet) {
         maxAmmo: 100000,
         health: 100000,
         maxHealth: 100000,
-        ownerId: packet.id,
+        ownerId: clientId,
         lastShot: 0
       });
     }
     world.totalZombiesInWave = zombieCount;
+    world.zombiesKilled = 0;
+    room.structuresRevision += 1;
     room.perf = createPerformanceMetrics();
     return;
   }
-  if (action.kind === 'startGame') {
-    if (packet.id && packet.id !== room.hostId) return;
+  if (PERF_DEBUG && kind === 'debugKillAll') {
+    for (const zombie of world.zombies) {
+      zombie.lastHitBy = clientId;
+      zombie.health = 0;
+    }
+    return;
+  }
+  if (kind === 'startGame') {
+    if (clientId && clientId !== room.hostId) return;
     room.gameStarted = true;
     world.gameStarted = true;
     broadcast(room, { type: 'startGame', id: 'server', room: room.code, hostId: room.hostId });
     announceRoom(room);
     return;
   }
-  if (action.kind === 'build' && action.entity) {
-    const target = action.buildKind === 'turret'
+  if (kind === 'build') {
+    if (!action.entity || typeof action.entity !== 'object' || Array.isArray(action.entity)) return;
+    const buildKind = cleanId(action.buildKind, 16);
+    const target = buildKind === 'turret'
       ? world.sentries
-      : action.buildKind === 'wall'
+      : buildKind === 'wall'
         ? world.walls
-        : action.buildKind === 'trap'
+        : buildKind === 'trap'
           ? world.traps
-          : action.buildKind === 'building'
+          : buildKind === 'building'
             ? world.buildings
             : null;
+    const networkId = cleanId(action.entity.networkId, 64);
     if (!target) return;
-    if (target.some((entry) => entry.networkId && entry.networkId === action.entity.networkId)) return;
-    const entity = sanitizeBuildEntity(action.buildKind, {
+    if (networkId && target.some((entry) => entry.networkId === networkId)) return;
+    const entity = sanitizeBuildEntity(buildKind, {
       ...action.entity,
       x: action.x ?? action.entity.x,
       y: action.y ?? action.entity.y
-    }, packet.id);
-    if (!validateBuildPlacement(action.buildKind, entity, world)) return;
+    }, clientId);
+    if (!validateBuildPlacement(buildKind, entity, world)) {
+      queueEvent(room, { kind: 'buildRejected', buildKind, networkId: entity.networkId, reason: 'The server could not place that here.' }, clientId);
+      return;
+    }
     target.push(entity);
+    room.structuresRevision += 1;
     return;
   }
-  if (action.kind === 'shot' && action.weapon) {
-    spawnRemoteShot(room, { id: packet.id }, { ...action.weapon, angle: action.angle });
+  if (kind === 'shot') {
+    if (!action.weapon || typeof action.weapon !== 'object') return;
+    spawnRemoteShot(room, { id: clientId }, { id: cleanId(action.weapon.id, 32), angle: Number(action.angle) });
     return;
   }
-  if (action.kind === 'revive') {
-    const reviver = room.players.get(packet.id);
-    const target = room.players.get(String(action.targetId || ''));
-    const now = nowMs();
+  if (kind === 'revive') {
+    const reviver = player;
+    const target = room.players.get(cleanId(action.targetId));
     if (!reviver || !target || reviver.downed || !target.downed) return;
     if (distance(reviver.x, reviver.y, target.x, target.y) > 82) return;
-    const continued = target.reviverId === packet.id && target.lastReviveTick && now - target.lastReviveTick <= 420;
-    target.reviverId = packet.id;
+    const continued = target.reviverId === clientId && target.lastReviveTick && now - target.lastReviveTick <= 420;
+    target.reviverId = clientId;
     target.reviveProgress = (continued ? target.reviveProgress || 0 : 0) + Math.min(180, Math.max(90, now - (target.lastReviveTick || now - 110)));
     target.lastReviveTick = now;
     if (target.reviveProgress >= REVIVE_DURATION_MS) revivePlayer(target, 0.5);
     return;
   }
-  if (action.kind === 'requestRespawn') {
-    const player = room.players.get(packet.id);
-    if (!player || !player.downed || nowMs() < (player.giveUpAt || player.respawnAt)) return;
-    worldScrapPlayerTurrets(world, player.id);
-    player.emergencyRespawns = (player.emergencyRespawns || 0) + 1;
-    player.x = 980;
-    player.y = 850;
-    revivePlayer(player, 0.45);
+  if (kind === 'requestRespawn') {
+    if (!player || !player.downed || now < (player.giveUpAt || player.respawnAt)) return;
+    emergencyRespawn(room, player);
     return;
   }
-  if (action.kind === 'toggleDoor') {
-    const structure = world.mapStructures.find((entry) => entry.id === action.structureId);
-    const player = room.players.get(packet.id);
+  if (kind === 'heal') {
+    if (!player) return;
+    const amount = clamp(Number(action.amount) || 0, 0, 250);
+    if (amount > 0) healPlayer(player, amount);
+    return;
+  }
+  if (kind === 'toggleDoor') {
+    const structure = world.mapStructures.find((entry) => entry.id === cleanId(action.structureId, 64));
     if (!structure || !player || structure.door.destroyed) return;
     const door = WorldMap.doorPoint(structure);
     if (distance(player.x, player.y, door.x, door.y) > 95) return;
     structure.door.open = !structure.door.open;
-    world.structureStateRevision = (world.structureStateRevision || 0) + 1;
+    bumpStructureState(world, structure);
     return;
   }
-  if (action.kind === 'openStructureLoot') {
-    const structure = world.mapStructures.find((entry) => entry.id === action.structureId);
-    const player = room.players.get(packet.id);
+  if (kind === 'openStructureLoot') {
+    const structure = world.mapStructures.find((entry) => entry.id === cleanId(action.structureId, 64));
     if (!structure || !player || structure.loot.claimed) return;
     if (distance(player.x, player.y, structure.loot.x, structure.loot.y) > 75) return;
     structure.loot.claimed = true;
-    world.structureStateRevision = (world.structureStateRevision || 0) + 1;
+    bumpStructureState(world, structure);
     for (let i = 0; i < 2; i += 1) {
       dropLoot(world, structure.loot.x + Math.random() * 35 - 17, structure.loot.y + Math.random() * 35 - 17);
     }
     return;
   }
-  if (action.kind === 'collectSupply' && world.supplyDrop && !world.supplyDrop.collected) {
-    world.supplyDrop.collected = true;
+  if (kind === 'collectSupply') {
+    const drop = world.supplyDrop;
+    if (!drop || drop.collected || !player || !world.preparationActive) return;
+    if (distance(player.x, player.y, drop.x, drop.y) > (drop.interactionRadius || 72) + 16) return;
+    drop.collected = true;
+    drop.collectedBy = clientId;
+    queueEvent(room, { kind: 'supplyCollected', playerId: clientId, rewards: drop.rewards });
+    return;
+  }
+  if (kind === 'upgradeTechTier') {
+    const requested = clamp(Math.floor(Number(action.tier) || 0), 1, 4);
+    if (requested === (world.techTier || 1) + 1) world.techTier = requested;
+    return;
+  }
+  if (kind === 'refillTurret') {
+    const networkId = cleanId(action.networkId, 64);
+    const sentry = findByNetworkId(world.sentries, networkId);
+    if (!player || !sentry) return rejectAction(room, clientId, kind, networkId, 'That turret is gone.');
+    if (distance(player.x, player.y, sentry.x, sentry.y) > 70) return rejectAction(room, clientId, kind, networkId, 'Move closer to refill.');
+    if (sentry.ammo >= sentry.maxAmmo) return rejectAction(room, clientId, kind, networkId, 'Turret already full.');
+    sentry.ammo = sentry.maxAmmo;
+    return;
+  }
+  if (kind === 'upgradeTurret') {
+    const networkId = cleanId(action.networkId, 64);
+    const stat = cleanId(action.stat, 16);
+    const sentry = findByNetworkId(world.sentries, networkId);
+    if (!player || !sentry || !['damage', 'fireRate', 'range', 'ammo'].includes(stat)) return rejectAction(room, clientId, kind, networkId, 'That turret is gone.');
+    sentry.upgradeLevels = sentry.upgradeLevels && typeof sentry.upgradeLevels === 'object' ? sentry.upgradeLevels : { damage: 0, fireRate: 0, range: 0, ammo: 0 };
+    const level = Number(sentry.upgradeLevels[stat]) || 0;
+    if (level >= 10) return rejectAction(room, clientId, kind, networkId, 'Turret upgrade maxed.');
+    sentry.upgradeLevels[stat] = level + 1;
+    if (stat === 'damage') sentry.damage = (sentry.damage || 20) * 1.2;
+    if (stat === 'fireRate') sentry.fireRate = (sentry.fireRate || 200) * 0.88;
+    if (stat === 'range') sentry.range = (sentry.range || 260) + 35;
+    if (stat === 'ammo') {
+      sentry.maxAmmo = Math.ceil((sentry.maxAmmo || 0) * 1.25);
+      sentry.ammo = sentry.maxAmmo;
+    }
+    return;
+  }
+  if (kind === 'repairStructure') {
+    const networkId = cleanId(action.networkId, 64);
+    const structureKind = cleanId(action.structureKind, 16);
+    const list = structureKind === 'turret' ? world.sentries : structureKind === 'wall' ? world.walls : structureKind === 'building' ? world.buildings : null;
+    const entity = list ? findByNetworkId(list, networkId) : null;
+    if (!player || !entity) return rejectAction(room, clientId, kind, networkId, 'That defense is gone.');
+    entity.health = entity.maxHealth || entity.health;
+    return;
+  }
+  if (kind === 'repairAll') {
+    if (!player) return;
+    for (const entity of [...world.sentries, ...world.walls, ...world.buildings]) {
+      if (entity.maxHealth) entity.health = entity.maxHealth;
+    }
+    return;
+  }
+  if (kind === 'upgradeWall') {
+    const networkId = cleanId(action.networkId, 64);
+    const wall = findByNetworkId(world.walls, networkId);
+    const stage = Math.floor(Number(action.stage));
+    if (!player || !wall) return rejectAction(room, clientId, kind, networkId, 'That wall is gone.');
+    if (!Number.isFinite(stage) || stage !== (wall.wallStage || 0) + 1 || !WALL_STAGES[stage]) return rejectAction(room, clientId, kind, networkId, 'Wall cannot be upgraded further.');
+    const next = WALL_STAGES[stage];
+    const ratio = wall.maxHealth ? wall.health / wall.maxHealth : 1;
+    wall.name = next.name;
+    wall.color = next.color;
+    wall.armor = next.armor || 0;
+    wall.isElectric = Boolean(next.isElectric);
+    wall.shockDamage = next.shockDamage || 0;
+    wall.techLevel = next.techLevel;
+    wall.wallStage = stage;
+    wall.maxHealth = next.health;
+    wall.health = Math.max(next.health * ratio, next.health * 0.55);
+    wall.radius = 25;
+    return;
+  }
+  if (kind === 'runUpgrade') {
+    if (!player) return;
+    const id = cleanId(action.id, 24);
+    const ownedSentries = world.sentries.filter((entry) => entry.ownerId === clientId);
+    const ownedWalls = world.walls.filter((entry) => entry.ownerId === clientId);
+    if (id === 'turretCore') {
+      for (const sentry of ownedSentries) {
+        sentry.damage = (sentry.damage || 20) * 1.15;
+        sentry.fireRate = (sentry.fireRate || 200) * 0.87;
+      }
+    } else if (id === 'fortify') {
+      for (const defense of [...ownedSentries, ...ownedWalls]) {
+        defense.maxHealth = (defense.maxHealth || defense.health || 100) * 1.2;
+        defense.health = (defense.health || 0) * 1.2;
+      }
+    } else if (id === 'longShot') {
+      for (const sentry of ownedSentries) sentry.range = (sentry.range || 260) * 1.15;
+    } else if (id === 'fieldRepair') {
+      for (const defense of [...ownedSentries, ...ownedWalls]) {
+        defense.health = Math.min(defense.maxHealth || defense.health, (defense.health || 0) + (defense.maxHealth || 0) * 0.4);
+      }
+    }
+    return;
   }
 }
 
@@ -1991,7 +2445,7 @@ function serveStatic(req, res) {
       commit: BUILD_COMMIT,
       simulationHz: Math.round(1000 / TICK_MS),
       snapshotHz: Math.round(1000 / SNAPSHOT_MS),
-      protocol: 'authoritative-world-v2'
+      protocol: PROTOCOL_VERSION
     }));
     return;
   }
@@ -2023,7 +2477,18 @@ function serveStatic(req, res) {
 }
 
 const server = http.createServer(serveStatic);
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: 256 * 1024,
+  perMessageDeflate: {
+    threshold: 1024,
+    zlibDeflateOptions: { level: 1, memLevel: 7 },
+    clientNoContextTakeover: true,
+    serverNoContextTakeover: true,
+    serverMaxWindowBits: 12,
+    concurrencyLimit: 4
+  }
+});
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -2040,48 +2505,83 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', (ws, req, room) => {
   ws.room = room;
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+  ws.on('error', (error) => {
+    console.warn(`[room:${room.code}] socket error: ${error.message}`);
+    try { ws.terminate(); } catch {}
+  });
 
   ws.on('message', (raw) => {
-    let packet;
     try {
-      packet = JSON.parse(raw.toString());
-    } catch {
-      send(ws, { type: 'error', message: 'Bad JSON packet' });
-      return;
+      handleMessage(room, ws, raw);
+    } catch (error) {
+      console.warn(`[room:${room.code}] message handling failed: ${error.message}`);
     }
-
-    if (packet.id) registerClient(room, ws, packet);
-
-    if (packet.type === 'ping') {
-      send(ws, { type: 'pong', sentAt: packet.sentAt, serverTime: nowMs() }, room);
-      return;
-    }
-
-    if (packet.type === 'state' && packet.id && packet.state) {
-      const previous = room.players.get(packet.id) || {};
-      room.players.set(packet.id, sanitizePlayerState(previous, packet.state, packet.id, nowMs()));
-      return;
-    }
-
-    if (packet.type === 'action') {
-      handleAction(room, packet);
-      return;
-    }
-
-    if (packet.type !== 'world') broadcast(room, packet, ws);
   });
 
   ws.on('close', () => {
     if (ws.clientId && room.clients.get(ws.clientId) === ws) {
       room.clients.delete(ws.clientId);
-      room.players.delete(ws.clientId);
       room.clientEntityKnowledge.delete(ws.clientId);
+      room.clientEvents.delete(ws.clientId);
+      const player = room.players.get(ws.clientId);
+      if (player) {
+        // Keep the player briefly so a reload / network blip can resume the same run.
+        player.disconnectedAt = nowMs();
+        player.lastSeen = Math.min(player.lastSeen, nowMs());
+      }
       if (room.hostId === ws.clientId) room.hostId = null;
       announceRoom(room);
     }
     if (room.clients.size === 0) rooms.delete(room.code);
   });
 });
+
+function handleMessage(room, ws, raw) {
+  let packet;
+  try {
+    packet = JSON.parse(raw.toString());
+  } catch {
+    send(ws, { type: 'error', message: 'Bad JSON packet' });
+    return;
+  }
+  if (!packet || typeof packet !== 'object') return;
+  if (packet.id !== undefined) packet.id = cleanId(packet.id, 48);
+  if (!packet.id) return;
+  registerClient(room, ws, packet);
+
+  if (packet.type === 'ping') {
+    send(ws, { type: 'pong', sentAt: packet.sentAt, serverTime: nowMs() }, room);
+    return;
+  }
+
+  if (packet.type === 'state' && packet.state && typeof packet.state === 'object') {
+    const previous = room.players.get(packet.id) || {};
+    room.players.set(packet.id, sanitizePlayerState(previous, packet.state, packet.id, nowMs()));
+    return;
+  }
+
+  if (packet.type === 'action') {
+    handleAction(room, packet);
+    return;
+  }
+
+  if (packet.type === 'hello') {
+    broadcast(room, { type: 'hello', id: packet.id, room: room.code }, ws);
+  }
+}
+
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch {}
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, HEARTBEAT_MS).unref();
 
 let nextServerTick = performance.now() + TICK_MS;
 function runServerTickLoop() {

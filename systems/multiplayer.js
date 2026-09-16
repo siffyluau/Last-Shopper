@@ -44,10 +44,19 @@
             this.disconnect();
             this.roomCode = (roomCode || 'STORE').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) || 'STORE';
             this.desiredHost = Boolean(options.host);
+            this.relayUrl = relayUrl || null;
+            this.reconnectAttempts = 0;
+            this.intentionalClose = false;
             if (relayUrl) {
                 this.connectWebSocket(this.roomCode, relayUrl);
             } else {
                 this.connectLocal(this.roomCode);
+            }
+            if (!this.visibilityHandler) {
+                this.visibilityHandler = () => {
+                    if (document.visibilityState === 'visible' && this.roomCode) this.sendState();
+                };
+                document.addEventListener('visibilitychange', this.visibilityHandler);
             }
             this.syncTimer = setInterval(() => this.sendState(), relayUrl ? 50 : 110);
             this.cleanupTimer = setInterval(() => this.cleanupPeers(), 1000);
@@ -77,14 +86,28 @@
             this.serverAuthoritative = true;
             this.isHost = false;
             this.onHostChange(false, 'server');
-            this.socket = new WebSocket(url);
-            this.socket.onopen = () => {
+            const socket = new WebSocket(url);
+            this.socket = socket;
+            socket.onopen = () => {
+                if (this.socket !== socket) return;
+                this.reconnectAttempts = 0;
                 this.onStatus(`CLOUD ROOM ${roomCode}`, 'online');
                 this.sendPacket({ type: 'hello', id: this.localId, room: this.roomCode, wantsHost: this.desiredHost });
+                this.sendState();
             };
-            this.socket.onclose = () => this.onStatus('CLOUD DISCONNECTED', 'offline');
-            this.socket.onerror = () => this.onStatus('CLOUD ERROR', 'offline');
-            this.socket.onmessage = (event) => {
+            socket.onclose = () => {
+                if (this.socket !== socket) return;
+                this.socket = null;
+                if (this.intentionalClose || !this.roomCode) {
+                    this.onStatus('CLOUD DISCONNECTED', 'offline');
+                    return;
+                }
+                this.scheduleReconnect();
+            };
+            socket.onerror = () => {
+                if (this.socket === socket) this.onStatus('CLOUD ERROR', 'offline');
+            };
+            socket.onmessage = (event) => {
                 try {
                     const receivedAt = performance.now();
                     this.incomingByteSamples.push({ at: receivedAt, bytes: typeof event.data === 'string' ? event.data.length : 0 });
@@ -96,6 +119,22 @@
                 }
             };
             this.onStatus('CONNECTING CLOUD', 'offline');
+        }
+
+        scheduleReconnect() {
+            if (this.reconnectTimer || this.intentionalClose || !this.relayUrl) return;
+            this.reconnectAttempts = (this.reconnectAttempts || 0) + 1;
+            if (this.reconnectAttempts > 40) {
+                this.onStatus('CLOUD DISCONNECTED - reload to rejoin', 'offline');
+                return;
+            }
+            const delay = Math.min(8000, 1000 * Math.pow(2, Math.min(3, this.reconnectAttempts - 1)));
+            this.onStatus(`RECONNECTING... (${this.reconnectAttempts})`, 'offline');
+            this.reconnectTimer = setTimeout(() => {
+                this.reconnectTimer = null;
+                if (this.intentionalClose || !this.roomCode || !this.relayUrl) return;
+                this.connectWebSocket(this.roomCode, this.relayUrl);
+            }, delay);
         }
 
         receive(packet) {
@@ -209,6 +248,11 @@
         }
 
         disconnect() {
+            this.intentionalClose = true;
+            if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+            this.relayUrl = null;
+            this.roomCode = null;
             if (this.syncTimer) clearInterval(this.syncTimer);
             if (this.cleanupTimer) clearInterval(this.cleanupTimer);
             if (this.pingTimer) clearInterval(this.pingTimer);
