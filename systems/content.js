@@ -645,7 +645,7 @@
         {
             id: 'stocker',
             name: 'Night Stocker',
-            description: 'Emergency reload every 40 seconds when a magazine runs dry.', perk: { type: 'emergencyReload', label: '40s emergency reload' }, style: 'hoodie',
+            description: 'Press B to instantly refill the equipped magazine every 40 seconds.', perk: { type: 'emergencyReload', label: 'B: instant reload / 40s' }, style: 'hoodie',
             unlock: { type: 'kills', value: 25, label: '25 kills' },
             colors: { body: '#64748b', shirt: '#111827', accent: '#38bdf8' }
         },

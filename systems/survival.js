@@ -201,11 +201,21 @@
             }
         },
 
-        tryEmergencyReload: function (weapon) {
+        activateSkinAbility: function () {
             const now = performance.now();
-            if (this.skinPerk?.type !== 'emergencyReload' || now < (this.nextEmergencyReloadAt || 0)) return false;
+            if (this.skinPerk?.type !== 'emergencyReload') return false;
+            const secondsLeft = Math.ceil(((this.nextEmergencyReloadAt || 0) - now) / 1000);
+            if (secondsLeft > 0) {
+                this.showWaveStatus(`EMERGENCY RELOAD READY IN ${secondsLeft}S`, 1100);
+                return false;
+            }
+            const weapon = this.weapons[this.selectedWeapon];
+            if (!weapon || weapon.currentAmmo >= weapon.maxAmmo) {
+                this.showWaveStatus('MAGAZINE ALREADY FULL', 1000);
+                return false;
+            }
+            weapon.reloadGeneration = (weapon.reloadGeneration || 0) + 1;
             weapon.currentAmmo = weapon.maxAmmo;
-            this.player.reserveAmmo += 50;
             weapon.isReloading = false;
             this.nextEmergencyReloadAt = now + 40000;
             this.camera.zoomPulseUntil = now + 850;
@@ -216,7 +226,7 @@
                     life: 35, maxLife: 35, color: [56, 189, 248], size: 3
                 });
             }
-            this.showWaveStatus('EMERGENCY RELOAD / +50 RESERVE', 1800);
+            this.showWaveStatus('NIGHT STOCKER / MAGAZINE REFILLED', 1800);
             this.updateHUD();
             return true;
         },

@@ -119,6 +119,24 @@
             font-weight: 700;
             backdrop-filter: blur(6px);
         }
+        .skin-ability-icon {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            height: 38px;
+            margin-top: 5px;
+            padding: 0 10px 0 6px;
+            border: 1px solid rgba(56,189,248,.65);
+            color: #bae6fd;
+            background: rgba(8,20,31,.88);
+            box-shadow: inset 3px 0 #38bdf8;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: .08em;
+        }
+        .skin-ability-icon kbd { display:grid; place-items:center; width:25px; height:25px; border:1px solid #7dd3fc; color:#fff; background:#0c4a6e; font:800 13px "Chakra Petch"; }
+        .skin-ability-icon.cooldown { border-color:rgba(120,113,108,.55); color:#78716c; background:rgba(12,10,9,.82); box-shadow:inset 3px 0 #57534e; }
+        .skin-ability-icon.cooldown kbd { border-color:#57534e; color:#a8a29e; background:#292524; }
 
         :root {
             --panel: rgba(17, 17, 17, 0.94);

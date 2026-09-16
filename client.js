@@ -359,6 +359,10 @@
                 
                 // Input Listeners
                 window.addEventListener('keydown', (e) => {
+                    const typingTarget = e.target instanceof HTMLInputElement
+                        || e.target instanceof HTMLTextAreaElement
+                        || e.target?.isContentEditable;
+                    if (typingTarget && e.key !== 'Escape') return;
                     if (e.key === 'Escape' && this.zombieIndexOpen) {
                         this.toggleZombieIndex(false);
                         return;
@@ -392,6 +396,8 @@
                         }
                     } else if (e.key.toLowerCase() === 'r') {
                         this.reloadWeapon();
+                    } else if (e.key.toLowerCase() === 'b') {
+                        if (!this.isInputBlocked?.()) this.activateSkinAbility?.();
                     } else if (e.key.toLowerCase() === 'e') {
                         if (!this.craftingOpen && !this.skillsOpen) {
                             const teammate = this.getNearbyDownedTeammate ? this.getNearbyDownedTeammate() : null;
@@ -625,6 +631,7 @@
                     w.owned = (i === 0);
                     w.currentAmmo = w.maxAmmo;
                     w.isReloading = false;
+                    w.reloadGeneration = (w.reloadGeneration || 0) + 1;
                     w.upgradeLevel = 0;
                 });
                 this.selectedWeapon = 0;
@@ -1402,6 +1409,14 @@
                         `;
                     }
                 }
+                if (this.skinPerk?.type === 'emergencyReload') {
+                    const cooldown = Math.max(0, Math.ceil(((this.nextEmergencyReloadAt || 0) - now) / 1000));
+                    potionStatus.innerHTML += `
+                        <div class="skin-ability-icon ${cooldown ? 'cooldown' : 'ready'}" title="Night Stocker emergency reload">
+                            <kbd>B</kbd><span>${cooldown ? `${cooldown}s` : 'READY'}</span>
+                        </div>
+                    `;
+                }
                 return;
                 
                 if (this.activePotions.loot > 0) {
@@ -1868,7 +1883,6 @@
                 if (!weapon.owned || weapon.isReloading) return;
                 
                 if (weapon.currentAmmo <= 0) {
-                    if (this.tryEmergencyReload?.(weapon)) return;
                     this.reloadWeapon();
                     return;
                 }
@@ -1943,6 +1957,8 @@
                 const weapon = this.weapons[this.selectedWeapon];
                 if (!weapon || weapon.isReloading || weapon.currentAmmo === weapon.maxAmmo) return;
                 const reloadDuration = weapon.reloadTime * Math.pow(0.92, this.player.skillLevels.reloadSpeed);
+                const reloadGeneration = (weapon.reloadGeneration || 0) + 1;
+                weapon.reloadGeneration = reloadGeneration;
                 this.playSfx?.('reload');
                 
                 if (weapon.ammoCost) {
@@ -1950,6 +1966,7 @@
                     
                     weapon.isReloading = true;
                     setTimeout(() => {
+                        if (weapon.reloadGeneration !== reloadGeneration) return;
                         weapon.currentAmmo = weapon.maxAmmo;
                         this.player.reserveAmmo -= weapon.ammoCost;
                         weapon.isReloading = false;
@@ -1965,9 +1982,11 @@
                 
                 weapon.isReloading = true;
                 setTimeout(() => {
+                    if (weapon.reloadGeneration !== reloadGeneration) return;
                     weapon.currentAmmo += ammoToReload;
                     this.player.reserveAmmo -= ammoToReload;
                     weapon.isReloading = false;
+                    this.updateHUD();
                 }, reloadDuration);
             },
             
