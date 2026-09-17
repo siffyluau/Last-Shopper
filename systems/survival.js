@@ -217,6 +217,9 @@
                 this.showWaveStatus('MAGAZINE ALREADY FULL', 1000);
                 return false;
             }
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'emergencyReload', weaponId: weapon.id });
+            }
             weapon.reloadGeneration = (weapon.reloadGeneration || 0) + 1;
             weapon.currentAmmo = weapon.maxAmmo;
             weapon.isReloading = false;
@@ -432,6 +435,7 @@
                 escortsToSpawn: this.escortsToSpawn,
                 currentWavePlan: this.currentWavePlan,
                 techTier: this.techTier,
+                workbenchLevel: this.workbench?.workbenchLevel || 1,
                 preparationActive: this.preparationActive,
                 preparationEndsIn: this.preparationActive ? Math.max(0, this.preparationEndsAt - performance.now()) : 0,
                 preparationEvent: this.preparationEvent,
@@ -551,6 +555,7 @@
             this.escortsToSpawn = world.escortsToSpawn || 0;
             this.currentWavePlan = world.currentWavePlan || this.currentWavePlan;
             this.techTier = world.techTier || this.techTier;
+            if (world.workbenchLevel) this.workbench.workbenchLevel = world.workbenchLevel;
             this.bossDefeats = world.bossDefeats || 0;
             this.killRewards = world.killRewards || [];
             this.preparationActive = Boolean(world.preparationActive);
@@ -609,6 +614,8 @@
                         this.showWaveStatus?.('EMERGENCY LOSS: owned turrets scrapped / 20% cash lost', 3800);
                     }
                     this.player.emergencyRespawns = emergencyRespawns;
+                    this.player.lifePurchases = localServerPlayer.lifePurchases || 0;
+                    this.player.eliminated = Boolean(localServerPlayer.eliminated);
                     this.player.health = localServerPlayer.health ?? this.player.health;
                     this.player.maxHealth = localServerPlayer.maxHealth ?? this.player.maxHealth;
                     this.player.downed = Boolean(localServerPlayer.downed);
@@ -727,6 +734,8 @@
 
         applyServerWorldSnapshot: function (world) {
             const receivedAt = performance.now();
+            const previousTechTier = this.techTier;
+            const previousWorkbenchLevel = this.workbench?.workbenchLevel || 1;
             if (this.lastNetworkSnapshotAt) {
                 const gap = receivedAt - this.lastNetworkSnapshotAt;
                 this.networkSnapshotGap = this.networkSnapshotGap ? this.networkSnapshotGap * 0.8 + Math.min(gap, 400) * 0.2 : gap;
@@ -738,6 +747,7 @@
             const wasDowned = Boolean(this.player.downed);
             const has = (field) => world[field] !== undefined;
             if (has('serverTime')) this.serverTime = world.serverTime;
+            if (has('serverPerf') && world.serverPerf) this.serverPerformance = world.serverPerf;
             if (has('dayTime') && Number.isFinite(world.dayTime)) {
                 this.dayTime = world.dayTime;
                 if (!Number.isFinite(this.visualDayTime)) this.visualDayTime = this.dayTime;
@@ -747,9 +757,11 @@
                 this.setMultiplayerStatus(world.wave > 0 ? 'Joining active game...' : 'Host starting game...', 'online');
                 this.enterGameFromLobby();
             }
+            if (has('gameOver') && world.gameOver && !this.gameOver) this.triggerGameOver(true);
             for (const field of ['wave', 'zombiesKilled', 'totalZombiesInWave', 'bossesToSpawn', 'miniBossesToSpawn', 'escortsToSpawn', 'techTier', 'bossDefeats']) {
                 if (has(field) && world[field] !== null) this[field] = world[field];
             }
+            if (has('workbenchLevel') && world.workbenchLevel) this.workbench.workbenchLevel = world.workbenchLevel;
             if (has('waveActive')) this.waveActive = Boolean(world.waveActive);
             if (has('currentWavePlan') && world.currentWavePlan) {
                 const localPlan = progression.wavePlan(world.currentWavePlan.wave || this.wave || 1);
@@ -765,7 +777,10 @@
             if (has('mapSeed') && world.mapSeed) this.mapSeed = world.mapSeed;
 
             this.mergeServerList('zombies', world.zombies, { interpolate: true });
-            this.mergeServerList('bullets', world.bullets, { extrapolate: true });
+            this.mergeServerList('bullets', world.bullets, {
+                extrapolate: true,
+                onMerge: (entity, entry) => this.reconcilePredictedProjectile(entity, entry)
+            });
             const now = performance.now();
             this.mergeServerList('sentries', world.sentries, {
                 idField: 'networkId',
@@ -814,6 +829,11 @@
 
             if (world.events) this.applyServerEvents(world.events);
 
+            if (this.workbenchOpen && (this.techTier !== previousTechTier || this.workbench.workbenchLevel !== previousWorkbenchLevel)) {
+                this.populateWorkbench();
+            }
+            if (this.traderOpen && has('trader')) this.populateTrader();
+
             this.updateDownedUi();
             if (!wasDowned && this.player.downed) this.playSfx?.('downed');
             if (wasDowned && !this.player.downed) this.playSfx?.('revive');
@@ -827,6 +847,29 @@
             }
             if (local.health !== undefined) this.player.health = local.health;
             if (local.maxHealth !== undefined) this.player.maxHealth = local.maxHealth;
+            if (local.baseMaxHealth !== undefined) this.player.baseMaxHealth = local.baseMaxHealth;
+            for (const field of ['money', 'wood', 'metal', 'reserveAmmo', 'rareTurretParts', 'xp', 'xpToNext', 'level', 'skillPoints', 'lifePurchases']) {
+                if (local[field] !== undefined && local[field] !== null) this.player[field] = local[field];
+            }
+            if (local.skillLevels) this.player.skillLevels = { ...this.player.skillLevels, ...local.skillLevels };
+            if (local.runUpgradeCounts) this.runUpgradeCounts = { ...local.runUpgradeCounts };
+            if (local.upgrades) this.upgrades = { ...this.upgrades, ...local.upgrades };
+            if (local.moveSpeedMultiplier !== undefined) this.player.speed = 4 * local.moveSpeedMultiplier;
+            if (local.reloadSpeedMultiplier !== undefined) this.player.reloadSpeedMultiplier = local.reloadSpeedMultiplier;
+            if (local.resourceMultiplier !== undefined) this.player.resourceMultiplier = local.resourceMultiplier;
+            if (local.potionExpiries) {
+                const clientNow = performance.now();
+                const serverNow = this.serverTime || Date.now();
+                for (const key of Object.keys(this.activePotions || {})) {
+                    const expiresAt = Number(local.potionExpiries[key]) || 0;
+                    this.activePotions[key] = expiresAt > serverNow ? clientNow + expiresAt - serverNow : 0;
+                }
+            }
+            if (local.nextEmergencyReloadAt !== undefined) {
+                const remaining = Math.max(0, local.nextEmergencyReloadAt - (this.serverTime || Date.now()));
+                this.nextEmergencyReloadAt = performance.now() + remaining;
+            }
+            if (local.weapons) this.applyAuthoritativeWeapons(local.weapons);
             this.player.downed = Boolean(local.downed);
             this.player.downedAt = local.downedAt || 0;
             this.player.respawnAt = local.respawnAt || 0;
@@ -834,6 +877,46 @@
             this.player.reviveProgress = local.reviveProgress || 0;
             this.player.reviverId = local.reviverId || null;
             this.player.emergencyRespawns = local.emergencyRespawns || 0;
+            this.player.eliminated = Boolean(local.eliminated);
+            const uiSignature = JSON.stringify([
+                this.player.money, this.player.wood, this.player.metal, this.player.reserveAmmo,
+                this.player.rareTurretParts, this.player.xp, this.player.xpToNext, this.player.level,
+                this.player.skillPoints, this.player.maxHealth, this.player.skillLevels, this.runUpgradeCounts,
+                this.player.lifePurchases, this.upgrades, local.weapons
+            ]);
+            if (uiSignature !== this.lastAuthoritativeUiSignature) {
+                this.lastAuthoritativeUiSignature = uiSignature;
+                this.updateHUD?.();
+                this.updateWeaponUI?.();
+                if (this.skillsOpen) this.populateSkills();
+                if (this.workbenchOpen) this.populateWorkbench();
+                if (this.shopOpen) this.populateShop();
+                if (this.traderOpen) this.populateTrader();
+                if (this.buildingOpen) this.populateBuilding();
+            }
+        },
+
+        applyAuthoritativeWeapons: function (serverWeapons) {
+            const byId = new Map(serverWeapons.map((weapon) => [weapon.id, weapon]));
+            const deepPockets = this.runUpgradeCounts?.deepPockets || 0;
+            for (const weapon of this.weapons) {
+                const state = byId.get(weapon.id);
+                const base = content.weaponTypes.find((entry) => entry.id === weapon.id);
+                if (!state || !base) continue;
+                const level = Math.max(0, Math.min(5, Number(state.upgradeLevel) || 0));
+                let maxAmmo = base.maxAmmo;
+                for (let index = 0; index < level; index++) maxAmmo += Math.max(1, Math.ceil(maxAmmo * 0.12));
+                for (let index = 0; index < deepPockets; index++) maxAmmo += Math.max(1, Math.floor(maxAmmo * 0.2));
+                weapon.owned = Boolean(state.owned);
+                weapon.upgradeLevel = level;
+                weapon.damage = base.damage * Math.pow(1.18, level);
+                weapon.fireRate = base.fireRate * Math.pow(0.92, level);
+                weapon.reloadTime = base.reloadTime * Math.pow(0.92, level);
+                weapon.bulletSize = (base.bulletSize || 4) + level * 0.4;
+                weapon.maxAmmo = maxAmmo;
+                if (state.currentAmmo !== undefined) weapon.currentAmmo = Math.max(0, Math.min(maxAmmo, state.currentAmmo));
+            }
+            if (!this.weapons[this.selectedWeapon]?.owned) this.selectedWeapon = Math.max(0, this.weapons.findIndex((weapon) => weapon.owned));
         },
 
         reconcileLocalPosition: function (serverPlayer) {
@@ -907,6 +990,24 @@
             }
         },
 
+        reconcilePredictedProjectile: function (entity, entry) {
+            if (!entry?.shotId || !this.predictedProjectiles?.length) return;
+            const pelletIndex = Number.isFinite(entry.pelletIndex) ? entry.pelletIndex : 0;
+            const predictedIndex = this.predictedProjectiles.findIndex((projectile) =>
+                projectile.shotId === entry.shotId
+                && (Number.isFinite(projectile.pelletIndex) ? projectile.pelletIndex : 0) === pelletIndex);
+            if (predictedIndex < 0) return;
+            const predicted = this.predictedProjectiles[predictedIndex];
+            entity.x = predicted.x;
+            entity.y = predicted.y;
+            entity.networkUpdatedAt = performance.now();
+            entity.reconciledPrediction = true;
+            this.predictedProjectiles.splice(predictedIndex, 1);
+            if (this.performanceDebug) {
+                console.debug(`[shot:${entry.shotId}] authoritative projectile ${entry.id || entity.id} reconciled`);
+            }
+        },
+
         applyServerEvents: function (events) {
             if (!events || !events.length) return;
             if (!this.appliedServerEvents) this.appliedServerEvents = new Set();
@@ -929,14 +1030,7 @@
             const me = this.localPlayerId;
             if (event.kind === 'killReward') {
                 const mine = !event.ownerId || event.ownerId === me;
-                const share = mine ? 1 : 0.5;
-                const multiplier = this.getResourceMultiplier();
-                this.player.money += Math.max(1, Math.floor((event.money || 0) * share * multiplier));
-                this.gainXp(Math.max(1, Math.floor((event.xp || 0) * share)));
-                if (mine) {
-                    this.player.rareTurretParts += event.parts || 0;
-                    this.recordKill({ type: event.zombieType, isBoss: Boolean(event.boss) });
-                }
+                if (mine) this.recordKill({ type: event.zombieType, isBoss: Boolean(event.boss) });
                 if (Number.isFinite(event.x) && this.isOnScreen(event.x, event.y, 60)) {
                     this.createDeath({ x: event.x, y: event.y });
                     if (event.boss || event.miniBoss) this.addCameraShake?.(event.boss ? 10 : 5);
@@ -945,13 +1039,6 @@
             }
             if (event.kind === 'loot') {
                 if (event.playerId !== me) return;
-                const multiplier = this.getResourceMultiplier();
-                const amount = event.amount || 1;
-                if (event.type === 'money') this.player.money += Math.floor(amount * multiplier);
-                else if (event.type === 'wood') this.player.wood += Math.max(1, Math.round(amount * multiplier));
-                else if (event.type === 'metal') this.player.metal += Math.max(1, Math.round(amount * multiplier));
-                else if (event.type === 'ammo') this.player.reserveAmmo += amount;
-                // medkits are applied by the server to our health directly
                 this.playSfx?.('pickup');
                 return;
             }
@@ -960,7 +1047,11 @@
                 return;
             }
             if (event.kind === 'shot') {
-                if (event.shooterId === me || !this.spawnPredictedShot) return;
+                if (this.performanceDebug) console.debug(`[shot:${event.shotId || event.id}] authoritative event`);
+                if (event.shooterId === me) return;
+                if (!this.spawnPredictedShot) return;
+                const alreadyAuthoritative = event.shotId && this.bullets?.some((bullet) => bullet.shotId === event.shotId);
+                if (alreadyAuthoritative) return;
                 const weapon = this.weapons.find((entry) => entry.id === event.weaponId) || {};
                 this.spawnPredictedShot({
                     ...weapon,
@@ -969,35 +1060,50 @@
                     pellets: event.pellets ?? weapon.pellets ?? 0,
                     bulletSize: event.bulletSize || weapon.bulletSize || 4,
                     explosive: event.explosive ?? weapon.explosive
-                }, event.angle, { x: event.x, y: event.y });
+                }, event.angle, { x: event.x, y: event.y }, event.shotId, event.shooterId);
+                return;
+            }
+            if (event.kind === 'shotRejected') {
+                if (event.shooterId !== me || !event.shotId) return;
+                this.predictedProjectiles = (this.predictedProjectiles || []).filter((projectile) => projectile.shotId !== event.shotId);
+                if (this.performanceDebug) console.debug(`[shot:${event.shotId}] rejected`);
                 return;
             }
             if (event.kind === 'buildRejected') {
-                const cost = this.pendingBuildCosts?.get(event.networkId);
-                if (cost) {
-                    refundCost(this.player, cost);
-                    this.pendingBuildCosts.delete(event.networkId);
-                }
-                this.showPlacementError?.(event.reason || 'Placement rejected. Resources refunded.');
+                this.pendingBuildCosts?.delete(event.networkId);
+                this.showPlacementError?.(event.reason || 'Placement rejected by the server.');
                 this.updateHUD();
                 return;
             }
             if (event.kind === 'actionRejected') {
-                const key = `${event.action}:${event.networkId}`;
-                const pending = this.pendingActionCosts?.get(key);
-                if (pending && pending.length) {
-                    refundCost(this.player, pending.shift());
-                    if (!pending.length) this.pendingActionCosts.delete(key);
+                if (event.action === 'build' && /resource|material|tier|support station/i.test(event.reason || '')) {
+                    this.cancelPlacing?.();
                 }
-                this.showWaveStatus?.(event.reason || 'Action rejected. Cost refunded.', 1800);
+                this.showWaveStatus?.(event.reason || 'Action rejected by the server.', 1800);
                 this.updateHUD();
                 return;
             }
             if (event.kind === 'respawned') {
                 if (event.emergency) {
-                    this.player.money = Math.floor(this.player.money * 0.8);
-                    this.showWaveStatus?.('EMERGENCY LOSS: owned turrets scrapped / 20% cash lost', 3800);
+                    this.showWaveStatus?.(`EMERGENCY REVIVE: ${event.remaining ?? 0}/${event.limit ?? this.getEmergencyReviveLimit()} remaining / turrets scrapped / 20% cash lost`, 3800);
                 }
+                return;
+            }
+            if (event.kind === 'healed') {
+                this.showWaveStatus?.(`${event.source || 'Healing'}: +${event.amount || 0} HP`, 1800);
+                return;
+            }
+            if (event.kind === 'waveReturn') {
+                this.showWaveStatus?.('Back on your feet for the new wave.', 2200);
+                return;
+            }
+            if (event.kind === 'playerEliminated') {
+                if (event.playerId === me) this.showWaveStatus?.('ELIMINATED: you will return next wave if the team survives.', 4200);
+                else this.showWaveStatus?.('A teammate is out until the next wave.', 2600);
+                return;
+            }
+            if (event.kind === 'gameOver') {
+                if (!this.gameOver) this.triggerGameOver(true);
                 return;
             }
             if (event.kind === 'supplyCollected') {
@@ -1007,12 +1113,12 @@
                     return;
                 }
                 const rewards = event.rewards || {};
-                this.player.money += rewards.money || 0;
-                this.player.wood += rewards.wood || 0;
-                this.player.metal += rewards.metal || 0;
-                this.player.reserveAmmo += rewards.ammo || 0;
                 this.showWaveStatus(`Supplies secured: +${rewards.money || 0}, +${rewards.wood || 0} wood, +${rewards.metal || 0} metal, +${rewards.ammo || 0} ammo`);
                 this.updateHUD();
+                return;
+            }
+            if (event.kind === 'progressionNotice') {
+                this.showWaveStatus?.(event.message || 'Progression updated.', 1500);
             }
         },
 
@@ -1025,30 +1131,13 @@
         },
 
         requestHeal: function (amount) {
-            if (!this.multiplayer?.serverAuthoritative) return false;
-            const clean = Math.max(1, Math.min(250, Math.floor(amount || 0)));
-            this.multiplayer.sendAction({ kind: 'heal', amount: clean });
-            return true;
+            // Valid multiplayer healing is granted by the server through level-ups, loot, potions, and revives.
+            return false;
         },
 
         sendPaidAction: function (action, cost) {
             if (!this.multiplayer?.serverAuthoritative) return false;
-            if (cost) {
-                if (!hasCost(this.player, cost)) return false;
-                payCost(this.player, cost);
-                if (!this.pendingActionCosts) this.pendingActionCosts = new Map();
-                const key = `${action.kind}:${action.networkId}`;
-                const pending = this.pendingActionCosts.get(key) || [];
-                pending.push(cost);
-                this.pendingActionCosts.set(key, pending);
-                setTimeout(() => {
-                    const list = this.pendingActionCosts?.get(key);
-                    if (list && list.includes(cost)) {
-                        list.splice(list.indexOf(cost), 1);
-                        if (!list.length) this.pendingActionCosts.delete(key);
-                    }
-                }, 4000);
-            }
+            if (cost && !hasCost(this.player, cost)) return false;
             this.multiplayer.sendAction(action);
             if (this.workbenchOpen) setTimeout(() => { if (this.workbenchOpen) this.populateWorkbench(); }, 180);
             this.updateHUD();
@@ -1065,11 +1154,19 @@
         getNearbyDownedTeammate: function () {
             let nearest = null;
             for (const teammate of this.remotePlayers || []) {
-                if (!teammate.downed) continue;
+                if (!teammate.downed || teammate.eliminated) continue;
                 const distance = this.dist(this.player.x, this.player.y, teammate.x, teammate.y);
                 if (distance <= 78 && (!nearest || distance < nearest.distance)) nearest = { ...teammate, distance };
             }
             return nearest;
+        },
+
+        getEmergencyReviveLimit: function () {
+            return 5 + Math.max(0, Math.floor(Number(this.player.lifePurchases) || 0));
+        },
+
+        getLifePurchaseCost: function () {
+            return Math.round(10000 * Math.pow(1.5, Math.max(0, Math.floor(Number(this.player.lifePurchases) || 0))));
         },
 
         requestReviveTick: function (targetId) {
@@ -1085,8 +1182,11 @@
                 this.keys = {};
                 this.mouse.isDown = false;
                 this.updateDownedUi();
-                if (!this.multiplayer?.serverAuthoritative && this.player.respawnAt && Date.now() >= this.player.respawnAt) {
-                    this.reviveLocalPlayer();
+                if (!this.multiplayer?.serverAuthoritative && !this.player.eliminated
+                    && (this.player.emergencyRespawns || 0) >= this.getEmergencyReviveLimit()
+                    && this.player.giveUpAt && Date.now() >= this.player.giveUpAt) {
+                    this.player.eliminated = true;
+                    this.triggerGameOver();
                 }
                 return;
             }
@@ -1100,16 +1200,34 @@
                 downedOverlay.classList.remove('flex');
                 return;
             }
-            const seconds = Math.max(0, Math.ceil(((this.player.giveUpAt || this.player.respawnAt || Date.now()) - Date.now()) / 1000));
+            const limit = this.getEmergencyReviveLimit();
+            const used = Math.min(limit, this.player.emergencyRespawns || 0);
+            const remaining = Math.max(0, limit - used);
+            const emergencyReadyAt = this.player.respawnAt || 0;
+            const finalDeadline = this.player.giveUpAt || 0;
+            const seconds = Math.max(0, Math.ceil(((remaining > 0 ? emergencyReadyAt : finalDeadline) - Date.now()) / 1000));
             const progress = Math.min(100, ((this.player.reviveProgress || 0) / 2500) * 100);
-            downedStatus.textContent = this.player.reviverId
-                ? 'A teammate is pulling you back up. Stay with them.'
-                : 'A teammate can hold [E] beside you to revive.';
+            downedStatus.textContent = this.player.eliminated
+                ? 'You are out until the next wave. Your team must survive.'
+                : this.player.reviverId
+                    ? 'A teammate is pulling you back up. Stay with them.'
+                    : 'A teammate can hold [E] beside you to revive.';
             reviveProgress.style.width = `${progress}%`;
-            downedRespawnText.textContent = seconds > 0
-                ? `Emergency shop recovery available in ${seconds}s.`
-                : 'Emergency recovery is ready.';
-            respawnButton.disabled = seconds > 0;
+            if (this.player.eliminated) {
+                downedRespawnText.textContent = 'No recovery available this wave.';
+                respawnButton.textContent = 'OUT UNTIL NEXT WAVE';
+                respawnButton.disabled = true;
+            } else if (remaining > 0) {
+                downedRespawnText.textContent = seconds > 0
+                    ? `Emergency revive ready in ${seconds}s. ${remaining} of ${limit} remaining.`
+                    : `Emergency revive ready. ${remaining} of ${limit} remaining.`;
+                respawnButton.textContent = `Use Emergency Revive (${remaining}/${limit})`;
+                respawnButton.disabled = seconds > 0;
+            } else {
+                downedRespawnText.textContent = `Emergency revives exhausted. Teammates have ${seconds}s to revive you.`;
+                respawnButton.textContent = 'NO EMERGENCY REVIVES';
+                respawnButton.disabled = true;
+            }
             downedOverlay.classList.remove('hidden');
             downedOverlay.classList.add('flex');
         },
@@ -1118,21 +1236,31 @@
             if (this.player.downed) return;
             this.player.health = 0;
             this.player.downed = true;
+            this.player.eliminated = false;
             this.player.downedAt = Date.now();
-            this.player.respawnAt = Date.now() + 6000;
+            if ((this.player.emergencyRespawns || 0) < this.getEmergencyReviveLimit()) {
+                this.player.respawnAt = Date.now() + 6000;
+                this.player.giveUpAt = 0;
+            } else {
+                this.player.respawnAt = 0;
+                this.player.giveUpAt = Date.now() + 60000;
+            }
             this.player.reviveProgress = 0;
             this.updateDownedUi();
             if (this.playSfx) this.playSfx('downed');
         },
 
         reviveLocalPlayer: function () {
+            if (!this.player.downed || this.player.eliminated || (this.player.emergencyRespawns || 0) >= this.getEmergencyReviveLimit()) return;
             this.sentries = this.sentries.filter((sentry) => sentry.ownerId && sentry.ownerId !== this.localPlayerId);
             this.player.money = Math.floor(this.player.money * 0.8);
             this.player.emergencyRespawns = (this.player.emergencyRespawns || 0) + 1;
             this.player.health = Math.max(45, Math.ceil(this.player.maxHealth * 0.45));
             this.player.downed = false;
+            this.player.eliminated = false;
             this.player.downedAt = 0;
             this.player.respawnAt = 0;
+            this.player.giveUpAt = 0;
             this.player.reviveProgress = 0;
             this.player.x = this.shop.interactionX;
             this.player.y = this.shop.interactionY + 70;
@@ -1142,7 +1270,8 @@
         },
 
         requestRespawn: function () {
-            if (!this.player.downed) return;
+            if (!this.player.downed || this.player.eliminated || (this.player.emergencyRespawns || 0) >= this.getEmergencyReviveLimit()) return;
+            if (this.player.respawnAt && Date.now() < this.player.respawnAt) return;
             if (this.multiplayer?.serverAuthoritative) {
                 this.multiplayer.sendAction({ kind: 'requestRespawn' });
             } else {
@@ -1231,7 +1360,7 @@
 
         drawNavigationHud: function () {
             const enemies = this.zombies || [];
-            if (!this.gameStarted || !enemies.length || this.player.downed) return;
+            if (!this.gameStarted || this.player.downed) return;
 
             const radarX = 18;
             const radarY = 18;
@@ -1255,6 +1384,25 @@
             ctx.moveTo(radarX + 7, radarY + center);
             ctx.lineTo(radarX + radarSize - 7, radarY + center);
             ctx.stroke();
+
+            const baseX = this.shop?.interactionX ?? this.shop?.x ?? 980;
+            const baseY = this.shop?.interactionY ?? this.shop?.y ?? 720;
+            const baseDx = baseX - this.player.x;
+            const baseDy = baseY - this.player.y;
+            const baseDistance = Math.hypot(baseDx, baseDy);
+            const baseScale = Math.min(1, baseDistance / radarRange);
+            const baseAngle = Math.atan2(baseDy, baseDx);
+            const basePx = radarX + center + Math.cos(baseAngle) * baseScale * (center - 11);
+            const basePy = radarY + center + Math.sin(baseAngle) * baseScale * (center - 11);
+            ctx.save();
+            ctx.translate(basePx, basePy);
+            ctx.rotate(Math.PI / 4);
+            ctx.fillStyle = '#f59e0b';
+            ctx.strokeStyle = '#fff7ed';
+            ctx.lineWidth = 1.5;
+            ctx.fillRect(-5, -5, 10, 10);
+            ctx.strokeRect(-5, -5, 10, 10);
+            ctx.restore();
 
             for (const enemy of enemies) {
                 const dx = enemy.x - this.player.x;
@@ -1282,7 +1430,7 @@
             ctx.fillStyle = '#a8a29e';
             ctx.font = '700 10px "Chakra Petch"';
             ctx.textAlign = 'left';
-            ctx.fillText(`THREAT RADAR  ${enemies.length}`, radarX + 7, radarY + radarSize + 15);
+            ctx.fillText(`BASE ◆  THREATS ${enemies.length}`, radarX + 7, radarY + radarSize + 15);
             ctx.restore();
 
             if (enemies.length !== 1) return;
@@ -1364,8 +1512,9 @@
             });
         },
 
-        broadcastShotAction: function (weapon, angle) {
+        broadcastShotAction: function (weapon, angle, shotId = null) {
             if (!this.multiplayer || !this.multiplayer.roomCode || this.isWorldHost()) return;
+            if (this.performanceDebug && shotId) console.debug(`[shot:${shotId}] websocket request`);
             if (!this.multiplayer.serverAuthoritative) {
                 this.multiplayer.sendAction({
                     kind: 'shot',
@@ -1385,7 +1534,8 @@
                         explosive: weapon.explosive,
                         bulletSize: weapon.bulletSize,
                         pierce: weapon.pierce
-                    }
+                    },
+                    shotId
                 });
                 return;
             }
@@ -1393,8 +1543,10 @@
                 kind: 'shot',
                 weapon: { id: weapon.id },
                 origin: { x: this.player.x, y: this.player.y },
+                direction: { x: Math.cos(angle), y: Math.sin(angle) },
                 angle,
-                clientTime: performance.now()
+                clientShotTime: performance.now(),
+                shotId
             });
         },
 
@@ -1402,6 +1554,13 @@
             if (!packet || !packet.action) return;
             const action = packet.action;
             if (action.kind === 'startGame') {
+                const validStarter = this.multiplayer?.serverAuthoritative
+                    ? packet.id === 'server'
+                    : packet.id === this.multiplayer?.roomHostId || (this.isRoomHost && packet.id === this.localPlayerId);
+                if (!validStarter) {
+                    this.setMultiplayerStatus('Waiting for host to start...', 'offline');
+                    return;
+                }
                 this.setMultiplayerStatus('Host starting game...', 'online');
                 this.enterGameFromLobby();
                 return;
@@ -2670,6 +2829,25 @@
             ctx.textBaseline = 'middle';
             ctx.fillText('SHOP', shop.x, top - 12);
 
+            const beaconPulse = 0.72 + Math.sin(performance.now() / 260) * 0.18;
+            ctx.strokeStyle = `rgba(249,115,22,${beaconPulse})`;
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(shop.x, top - 34);
+            ctx.lineTo(shop.x, top - 112);
+            ctx.stroke();
+            ctx.fillStyle = '#f59e0b';
+            ctx.beginPath();
+            ctx.moveTo(shop.x, top - 126);
+            ctx.lineTo(shop.x + 11, top - 112);
+            ctx.lineTo(shop.x, top - 98);
+            ctx.lineTo(shop.x - 11, top - 112);
+            ctx.closePath();
+            ctx.fill();
+            ctx.fillStyle = '#fff7ed';
+            ctx.font = '900 11px "Chakra Petch"';
+            ctx.fillText('MAIN BASE', shop.x, top - 139);
+
             ctx.fillStyle = '#fef3c7';
             ctx.shadowColor = '#f97316';
             ctx.shadowBlur = 12;
@@ -3327,6 +3505,11 @@
             if (!definition || this.player.skillPoints <= 0) return;
             if (this.player.skillLevels[id] >= definition.max) return;
 
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'buySkill', skillId: id });
+                return;
+            }
+
             this.player.skillPoints--;
             this.player.skillLevels[id]++;
             if (id === 'maxHealth') {
@@ -3338,6 +3521,7 @@
                 this.player.speed *= 1.05;
             }
             this.populateSkills();
+            if (this.workbenchOpen) this.populateWorkbench();
             this.updateHUD();
         },
 
@@ -3354,9 +3538,11 @@
             const money = Math.floor(reward.money * multiplier * teamScale);
             const wood = Math.max(1, Math.round(reward.wood * multiplier * teamScale));
             const metal = Math.max(1, Math.round(reward.metal * multiplier * teamScale));
-            this.player.money += money;
-            this.player.wood += wood;
-            this.player.metal += metal;
+            if (!this.multiplayer?.serverAuthoritative) {
+                this.player.money += money;
+                this.player.wood += wood;
+                this.player.metal += metal;
+            }
             this.metaProgression.highestWave = Math.max(this.metaProgression.highestWave || 0, this.wave);
             this.updateLobbyMeta();
             this.populateSkinList();
@@ -3365,7 +3551,7 @@
             this.mouse.isDown = false;
 
             const previousTier = this.techTier;
-            this.techTier = Math.max(this.techTier, progression.unlockedTechForWave(this.wave));
+            if (!this.multiplayer?.serverAuthoritative) this.techTier = Math.max(this.techTier, progression.unlockedTechForWave(this.wave));
             const unlockedTier = this.techTier > previousTier;
             const rewardText = `Wave ${this.wave} cleared: +$${money}, +${wood} wood, +${metal} metal`;
             const tierText = unlockedTier ? `Tech Tier ${roman(this.techTier)} unlocked` : '';
@@ -3383,12 +3569,11 @@
         applyRunUpgrade: function (id) {
             const upgrade = content.runUpgrades.find((entry) => entry.id === id);
             if (!upgrade) return null;
-            this.runUpgradeCounts[id] = (this.runUpgradeCounts[id] || 0) + 1;
-
-            if (this.multiplayer?.serverAuthoritative && ['turretCore', 'fortify', 'longShot', 'fieldRepair'].includes(id)) {
+            if (this.multiplayer?.serverAuthoritative) {
                 this.multiplayer.sendAction({ kind: 'runUpgrade', id });
                 return upgrade;
             }
+            this.runUpgradeCounts[id] = (this.runUpgradeCounts[id] || 0) + 1;
             if (id === 'vitality') {
                 this.player.baseMaxHealth += 25;
                 this.player.maxHealth += 25;
@@ -3647,6 +3832,11 @@
 
         ensureTraderStock: function () {
             const eventId = this.trader?.id || `trader-wave-${this.wave + 1}`;
+            if (this.multiplayer?.serverAuthoritative && this.trader?.stock) {
+                this.traderStockEventId = eventId;
+                this.traderStock = this.trader.stock;
+                return;
+            }
             if (this.traderStockEventId === eventId && this.traderStock) return;
             this.traderStockEventId = eventId;
             this.traderStock = { wood: 3, metal: 3, ammo: 3, repairs: 2, parts: 1, small: 2, medium: 2, large: 1, full: 1 };
@@ -3692,6 +3882,10 @@
             }
             const cost = this.getAmmoPackCost(pack, discount);
             if (!hasCost(this.player, cost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'buyAmmoPack', packId: id, source });
+                return;
+            }
             payCost(this.player, cost);
             if (source === 'trader') this.traderStock[id]--;
             this.player.reserveAmmo += pack.ammo || 0;
@@ -3749,6 +3943,10 @@
             const cost = costs[id];
             this.ensureTraderStock();
             if (!cost || this.player.money < cost || (this.traderStock[id] || 0) <= 0) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'buyTraderItem', itemId: id });
+                return;
+            }
             this.player.money -= cost;
             this.traderStock[id]--;
             if (id === 'wood') this.player.wood += 12;
@@ -3790,14 +3988,15 @@
             if (building.id === 'potionHut') {
                 buildingContent.innerHTML = `<div class="potion-counter-head"><div><span class="window-kicker">MIXING COUNTER</span><h3>Choose a formula</h3></div>${infoTip('Potion effects are timed and appear as compact icons on the HUD.', 'Potion help')}</div>
                     <div class="potion-grid">${content.potionRecipes.map((recipe) => {
-                        const canAfford = hasCost(this.player, recipe.cost);
+                        const healthFull = recipe.type === 'instantHeal' && this.player.health >= this.player.maxHealth;
+                        const canAfford = !healthFull && hasCost(this.player, recipe.cost);
                         const duration = recipe.duration ? `${Math.round(recipe.duration / 1000)}S` : 'INSTANT';
                         return `<article class="potion-card potion-${recipe.type}">
                             <div class="potion-bottle" aria-hidden="true"><i></i></div>
                             <div class="potion-card-body"><span class="window-kicker">${duration}</span>
                             <div class="item-title-row"><div class="workbench-item-title">${recipe.name}</div>${infoTip(recipe.description, recipe.name)}</div>
                             <div class="workbench-cost-row">${costChips(this.player, recipe.cost)}</div>
-                            <button class="btn ${canAfford ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.buyPotionRecipe('${recipe.id}')">Mix</button></div>
+                            <button class="btn ${canAfford ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.buyPotionRecipe('${recipe.id}')">${healthFull ? 'Health Full' : 'Mix'}</button></div>
                         </article>`;
                     }).join('')}</div>`;
                 return;
@@ -3853,7 +4052,7 @@
             }
 
             if (building.id === 'advancedTurretBench') {
-                buildingContent.innerHTML = `<p class="window-copy">Installed effect: +2 turret cap and +2 turret upgrade cap while the station stands.</p>
+                buildingContent.innerHTML = `<p class="window-copy">Installed effect: unlocks the Gatling Turret, +2 turret cap, and +2 turret upgrade cap while standing.</p>
                     <article class="workbench-item workbench-upgrade">
                         <span class="window-kicker">SUPPORT BENCH</span>
                         <div class="workbench-item-title">Advanced Turret Tuning</div>
@@ -3863,7 +4062,7 @@
             }
 
             if (building.id === 'trapBench') {
-                buildingContent.innerHTML = `<p class="window-copy">Installed effect: +4 trap cap while the station stands.</p>
+                buildingContent.innerHTML = `<p class="window-copy">Installed effect: +8 trap cap and +2 reusable-trap upgrade cap while the station stands.</p>
                     <article class="workbench-item workbench-trap">
                         <span class="window-kicker">SUPPORT BENCH</span>
                         <div class="workbench-item-title">Trap Capacity Online</div>
@@ -3873,7 +4072,7 @@
             }
 
             if (building.id === 'powerRelay') {
-                buildingContent.innerHTML = `<p class="window-copy">Installed effect: all turrets gain 15% range and recover one round every three seconds while this relay has power.</p>
+                buildingContent.innerHTML = `<p class="window-copy">Installed effect: unlocks the Arc Turret; all turrets gain 15% range and recover one round every three seconds.</p>
                     <article class="workbench-item workbench-upgrade">
                         <span class="window-kicker">GRID ONLINE</span>
                         <div class="workbench-item-title">Defensive Power Network</div>
@@ -3883,7 +4082,7 @@
             }
 
             if (building.id === 'emergencyArmory') {
-                buildingContent.innerHTML = `<div class="potion-counter-head"><div><span class="window-kicker">TIER IV GRID</span><h3>Emergency Armory Online</h3></div>${infoTip('Every 1.8 seconds, each active turret recovers up to 6 rounds. This stacks with the Power Relay range bonus.', 'Armory effect')}</div>
+                buildingContent.innerHTML = `<div class="potion-counter-head"><div><span class="window-kicker">TIER IV GRID</span><h3>Emergency Armory Online</h3></div>${infoTip('Unlocks the Siege Mortar. Every 1.8 seconds, each active turret recovers up to 6 rounds. This stacks with the Power Relay range bonus.', 'Armory effect')}</div>
                     <article class="workbench-item workbench-upgrade"><span class="window-kicker">PASSIVE SUPPORT</span><div class="workbench-item-title">Rapid Turret Resupply</div><div class="workbench-cost-row"><span class="workbench-cost-item affordable">6 rounds / 1.8s</span></div></article>`;
             }
         },
@@ -3891,6 +4090,11 @@
         buyPotionRecipe: function (id) {
             const recipe = content.potionRecipes.find((entry) => entry.id === id);
             if (!recipe || !hasCost(this.player, recipe.cost)) return;
+            if (recipe.type === 'instantHeal' && this.player.health >= this.player.maxHealth) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'buyPotion', recipeId: id });
+                return;
+            }
             payCost(this.player, recipe.cost);
             const now = performance.now();
             if (recipe.type === 'instantHeal') {
@@ -3911,6 +4115,10 @@
             };
             const option = options[id];
             if (!option || !hasCost(this.player, option.cost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'buyAmmoForge', optionId: id });
+                return;
+            }
             payCost(this.player, option.cost);
             this.player.reserveAmmo += option.ammo || 0;
             this.player.rareTurretParts += option.parts || 0;
@@ -3928,6 +4136,10 @@
             if (!weapon || !weapon.owned || (weapon.upgradeLevel || 0) >= 5) return;
             const cost = this.getWeaponUpgradeCost(weapon);
             if (!hasCost(this.player, cost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'upgradeWeapon', weaponId: weapon.id });
+                return;
+            }
             payCost(this.player, cost);
             weapon.upgradeLevel = (weapon.upgradeLevel || 0) + 1;
             weapon.damage *= 1.18;
@@ -3948,14 +4160,33 @@
 
         getPlacementLimits: function () {
             const benchLevel = this.workbench?.workbenchLevel || 1;
-            const hasAdvancedBench = this.buildings.some((building) => building.id === 'advancedTurretBench');
-            const hasTrapBench = this.buildings.some((building) => building.id === 'trapBench');
+            const hasAdvancedBench = this.isBuildingOnline('advancedTurretBench');
+            const hasTrapBench = this.isBuildingOnline('trapBench');
             return {
                 turrets: 4 + benchLevel * 2 + (hasAdvancedBench ? 2 : 0),
                 walls: 18 + benchLevel * 10,
-                traps: 6 + benchLevel * 4 + (hasTrapBench ? 4 : 0),
+                traps: 6 + benchLevel * 4 + (hasTrapBench ? 8 : 0),
                 buildings: 9
             };
+        },
+
+        isBuildingOnline: function (id) {
+            return this.buildings.some((building) => building.id === id && (building.health === undefined || building.health > 0));
+        },
+
+        getRequiredBuildingName: function (id) {
+            return content.buildingTypes.find((building) => building.id === id)?.name || 'Support Station';
+        },
+
+        setPlacementHint: function (text, continuous = false) {
+            placingItemText.textContent = text;
+            if (placingItemHelp) {
+                placingItemHelp.textContent = continuous
+                    ? 'Click each location to keep building. Finish with the button or [ESC].'
+                    : 'Click to place. Press [ESC] to cancel.';
+            }
+            if (cancelPlacementButton) cancelPlacementButton.textContent = continuous ? 'FINISH BUILDING [ESC]' : 'CANCEL PLACEMENT [ESC]';
+            placingItemHint.classList.remove('hidden');
         },
 
         showPlacementError: function (message) {
@@ -4151,14 +4382,16 @@
                 .map((item, index) => ({ ...item, index }))
                 .filter((item) => item.techLevel <= bench.workbenchLevel)
                 .map((item) => {
-                    const canAfford = hasCost(this.player, item.cost);
+                    const stationReady = !item.requiredBuilding || this.isBuildingOnline(item.requiredBuilding);
+                    const canAfford = stationReady && hasCost(this.player, item.cost);
                     const limit = this.getPlacementLimits().turrets;
+                    const lockLabel = stationReady ? 'Fabricate Turret' : `Build ${this.getRequiredBuildingName(item.requiredBuilding)}`;
                     return `
                     <article class="workbench-item workbench-turret">
                         <span class="window-kicker">TURRET / TECH ${roman(item.techLevel)}</span>
-                        <div class="item-title-row"><div class="workbench-item-title">${item.name}</div>${infoTip(`Automated defense. ${item.damage}${item.pellets ? ' x' + item.pellets : ''} damage, ${item.range} range, ${item.maxAmmo} ammo. Current cap: ${this.sentries.length}/${limit}.`, item.name)}</div>
+                        <div class="item-title-row"><div class="workbench-item-title">${item.name}</div>${infoTip(`Automated defense. ${item.damage}${item.pellets ? ' x' + item.pellets : ''} damage, ${item.range} range, ${item.maxAmmo} ammo. Current cap: ${this.sentries.length}/${limit}.${item.requiredBuilding ? ` Requires ${this.getRequiredBuildingName(item.requiredBuilding)}.` : ''}`, item.name)}</div>
                         <div class="workbench-cost-row">${costChips(this.player, item.cost)}</div>
-                        <button class="btn ${canAfford ? 'btn-success' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.startPlacingSentry(${item.index})">Fabricate Turret</button>
+                        <button class="btn ${canAfford ? 'btn-success' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.startPlacingSentry(${item.index})">${lockLabel}</button>
                     </article>`;
                 }).join('');
 
@@ -4170,11 +4403,33 @@
                     return `
                     <article class="workbench-item workbench-trap">
                         <span class="window-kicker">TRAP / TECH ${roman(item.techLevel)}</span>
-                        <div class="item-title-row"><div class="workbench-item-title">${item.name}</div>${infoTip(`${item.damage} burst damage. One-use floor control. Current cap: ${this.traps.length}/${this.getPlacementLimits().traps}.`, item.name)}</div>
+                        <div class="item-title-row"><div class="workbench-item-title">${item.name}</div>${infoTip(`${item.damage} damage per trigger. Square ${item.radius * 2} x ${item.radius * 2} control zone with ${item.maxUses || 10} uses. Current cap: ${this.traps.length}/${this.getPlacementLimits().traps}.`, item.name)}</div>
                         <div class="workbench-cost-row">${costChips(this.player, item.cost)}</div>
                         <button class="btn ${canAfford ? 'btn-success' : 'btn-secondary opacity-50'}" ${canAfford ? '' : 'disabled'} onclick="game.startPlacingTrap(${item.index})">Craft Trap</button>
                     </article>`;
                 }).join('');
+
+            const placedTrapHtml = this.traps.length ? this.traps.map((trap, index) => {
+                const levels = trap.upgradeLevels || { damage: 0, radius: 0, uses: 0 };
+                const cap = this.getTrapUpgradeCap(bench);
+                return `
+                    <article class="turret-upgrade-card trap-upgrade-card">
+                        <header class="turret-upgrade-header">
+                            <div><span class="window-kicker">PLACED TRAP / OWNER ${trap.ownerName || 'P1'}</span><h3>${trap.name} #${index + 1}</h3></div>
+                            <b>${Math.max(0, trap.usesRemaining ?? trap.maxUses ?? 10)} / ${trap.maxUses || 10} USES</b>
+                        </header>
+                        <div class="turret-stat-row">
+                            <span>Damage <strong>${Math.ceil(trap.damage || 0)}</strong></span>
+                            <span>Square Radius <strong>${Math.ceil(trap.radius || 0)}</strong></span>
+                            <span>Upgrade Cap <strong>${cap}</strong></span>
+                        </div>
+                        <div class="turret-upgrade-grid">
+                            ${this.trapUpgradeButton(trap.networkId || index, 'damage', levels.damage || 0, cap)}
+                            ${this.trapUpgradeButton(trap.networkId || index, 'radius', levels.radius || 0, cap)}
+                            ${this.trapUpgradeButton(trap.networkId || index, 'uses', levels.uses || 0, cap)}
+                        </div>
+                    </article>`;
+            }).join('') : '<p class="workbench-empty">No traps placed. Craft one to tune its damage, square radius, and charges.</p>';
 
             const turretUpgradeHtml = this.sentries.length ? this.sentries.map((sentry, index) => {
                 const levels = sentry.upgradeLevels || { damage: 0, fireRate: 0, range: 0, ammo: 0 };
@@ -4281,6 +4536,11 @@
                     </article>`;
             }).join('');
 
+            const lifeLimit = this.getEmergencyReviveLimit();
+            const livesRemaining = Math.max(0, lifeLimit - (this.player.emergencyRespawns || 0));
+            const lifeCost = this.getLifePurchaseCost();
+            const lifeUnlocked = this.techTier >= 3 && bench.workbenchLevel >= 3;
+            const canBuyLife = lifeUnlocked && this.player.money >= lifeCost;
             const repairHtml = `
                 <article class="workbench-item workbench-consumable">
                     <span class="window-kicker">GLOBAL REPAIR</span>
@@ -4294,6 +4554,17 @@
                     <div class="workbench-item-title">Bench Frame Repair</div>
                     <p class="workbench-item-desc">${Math.ceil(bench.health)} / ${Math.ceil(bench.maxHealth)} HP.</p>
                     <button class="btn btn-secondary" onclick="game.repairWorkbench()">Repair Workbench</button>
+                </article>
+                <article class="workbench-item workbench-upgrade">
+                    <span class="window-kicker">TECH III / RECOVERY CONTRACT</span>
+                    <div class="item-title-row"><div class="workbench-item-title">Buy One Emergency Life</div>${infoTip('Adds one permanent emergency revive to this run. The first costs $10,000 and each later contract costs 50% more.', 'Life Contract')}</div>
+                    <div class="turret-stat-row">
+                        <span>Available <strong>${livesRemaining}</strong></span>
+                        <span>Run Limit <strong>${lifeLimit}</strong></span>
+                        <span>Purchased <strong>${this.player.lifePurchases || 0}</strong></span>
+                    </div>
+                    <div class="workbench-cost-row"><span class="workbench-cost-item ${this.player.money >= lifeCost ? 'affordable' : 'unaffordable'}">$${lifeCost.toLocaleString()}</span></div>
+                    <button class="btn ${canBuyLife ? 'btn-primary' : 'btn-secondary opacity-50'}" ${canBuyLife ? '' : 'disabled'} onclick="game.buyLife()">${lifeUnlocked ? `Buy Life - $${lifeCost.toLocaleString()}` : 'Requires Tech III + Bench L3'}</button>
                 </article>`;
 
             const skillHtml = content.skills.map((skill) => {
@@ -4310,7 +4581,7 @@
             const tabContent = {
                 turrets: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Turret Fabrication</h2><div class="workbench-grid">${turretCraftHtml}</div><h2 class="workbench-section-header">Turret Upgrades</h2>${turretUpgradeHtml}</section>`,
                 walls: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Wall Ladder</h2><div class="wall-tier-list">${wallTierHtml}</div><h2 class="workbench-section-header">Placed Wall Upgrades</h2>${placedWallHtml}</section>`,
-                traps: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Trap Crafting</h2><div class="workbench-grid">${trapCraftHtml}</div></section>`,
+                traps: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Trap Crafting</h2><div class="workbench-grid">${trapCraftHtml}</div><h2 class="workbench-section-header">Reusable Trap Tuning</h2>${placedTrapHtml}</section>`,
                 ammo: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Ammo Counter</h2>${this.getAmmoStoreHtml('workbench')}</section>`,
                 repairs: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Repair Counter</h2><div class="workbench-grid">${repairHtml}</div></section>`,
                 tech: `<section class="workbench-panel wide"><h2 class="workbench-section-header">Tech and Bench Upgrades</h2>${techHtml}</section>`,
@@ -4347,7 +4618,11 @@
         },
 
         getTurretUpgradeCap: function (bench = this.getActiveWorkbench()) {
-            return (bench?.workbenchLevel || 1) * 2 + (this.buildings.some((building) => building.id === 'advancedTurretBench') ? 2 : 0);
+            return (bench?.workbenchLevel || 1) * 2 + (this.isBuildingOnline('advancedTurretBench') ? 2 : 0);
+        },
+
+        getTrapUpgradeCap: function (bench = this.getActiveWorkbench()) {
+            return (bench?.workbenchLevel || 1) + (this.isBuildingOnline('trapBench') ? 2 : 0);
         },
 
         turretUpgradeButton: function (index, stat, level, cap) {
@@ -4361,6 +4636,19 @@
                 <span>${labels[stat]}</span>
                 <b>Lv ${level}/${cap}</b>
                 <small>${effects[stat]}</small>
+                <em>${maxed ? 'Maxed' : costLabel(cost)}</em>
+            </button>`;
+        },
+
+        trapUpgradeButton: function (index, stat, level, cap) {
+            const labels = { damage: 'Trigger Damage', radius: 'Square Radius', uses: 'Extra Charges' };
+            const effects = { damage: '+20% damage', radius: '+4 radius', uses: '+5 max and current uses' };
+            const maxed = level >= cap;
+            const cost = { money: 60 + level * 60, wood: 2 + level, metal: 2 + level * 2 };
+            const canAfford = !maxed && hasCost(this.player, cost);
+            return `<button class="turret-upgrade-button ${canAfford ? '' : 'disabled'}"
+                ${canAfford ? '' : 'disabled'} onclick="game.upgradeTrap('${index}', '${stat}')">
+                <span>${labels[stat]}</span><b>Lv ${level}/${cap}</b><small>${effects[stat]}</small>
                 <em>${maxed ? 'Maxed' : costLabel(cost)}</em>
             </button>`;
         },
@@ -4389,6 +4677,10 @@
             if (!bench || bench.workbenchLevel >= content.workbenchLevels.length) return;
             const next = content.workbenchLevels[bench.workbenchLevel];
             if (this.techTier < next.level || !hasCost(this.player, next.cost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'upgradeWorkbench' });
+                return;
+            }
             payCost(this.player, next.cost);
             bench.workbenchLevel++;
             bench.maxHealth += 180;
@@ -4400,11 +4692,30 @@
             if (this.techTier >= 4) return;
             const cost = { money: 1800 * this.techTier, wood: 25 * this.techTier, metal: 30 * this.techTier, parts: this.techTier };
             if (!hasCost(this.player, cost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'upgradeTechTier', tier: this.techTier + 1 });
+                return;
+            }
             payCost(this.player, cost);
             this.techTier++;
-            if (this.multiplayer?.serverAuthoritative) this.multiplayer.sendAction({ kind: 'upgradeTechTier', tier: this.techTier });
             this.populateWorkbench();
             this.updateHUD();
+        },
+
+        buyLife: function () {
+            const bench = this.getActiveWorkbench();
+            if (!bench || this.techTier < 3 || bench.workbenchLevel < 3 || this.player.downed) return;
+            const cost = this.getLifePurchaseCost();
+            if (this.player.money < cost) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.multiplayer.sendAction({ kind: 'buyLife' });
+                return;
+            }
+            this.player.money -= cost;
+            this.player.lifePurchases = (this.player.lifePurchases || 0) + 1;
+            this.populateWorkbench();
+            this.updateHUD();
+            this.showWaveStatus?.(`LIFE CONTRACT PURCHASED: revive limit ${this.getEmergencyReviveLimit()}`, 2200);
         },
 
         getRepairAllCost: function () {
@@ -4471,6 +4782,31 @@
             this.populateWorkbench();
         },
 
+        upgradeTrap: function (index, stat) {
+            const bench = this.getActiveWorkbench();
+            const trap = this.resolveNetworkEntity(this.traps, index);
+            if (!bench || !trap || !['damage', 'radius', 'uses'].includes(stat)) return;
+            trap.upgradeLevels ||= { damage: 0, radius: 0, uses: 0 };
+            const level = trap.upgradeLevels[stat] || 0;
+            if (level >= this.getTrapUpgradeCap(bench)) return;
+            const cost = { money: 60 + level * 60, wood: 2 + level, metal: 2 + level * 2 };
+            if (!hasCost(this.player, cost)) return;
+            if (this.multiplayer?.serverAuthoritative) {
+                this.sendPaidAction({ kind: 'upgradeTrap', networkId: trap.networkId, stat }, cost);
+                return;
+            }
+            payCost(this.player, cost);
+            trap.upgradeLevels[stat] = level + 1;
+            if (stat === 'damage') trap.damage *= 1.2;
+            if (stat === 'radius') trap.radius += 4;
+            if (stat === 'uses') {
+                trap.maxUses = (trap.maxUses || 10) + 5;
+                trap.usesRemaining = Math.min(trap.maxUses, (trap.usesRemaining || 0) + 5);
+            }
+            this.populateWorkbench();
+            this.updateHUD();
+        },
+
         repairTurret: function (index) {
             const sentry = this.resolveNetworkEntity(this.sentries, index);
             if (!sentry || sentry.health >= sentry.maxHealth) return;
@@ -4526,16 +4862,19 @@
             const sentry = this.sentryTypes[index];
             const allowedLevel = sentry.techLevel === 1 ? 1 : (this.getActiveWorkbench()?.workbenchLevel || 0);
             if (!sentry || sentry.techLevel > allowedLevel || !hasCost(this.player, sentry.cost)) return;
+            if (sentry.requiredBuilding && !this.isBuildingOnline(sentry.requiredBuilding)) {
+                this.showPlacementError(`Build ${this.getRequiredBuildingName(sentry.requiredBuilding)} first.`);
+                return;
+            }
             if (this.sentries.filter((entry) => !entry.ownerId || entry.ownerId === this.localPlayerId).length >= this.getPlacementLimits().turrets) {
                 this.showPlacementError(`Turret cap reached: ${this.getPlacementLimits().turrets}. Upgrade tech or build a turret bench.`);
                 return;
             }
-            payCost(this.player, sentry.cost);
+            if (!this.multiplayer?.serverAuthoritative) payCost(this.player, sentry.cost);
             this.placingSentry = { ...sentry, angle: 0, lastShot: 0, isDisabled: 0, paidCost: sentry.cost };
             this.toggleCrafting(false);
             this.toggleWorkbench(false);
-            placingItemText.textContent = `Placing ${sentry.name}...`;
-            placingItemHint.classList.remove('hidden');
+            this.setPlacementHint(`Placing ${sentry.name}...`);
         },
 
         startPlacingWall: function (index) {
@@ -4545,11 +4884,10 @@
                 this.showPlacementError(`Wall cap reached: ${this.getPlacementLimits().walls}. Upgrade the bench for more.`);
                 return;
             }
-            payCost(this.player, wall.cost);
-            this.placingWall = { ...wall, paidCost: wall.cost };
+            if (!this.multiplayer?.serverAuthoritative) payCost(this.player, wall.cost);
+            this.placingWall = { ...wall, paidCost: wall.cost, continuousPlacement: true };
             this.toggleCrafting(false);
-            placingItemText.textContent = `Placing ${wall.name}...`;
-            placingItemHint.classList.remove('hidden');
+            this.setPlacementHint(`Multi-placing ${wall.name}...`, true);
         },
 
         startPlacingWallStage: function (stageIndex) {
@@ -4562,27 +4900,23 @@
                 this.showPlacementError(`Wall cap reached: ${this.getPlacementLimits().walls}. Upgrade the bench for more.`);
                 return;
             }
-            payCost(this.player, cost);
+            if (!this.multiplayer?.serverAuthoritative) payCost(this.player, cost);
             this.placingWall = {
                 ...wall,
                 cost,
                 paidCost: cost,
+                continuousPlacement: true,
                 wallStage: stageIndex,
                 maxHealth: wall.health,
                 radius: 25
             };
             this.toggleWorkbench(false);
-            placingItemText.textContent = `Placing ${wall.name}...`;
-            placingItemHint.classList.remove('hidden');
+            this.setPlacementHint(`Multi-placing ${wall.name}...`, true);
         },
 
         commitPlacedEntity: function (kind, collection, entity) {
             if (this.isWorldHost()) {
                 collection.push(entity);
-            } else if (this.multiplayer?.serverAuthoritative && entity.networkId && (entity.paidCost || entity.cost)) {
-                if (!this.pendingBuildCosts) this.pendingBuildCosts = new Map();
-                this.pendingBuildCosts.set(entity.networkId, entity.paidCost || entity.cost);
-                setTimeout(() => this.pendingBuildCosts?.delete(entity.networkId), 5000);
             }
             this.recordBuild();
             this.playSfx?.('build');
@@ -4636,8 +4970,24 @@
             wall.health = wall.maxHealth;
             if (!wall.isWorkbench && wall.wallStage === undefined) wall.wallStage = 0;
             this.commitPlacedEntity('wall', this.walls, wall);
-            this.placingWall = null;
-            placingItemHint.classList.add('hidden');
+            const template = this.placingWall;
+            const cost = template.paidCost || template.cost || {};
+            if (this.multiplayer?.serverAuthoritative) {
+                this.placingWall = { ...template };
+                this.setPlacementHint(`Multi-placing ${template.name}...`, true);
+                return;
+            }
+            const wallCount = this.walls.filter((entry) => !entry.isWorkbench).length;
+            if (wallCount < this.getPlacementLimits().walls && hasCost(this.player, cost)) {
+                payCost(this.player, cost);
+                this.placingWall = { ...template };
+                this.setPlacementHint(`Multi-placing ${template.name}...`, true);
+            } else {
+                this.placingWall = null;
+                placingItemHint.classList.add('hidden');
+                this.showWaveStatus?.(wallCount >= this.getPlacementLimits().walls ? 'Wall cap reached.' : 'Out of materials. Wall placement finished.', 2200);
+            }
+            this.updateHUD();
         },
 
         startPlacingTrap: function (index) {
@@ -4648,11 +4998,17 @@
                 this.showPlacementError(`Trap cap reached: ${this.getPlacementLimits().traps}. Build a Trap Bench for more.`);
                 return;
             }
-            payCost(this.player, trap.cost);
-            this.placingTrap = { ...trap, paidCost: trap.cost };
+            if (!this.multiplayer?.serverAuthoritative) payCost(this.player, trap.cost);
+            this.placingTrap = {
+                ...trap,
+                paidCost: trap.cost,
+                maxUses: trap.maxUses || 10,
+                usesRemaining: trap.maxUses || 10,
+                lastTriggeredAt: 0,
+                upgradeLevels: { damage: 0, radius: 0, uses: 0 }
+            };
             this.toggleWorkbench(false);
-            placingItemText.textContent = `Placing ${trap.name}...`;
-            placingItemHint.classList.remove('hidden');
+            this.setPlacementHint(`Placing ${trap.name}...`);
         },
 
         placeTrap: function () {
@@ -4687,11 +5043,10 @@
                 this.showPlacementError(`Building cap reached: ${this.getPlacementLimits().buildings}.`);
                 return;
             }
-            payCost(this.player, building.cost);
+            if (!this.multiplayer?.serverAuthoritative) payCost(this.player, building.cost);
             this.placingBuilding = { ...building, paidCost: building.cost };
             this.toggleWorkbench(false);
-            placingItemText.textContent = validation.ok ? `Placing ${building.name}...` : validation.message;
-            placingItemHint.classList.remove('hidden');
+            this.setPlacementHint(validation.ok ? `Placing ${building.name}...` : validation.message);
         },
 
         placeBuilding: function () {
@@ -4717,22 +5072,23 @@
         },
 
         cancelPlacing: function () {
-            if (this.placingSentry) {
+            const shouldRefund = !this.multiplayer?.serverAuthoritative;
+            if (this.placingSentry && shouldRefund) {
                 refundCost(this.player, this.placingSentry.paidCost || this.placingSentry.cost);
-                this.placingSentry = null;
             }
-            if (this.placingWall) {
+            if (this.placingWall && shouldRefund) {
                 refundCost(this.player, this.placingWall.paidCost || this.placingWall.cost);
-                this.placingWall = null;
             }
-            if (this.placingTrap) {
+            if (this.placingTrap && shouldRefund) {
                 refundCost(this.player, this.placingTrap.paidCost || this.placingTrap.cost);
-                this.placingTrap = null;
             }
-            if (this.placingBuilding) {
+            if (this.placingBuilding && shouldRefund) {
                 refundCost(this.player, this.placingBuilding.paidCost || this.placingBuilding.cost);
-                this.placingBuilding = null;
             }
+            this.placingSentry = null;
+            this.placingWall = null;
+            this.placingTrap = null;
+            this.placingBuilding = null;
             this.placementError = '';
             placingItemHint.classList.add('hidden');
             this.updateHUD();
@@ -4780,9 +5136,13 @@
             const type = this.zombieTypes[typeKey] || this.zombieTypes.normal;
             const plan = this.currentWavePlan || progression.wavePlan(this.wave);
             const eliteScale = (type.isBoss || type.isMiniBoss) ? 1 + this.wave * 0.015 : 1;
-            const health = Math.floor(type.health * plan.healthScale * eliteScale);
+            const extraPlayers = Math.max(0, (this.team.playerCount || 1) - 1);
+            const partyBossScale = type.isBoss
+                ? 1 + Math.min(extraPlayers, 1) * 0.45 + Math.max(0, extraPlayers - 1) * 0.75
+                : type.isMiniBoss ? 1 + extraPlayers * 0.4 : 1;
+            const health = Math.floor(type.health * plan.healthScale * eliteScale * partyBossScale);
             const reward = Math.floor(type.reward * plan.rewardScale);
-            const shieldHealth = type.shieldHealth ? Math.floor(type.shieldHealth * plan.healthScale) : 0;
+            const shieldHealth = type.shieldHealth ? Math.floor(type.shieldHealth * plan.healthScale * partyBossScale) : 0;
             const spawnPoint = this.findSafeZombieSpawn(this.player, type.size || 34);
 
             this.zombies.push({

@@ -641,8 +641,9 @@
         .info-tip-bubble {
             position: absolute;
             right: -6px;
+            top: auto;
             bottom: calc(100% + 9px);
-            z-index: 120;
+            z-index: 220;
             width: min(260px, 70vw);
             padding: 10px 12px;
             border: 1px solid rgba(249,115,22,.7);
@@ -662,6 +663,9 @@
         .info-tip:hover .info-tip-bubble,
         .info-tip:focus .info-tip-bubble,
         .info-tip:focus-within .info-tip-bubble { opacity: 1; transform: translateY(0); }
+        .info-tip:hover,
+        .info-tip:focus,
+        .info-tip:focus-within { z-index: 230; }
 
         .potion-counter-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; padding: 12px 14px; border-left: 4px solid #a855f7; background: #17121b; }
         .potion-counter-head h3 { margin: 2px 0 0; color: #fff7ed; font-size: 20px; }
@@ -922,6 +926,23 @@
             box-shadow: 0 10px 30px rgba(0,0,0,.5);
         }
 
+        .placement-help { margin-top: 3px; color: #a8a29e; font-size: 12px; }
+        .placement-finish-button {
+            width: 100%;
+            margin-top: 10px;
+            padding: 9px 12px;
+            border: 1px solid #fb923c;
+            border-bottom: 3px solid #9a3412;
+            background: #2b211b;
+            color: #ffedd5;
+            font: 800 12px "Chakra Petch", sans-serif;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+            cursor: pointer;
+        }
+        .placement-finish-button:hover,
+        .placement-finish-button:focus-visible { background: #431f0d; color: #fff7ed; }
+
         .game-over-window {
             max-width: 620px;
             padding: 30px;
@@ -1036,7 +1057,7 @@
         .workbench-window .station-header { background: linear-gradient(90deg, rgba(180,83,9,.38), transparent 48%), #100f0e; }
         .workbench-console { box-shadow: inset 0 -4px rgba(249,115,22,.12), 0 8px 24px rgba(0,0,0,.22); }
         .workbench-tab { cursor: pointer; clip-path: polygon(5px 0, 100% 0, 100% calc(100% - 5px), calc(100% - 5px) 100%, 0 100%, 0 5px); }
-        .workbench-item { position: relative; overflow: hidden; }
+        .workbench-item { position: relative; overflow: visible; }
         .workbench-item::after { content: ''; position: absolute; right: -24px; bottom: -24px; width: 70px; height: 70px; border: 1px solid rgba(255,255,255,.035); transform: rotate(45deg); }
 
         @media (max-width: 900px) {
@@ -1083,6 +1104,7 @@
         }
 
         .workbench-item:hover {
+            z-index: 130;
             background: rgba(55, 51, 48, 0.95);
             box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.05), 0 4px 12px rgba(0, 0, 0, 0.3);
         }

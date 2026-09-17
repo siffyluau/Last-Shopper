@@ -335,7 +335,10 @@
         <!-- Placing Item Hint -->
         <div id="placing-item-hint" class="placement-hint hidden">
             <p id="placing-item-text" class="text-lg text-white font-semibold">Placing Basic Turret...</p>
-            <p class="text-sm text-gray-400">Click to place. Press [ESC] to cancel.</p>
+            <p id="placing-item-help" class="placement-help">Click to place. Press [ESC] to cancel.</p>
+            <button id="cancel-placement-button" class="placement-finish-button" type="button" onclick="game.cancelPlacing()">
+                FINISH BUILDING [ESC]
+            </button>
         </div>
 
     </div>

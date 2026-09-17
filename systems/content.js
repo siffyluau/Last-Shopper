@@ -390,6 +390,24 @@
             isDisabled: 0
         },
         {
+            name: 'Gatling Turret',
+            techLevel: 2,
+            requiredBuilding: 'advancedTurretBench',
+            cost: { wood: 16, metal: 20, parts: 1 },
+            damage: 22,
+            fireRate: 58,
+            range: 315,
+            speed: 14,
+            color: [96, 165, 250],
+            bulletSize: 3,
+            health: 320,
+            maxHealth: 320,
+            ammo: 320,
+            maxAmmo: 320,
+            radius: 18,
+            isDisabled: 0
+        },
+        {
             name: 'Pulse Turret',
             techLevel: 3,
             cost: { wood: 20, metal: 34, parts: 2 },
@@ -407,10 +425,36 @@
             isDisabled: 0
         },
         {
+            name: 'Arc Turret',
+            techLevel: 3,
+            requiredBuilding: 'powerRelay',
+            cost: { wood: 24, metal: 40, parts: 2 },
+            damage: 145,
+            fireRate: 360,
+            range: 470,
+            speed: 17,
+            pierce: 2,
+            color: [45, 212, 191],
+            bulletSize: 5,
+            health: 510,
+            maxHealth: 510,
+            ammo: 110,
+            maxAmmo: 110,
+            radius: 19,
+            isDisabled: 0
+        },
+        {
             name: 'Rail Sentry', techLevel: 4, cost: { wood: 30, metal: 62, parts: 4 },
             damage: 430, fireRate: 720, range: 620, speed: 20, pierce: 3,
             color: [255, 214, 90], bulletSize: 6, health: 680, maxHealth: 680,
             ammo: 54, maxAmmo: 54, radius: 20, isDisabled: 0
+        },
+        {
+            name: 'Siege Mortar', techLevel: 4, requiredBuilding: 'emergencyArmory',
+            cost: { wood: 42, metal: 78, parts: 5 },
+            damage: 980, fireRate: 2500, range: 760, speed: 7, explosive: true,
+            color: [250, 204, 21], bulletSize: 9, health: 780, maxHealth: 780,
+            ammo: 16, maxAmmo: 16, radius: 22, isDisabled: 0
         }
     ];
 
@@ -482,7 +526,8 @@
             damage: 320,
             color: [120, 120, 120],
             radius: 20,
-            oneTimeUse: true
+            maxUses: 10,
+            triggerCooldown: 650
         },
         {
             name: 'Fire Trap',
@@ -491,7 +536,8 @@
             damage: 620,
             color: [245, 100, 35],
             radius: 26,
-            oneTimeUse: true
+            maxUses: 10,
+            triggerCooldown: 800
         },
         {
             name: 'EMP Mine',
@@ -500,11 +546,12 @@
             damage: 1150,
             color: [40, 210, 255],
             radius: 34,
-            oneTimeUse: true
+            maxUses: 10,
+            triggerCooldown: 950
         },
         {
             name: 'Cryo Charge', techLevel: 4, cost: { wood: 14, metal: 30, parts: 2 },
-            damage: 2100, color: [120, 225, 255], radius: 48, oneTimeUse: true
+            damage: 2100, color: [120, 225, 255], radius: 48, maxUses: 10, triggerCooldown: 1100
         }
     ];
 
@@ -513,6 +560,12 @@
         { level: 2, name: 'Machine Bench', cost: { money: 900, wood: 24, metal: 18 } },
         { level: 3, name: 'Powered Bench', cost: { money: 2600, wood: 40, metal: 48 } },
         { level: 4, name: 'Blackout Fabricator', cost: { money: 8500, wood: 75, metal: 110, parts: 6 } }
+    ];
+
+    const utilityUpgrades = [
+        { id: 'autoLoot', name: 'Sentry Auto-Loot', description: 'Automatically collect drops from all sources in a large radius.', cost: { money: 15000, wood: 100, metal: 100 } },
+        { id: 'autoRefill', name: 'Sentry Auto-Refill', description: 'Your turrets automatically refill their ammo for free when empty.', cost: { money: 20000, wood: 150, metal: 150 } },
+        { id: 'turretSpeed', name: 'Sentry Speed Boost', description: 'Increases the firing speed of all your turrets by 50%.', cost: { money: 10000, wood: 50, metal: 50 } }
     ];
 
     const buildingTypes = [
@@ -541,7 +594,7 @@
             name: 'Advanced Turret Bench',
             techLevel: 2,
             cost: { money: 1250, wood: 30, metal: 32, parts: 1 },
-            description: 'Improves turret upgrade caps and tuning options.',
+            description: 'Unlocks the Gatling Turret and improves turret upgrade caps.',
             width: 104,
             height: 72,
             color: [37, 99, 235]
@@ -551,7 +604,7 @@
             name: 'Trap Bench',
             techLevel: 2,
             cost: { money: 900, wood: 26, metal: 24 },
-            description: 'Unlocks a safer trap crafting station.',
+            description: 'Adds eight trap slots and raises reusable trap upgrade caps.',
             width: 92,
             height: 70,
             color: [185, 28, 28]
@@ -581,7 +634,7 @@
             name: 'Parking Lot Power Relay',
             techLevel: 3,
             cost: { money: 2400, wood: 28, metal: 48, parts: 2 },
-            description: 'Extends turret coverage and slowly refills powered defenses.',
+            description: 'Unlocks the Arc Turret, extends coverage, and slowly refills powered defenses.',
             width: 108,
             height: 76,
             color: [45, 212, 191]
@@ -589,7 +642,7 @@
         {
             id: 'emergencyArmory', name: 'Emergency Armory', techLevel: 4,
             cost: { money: 10500, wood: 60, metal: 95, parts: 7 },
-            description: 'Tier IV station that rapidly resupplies every active turret while it remains standing.',
+            description: 'Unlocks the Siege Mortar and rapidly resupplies every active turret while standing.',
             width: 120, height: 82, color: [234, 179, 8]
         }
     ];
@@ -700,13 +753,14 @@
         }
     ];
 
-    window.LastShopperContent = {
+    const exportedContent = {
         enemyTypes,
         weaponTypes,
         turretTypes,
         wallStages,
         trapTypes,
         workbenchLevels,
+        utilityUpgrades,
         buildingTypes,
         potionRecipes,
         ammoPacks,
@@ -714,4 +768,7 @@
         runUpgrades,
         skins
     };
+
+    if (typeof module !== 'undefined' && module.exports) module.exports = exportedContent;
+    if (typeof window !== 'undefined') window.LastShopperContent = exportedContent;
 }());

@@ -6,6 +6,7 @@ const WebSocket = require('ws');
 const { WebSocketServer } = WebSocket;
 const WorldMap = require('./systems/world.js');
 const SpatialHash = require('./systems/spatial-hash.js');
+const GameContent = require('./systems/content.js');
 
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
@@ -23,6 +24,29 @@ const PATH_UPDATE_MS = 650;
 const INTEREST_RADIUS = 1500;
 const DAY_CYCLE_MS = 8 * 60 * 1000;
 const REVIVE_DURATION_MS = 2500;
+const MAX_EMERGENCY_REVIVES = 5;
+const EMERGENCY_RESPAWN_DELAY_MS = 6000;
+const FINAL_REVIVE_WINDOW_MS = 60000;
+const SKILL_CAPS = new Map(GameContent.skills.map((skill) => [skill.id, skill.max]));
+const EMPTY_SKILLS = Object.freeze(Object.fromEntries(GameContent.skills.map((skill) => [skill.id, 0])));
+const WEAPON_DEFINITIONS = new Map(GameContent.weaponTypes.map((weapon) => [weapon.id, weapon]));
+const TURRET_DEFINITIONS = new Map(GameContent.turretTypes.map((turret) => [turret.name, turret]));
+const TRAP_DEFINITIONS = new Map(GameContent.trapTypes.map((trap) => [trap.name, trap]));
+const BUILDING_DEFINITIONS = new Map(GameContent.buildingTypes.map((building) => [building.id, building]));
+const UTILITY_UPGRADE_DEFINITIONS = new Map(GameContent.utilityUpgrades.map((upgrade) => [upgrade.id, upgrade]));
+const RUN_UPGRADE_IDS = new Set(GameContent.runUpgrades.map((upgrade) => upgrade.id));
+const AMMO_FORGE_OPTIONS = Object.freeze({
+  small: { cost: { money: 90, metal: 2 }, ammo: 80 },
+  large: { cost: { money: 240, metal: 6 }, ammo: 240 },
+  parts: { cost: { money: 450, metal: 14 }, parts: 1 }
+});
+const TRADER_ITEMS = Object.freeze({
+  wood: { cost: { money: 55 }, reward: { wood: 12 } },
+  metal: { cost: { money: 80 }, reward: { metal: 9 } },
+  ammo: { cost: { money: 45 }, reward: { ammo: 75 } },
+  repairs: { cost: { money: 135 }, repairAll: true },
+  parts: { cost: { money: 280 }, reward: { parts: 1 } }
+});
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -36,23 +60,7 @@ const MIME = {
 
 const SHOP_RECT = { x: 980, y: 615, width: 390, height: 260 };
 const WORKBENCH_RECT = { x: 1285, y: 820, width: 118, height: 62 };
-const SERVER_PLACEMENT_LIMITS = {
-  turrets: 14,
-  walls: 60,
-  traps: 26,
-  buildings: 9
-};
-
-// Mirror of systems/content.js wallStages (the server cannot load that browser-only file).
-const WALL_STAGES = [
-  { name: 'Wood Wall', techLevel: 1, health: 240, color: [139, 82, 35] },
-  { name: 'Reinforced Wood', techLevel: 1, health: 430, color: [125, 88, 52] },
-  { name: 'Metal Wall', techLevel: 2, health: 780, color: [130, 145, 155] },
-  { name: 'Reinforced Metal', techLevel: 3, health: 1080, color: [105, 120, 132], armor: 0.1 },
-  { name: 'Electric Wall', techLevel: 3, health: 1280, color: [30, 165, 245], isElectric: true, shockDamage: 28 },
-  { name: 'Titanium Wall', techLevel: 3, health: 1680, color: [185, 195, 205], armor: 0.15 },
-  { name: 'Composite Shock Wall', techLevel: 4, health: 2650, color: [235, 190, 70], armor: 0.24, isElectric: true, shockDamage: 65 }
-];
+const WALL_STAGES = GameContent.wallStages;
 
 const enemyTypes = {
   normal: { color: [45, 80, 22], speed: 1, health: 100, reward: 10, xp: 10, size: 15, contactDamage: 8 },
@@ -109,6 +117,14 @@ function nowMs() {
   return Date.now();
 }
 
+function emergencyReviveLimit(player) {
+  return MAX_EMERGENCY_REVIVES + Math.max(0, Math.floor(Number(player?.lifePurchases) || 0));
+}
+
+function lifePurchaseCost(player) {
+  return Math.round(10000 * Math.pow(1.5, Math.max(0, Math.floor(Number(player?.lifePurchases) || 0))));
+}
+
 function createPerformanceMetrics() {
   return {
     startedAt: nowMs(),
@@ -122,9 +138,11 @@ function createPerformanceMetrics() {
       wave: 0,
       zombies: 0,
       bullets: 0,
+      collisions: 0,
       sentries: 0,
       cleanup: 0,
-      snapshots: 0
+      snapshots: 0,
+      serialization: 0
     },
     outgoingMessages: 0,
     outgoingBytes: 0,
@@ -137,12 +155,20 @@ function createPerformanceMetrics() {
   };
 }
 
+function recordStageDuration(room, name, elapsed) {
+  if (!room || !Number.isFinite(elapsed)) return;
+  const previous = room.stageEma[name];
+  room.stageEma[name] = previous === undefined ? elapsed : previous * 0.9 + elapsed * 0.1;
+  if (PERF_DEBUG && room.perf?.stages && name in room.perf.stages) room.perf.stages[name] += elapsed;
+}
+
 function measureStage(room, name, callback) {
-  if (!PERF_DEBUG) return callback();
   const startedAt = performance.now();
-  const result = callback();
-  room.perf.stages[name] += performance.now() - startedAt;
-  return result;
+  try {
+    return callback();
+  } finally {
+    recordStageDuration(room, name, performance.now() - startedAt);
+  }
 }
 
 function performanceReport(room) {
@@ -278,6 +304,20 @@ function nearbyAny(x, y, radius, list, minDistance, skipNetworkId) {
   });
 }
 
+function buildingOnline(world, id) {
+  return world.buildings.some((building) => building.id === id && building.health > 0);
+}
+
+function serverPlacementLimits(world) {
+  const benchLevel = world.workbenchLevel || 1;
+  return {
+    turrets: 4 + benchLevel * 2 + (buildingOnline(world, 'advancedTurretBench') ? 2 : 0),
+    walls: 18 + benchLevel * 10,
+    traps: 6 + benchLevel * 4 + (buildingOnline(world, 'trapBench') ? 8 : 0),
+    buildings: 9
+  };
+}
+
 function validateBuildPlacement(kind, entity, world) {
   if (!entity) return false;
   const x = Number(entity.x);
@@ -290,20 +330,21 @@ function validateBuildPlacement(kind, entity, world) {
     WorldMap.wallSegments(structure).some((wall) => rectBlocked(x, y, radius, wall)))) return false;
   if (kind !== 'building' && world.buildings.some((building) => rectBlocked(x, y, radius, building))) return false;
 
+  const limits = serverPlacementLimits(world);
   if (kind === 'turret') {
-    if (world.sentries.filter((item) => item.ownerId === entity.ownerId).length >= SERVER_PLACEMENT_LIMITS.turrets) return false;
+    if (world.sentries.filter((item) => item.ownerId === entity.ownerId).length >= limits.turrets) return false;
     if (nearbyAny(x, y, radius, world.sentries, 78, entity.networkId)) return false;
     if (nearbyAny(x, y, radius, world.walls, 26)) return false;
   } else if (kind === 'wall') {
-    if (world.walls.filter((item) => item.ownerId === entity.ownerId).length >= SERVER_PLACEMENT_LIMITS.walls) return false;
+    if (world.walls.filter((item) => item.ownerId === entity.ownerId).length >= limits.walls) return false;
     if (nearbyAny(x, y, radius, world.walls, 5, entity.networkId)) return false;
     if (nearbyAny(x, y, radius, world.sentries, 20)) return false;
   } else if (kind === 'trap') {
-    if (world.traps.filter((item) => item.ownerId === entity.ownerId).length >= SERVER_PLACEMENT_LIMITS.traps) return false;
+    if (world.traps.filter((item) => item.ownerId === entity.ownerId).length >= limits.traps) return false;
     if (nearbyAny(x, y, radius, world.traps, 34, entity.networkId)) return false;
     if (nearbyAny(x, y, radius, world.sentries, 20) || nearbyAny(x, y, radius, world.walls, 12)) return false;
   } else if (kind === 'building') {
-    if (world.buildings.filter((item) => item.ownerId === entity.ownerId).length >= SERVER_PLACEMENT_LIMITS.buildings) return false;
+    if (world.buildings.filter((item) => item.ownerId === entity.ownerId).length >= limits.buildings) return false;
     if (world.buildings.some((building) => building.id === entity.id)) return false;
     if (nearbyAny(x, y, radius, world.buildings, 82, entity.networkId)) return false;
     if (nearbyAny(x, y, radius, world.sentries, 44) || nearbyAny(x, y, radius, world.walls, 24)) return false;
@@ -313,29 +354,77 @@ function validateBuildPlacement(kind, entity, world) {
   return true;
 }
 
-function sanitizeBuildEntity(kind, entity, ownerId) {
-  const clean = { ...entity };
-  clean.x = Number(entity.x);
-  clean.y = Number(entity.y);
-  clean.radius = buildRadius(entity);
-  clean.networkId = String(entity.networkId || `${kind}-${ownerId || 'player'}-${nowMs()}-${Math.random().toString(36).slice(2, 6)}`);
-  clean.ownerId = String(entity.ownerId || ownerId || 'player');
-  clean.ownerName = String(entity.ownerName || 'P1').slice(0, 24);
+function canonicalBuildDefinition(kind, entity) {
+  if (kind === 'turret') return TURRET_DEFINITIONS.get(String(entity.name || '')) || null;
+  if (kind === 'wall') return WALL_STAGES[clamp(Math.floor(Number(entity.wallStage) || 0), 0, WALL_STAGES.length - 1)] || null;
+  if (kind === 'trap') return TRAP_DEFINITIONS.get(String(entity.name || '')) || null;
+  if (kind === 'building') return BUILDING_DEFINITIONS.get(String(entity.id || '')) || null;
+  return null;
+}
+
+function sanitizeBuildEntity(kind, entity, ownerId, player) {
+  const definition = canonicalBuildDefinition(kind, entity);
+  if (!definition) return null;
+  const x = Number(entity.x);
+  const y = Number(entity.y);
+  const common = {
+    ...definition,
+    x,
+    y,
+    networkId: String(entity.networkId || `${kind}-${ownerId || 'player'}-${nowMs()}-${Math.random().toString(36).slice(2, 6)}`).slice(0, 64),
+    ownerId: String(ownerId || 'player'),
+    ownerName: String(player?.name || 'P1').slice(0, 24)
+  };
   if (kind === 'turret') {
-    clean.angle = Number(clean.angle) || 0;
-    clean.lastShot = 0;
-    clean.isDisabled = 0;
-    clean.health = Number(clean.health || clean.maxHealth || 180);
-    clean.maxHealth = Number(clean.maxHealth || clean.health || 180);
-    clean.ammo = Number(clean.ammo || clean.maxAmmo || 0);
-    clean.maxAmmo = Number(clean.maxAmmo || clean.ammo || 0);
-    clean.upgradeLevels = clean.upgradeLevels || { damage: 0, fireRate: 0, range: 0, ammo: 0 };
+    const upgrades = player?.runUpgradeCounts || {};
+    const damageScale = Math.pow(1.15, upgrades.turretCore || 0);
+    const fireRateScale = Math.pow(0.87, upgrades.turretCore || 0);
+    const rangeScale = Math.pow(1.15, upgrades.longShot || 0);
+    const healthScale = Math.pow(1.2, upgrades.fortify || 0);
+    return {
+      ...common,
+      radius: definition.radius || 15,
+      angle: 0,
+      lastShot: 0,
+      isDisabled: 0,
+      damage: definition.damage * damageScale,
+      fireRate: definition.fireRate * fireRateScale,
+      range: definition.range * rangeScale,
+      maxHealth: definition.maxHealth * healthScale,
+      health: definition.maxHealth * healthScale,
+      ammo: definition.maxAmmo,
+      maxAmmo: definition.maxAmmo,
+      upgradeLevels: { damage: 0, fireRate: 0, range: 0, ammo: 0 }
+    };
   }
   if (kind === 'wall') {
-    clean.maxHealth = Number(clean.maxHealth || clean.health || 240);
-    clean.health = Number(clean.health || clean.maxHealth);
+    const wallStage = WALL_STAGES.indexOf(definition);
+    const fortify = Math.pow(1.2, player?.runUpgradeCounts?.fortify || 0);
+    const skinScale = playerSkinPerk(player || {}, 'wallHealth') ? 1.03 : 1;
+    const maxHealth = definition.health * fortify * skinScale;
+    return { ...common, wallStage, radius: 25, maxHealth, health: maxHealth };
   }
-  return clean;
+  if (kind === 'trap') {
+    const maxUses = Math.max(1, Number(definition.maxUses) || 10);
+    return {
+      ...common,
+      radius: definition.radius || 20,
+      maxUses,
+      usesRemaining: maxUses,
+      lastTriggeredAt: 0,
+      upgradeLevels: { damage: 0, radius: 0, uses: 0 }
+    };
+  }
+  const maxHealth = 900 + definition.techLevel * 200;
+  return {
+    ...common,
+    width: definition.width,
+    height: definition.height,
+    radius: Math.max(definition.width, definition.height) / 2,
+    interactionRadius: Math.max(definition.width, definition.height) * 0.92,
+    health: maxHealth,
+    maxHealth
+  };
 }
 
 function wavePlan(wave, playerCount) {
@@ -360,6 +449,13 @@ function wavePlan(wave, playerCount) {
       metal: Math.max(1, Math.floor(wave * 0.36))
     }
   };
+}
+
+function bossPartyHealthScale(playerCount, type) {
+  const extraPlayers = Math.max(0, playerCount - 1);
+  if (type.isBoss) return 1 + Math.min(extraPlayers, 1) * 0.45 + Math.max(0, extraPlayers - 1) * 0.75;
+  if (type.isMiniBoss) return 1 + extraPlayers * 0.4;
+  return 1;
 }
 
 function enemyPool(wave) {
@@ -399,6 +495,7 @@ function createWorld(seed) {
     dayTime: 0.34,
     dayNumber: 1,
     gameStarted: false,
+    gameOver: false,
     wave: 0,
     waveActive: false,
     zombiesKilled: 0,
@@ -408,6 +505,7 @@ function createWorld(seed) {
     escortsToSpawn: 0,
     currentWavePlan: null,
     techTier: 1,
+    workbenchLevel: 1,
     nextSpawnAt: 0,
     nextWaveAt: 0,
     preparationActive: false,
@@ -438,6 +536,7 @@ function getRoom(code) {
       clients: new Map(),
       players: new Map(),
       weaponCooldowns: new Map(),
+      acceptedShotIds: new Map(),
       hostId: null,
       gameStarted: false,
       latestWorld: createWorld(`room-${roomCode}`),
@@ -451,6 +550,9 @@ function getRoom(code) {
       lastSpatialSignature: '',
       snapshotIntervalMs: SNAPSHOT_MS,
       tickEma: 0,
+      stageEma: {},
+      reportedPerf: {},
+      nextPerfPublishAt: 0,
       governorRecoverAt: 0,
       lastTick: nowMs(),
       lastSnapshot: 0,
@@ -463,7 +565,9 @@ function getRoom(code) {
 
 function send(ws, packet, room = ws.room) {
   if (ws.readyState !== WebSocket.OPEN) return false;
+  const serializationStartedAt = performance.now();
   const payload = JSON.stringify(packet);
+  recordStageDuration(room, 'serialization', performance.now() - serializationStartedAt);
   ws.send(payload);
   if (!PERF_DEBUG || !room?.perf) return true;
   const bytes = Buffer.byteLength(payload);
@@ -540,15 +644,51 @@ const WALL_DYNAMIC = {
   x: round1, y: round1, health: roundInt, maxHealth: roundInt, isElectric: identity, shockDamage: identity,
   wallStage: identity, name: identity, color: identity, armor: identity
 };
-const TRAP_DYNAMIC = { x: round1, y: round1 };
+const TRAP_DYNAMIC = {
+  x: round1, y: round1, damage: round2, radius: round1,
+  usesRemaining: roundInt, maxUses: roundInt, upgradeLevels: identity
+};
 const BUILDING_DYNAMIC = { x: round1, y: round1, health: roundInt, maxHealth: roundInt };
 const PLAYER_DYNAMIC = {
   x: round1, y: round1, angle: round2, health: roundInt, maxHealth: roundInt, downed: identity, downedAt: identity,
   respawnAt: identity, giveUpAt: identity, reviveProgress: identity, reviverId: identity, emergencyRespawns: identity,
-  seq: identity, name: identity, skinId: identity, level: identity, wave: identity, weapons: identity
+  eliminated: identity,
+  lifePurchases: identity,
+  seq: identity, name: identity, skinId: identity, level: identity, wave: identity, weapons: identity,
+  money: roundInt, wood: roundInt, metal: roundInt, reserveAmmo: roundInt, rareTurretParts: roundInt,
+  xp: roundInt, xpToNext: roundInt, skillPoints: roundInt, skillLevels: identity, runUpgradeCounts: identity,
+  baseMaxHealth: roundInt, moveSpeedMultiplier: round2, reloadSpeedMultiplier: round2, resourceMultiplier: round2,
+  potionExpiries: identity, nextEmergencyReloadAt: identity, milestoneUpgradeCredits: roundInt, upgrades: identity
 };
 const PLAYER_SERVER_ONLY = new Set(['lastSeen', 'lastReviveTick', 'invulnerableUntil', 'upgrades', 'damageMultiplier',
-  'fireRateMultiplier', 'armorMultiplier', 'critChance', 'lifesteal', 'disconnectedAt']);
+  'fireRateMultiplier', 'armorMultiplier', 'critChance', 'lifesteal', 'pickupRadius', 'disconnectedAt',
+  'progressionInitialized', 'money', 'wood', 'metal', 'reserveAmmo', 'rareTurretParts', 'xp', 'xpToNext',
+  'skillPoints', 'skillLevels', 'runUpgradeCounts', 'baseMaxHealth', 'moveSpeedMultiplier',
+  'reloadSpeedMultiplier', 'resourceMultiplier', 'potionExpiries', 'nextEmergencyReloadAt', 'milestoneUpgradeCredits', 'lifePurchases']);
+
+function privatePlayerSnapshot(player) {
+  return {
+    money: player.money,
+    wood: player.wood,
+    metal: player.metal,
+    reserveAmmo: player.reserveAmmo,
+    rareTurretParts: player.rareTurretParts,
+    xp: player.xp,
+    xpToNext: player.xpToNext,
+    skillPoints: player.skillPoints,
+    skillLevels: player.skillLevels,
+    runUpgradeCounts: player.runUpgradeCounts,
+    baseMaxHealth: player.baseMaxHealth,
+    moveSpeedMultiplier: player.moveSpeedMultiplier,
+    reloadSpeedMultiplier: player.reloadSpeedMultiplier,
+    resourceMultiplier: player.resourceMultiplier,
+    potionExpiries: player.potionExpiries,
+    nextEmergencyReloadAt: player.nextEmergencyReloadAt,
+    milestoneUpgradeCredits: player.milestoneUpgradeCredits,
+    lifePurchases: player.lifePurchases,
+    upgrades: player.upgrades
+  };
+}
 
 function stableValue(value) {
   if (value === undefined) return null;
@@ -647,6 +787,7 @@ function networkWorldSnapshot(room, clientId) {
 
   const globals = {
     gameStarted: room.gameStarted,
+    gameOver: world.gameOver,
     wave: world.wave,
     waveActive: world.waveActive,
     zombiesKilled: world.zombiesKilled,
@@ -656,6 +797,7 @@ function networkWorldSnapshot(room, clientId) {
     escortsToSpawn: world.escortsToSpawn,
     currentWavePlan: world.currentWavePlan,
     techTier: world.techTier,
+    workbenchLevel: world.workbenchLevel,
     dayTime: Math.round(world.dayTime * 10000) / 10000,
     dayNumber: world.dayNumber,
     preparationActive: world.preparationActive,
@@ -665,7 +807,8 @@ function networkWorldSnapshot(room, clientId) {
     lootBeacon: world.lootBeacon,
     domainEvent: world.domainEvent,
     bossDefeats: world.bossDefeats,
-    mapSeed: world.mapSeed
+    mapSeed: world.mapSeed,
+    serverPerf: room.reportedPerf
   };
   const lastGlobals = knowledge.globals || (knowledge.globals = {});
   for (const [field, value] of Object.entries(globals)) {
@@ -696,7 +839,7 @@ function networkWorldSnapshot(room, clientId) {
     extra: (sentry) => ({ disabledMs: sentry.isDisabled > now ? Math.ceil((sentry.isDisabled - now) / 250) * 250 : 0 })
   });
   snapshot.walls = diffKnownEntities(knowledge, 'walls', interestedWalls, 'networkId', WALL_DYNAMIC);
-  snapshot.traps = diffKnownEntities(knowledge, 'traps', interestedTraps, 'networkId', TRAP_DYNAMIC, { serverOnly: new Set(['consumed']) });
+  snapshot.traps = diffKnownEntities(knowledge, 'traps', interestedTraps, 'networkId', TRAP_DYNAMIC, { serverOnly: new Set(['consumed', 'lastTriggeredAt']) });
   snapshot.buildings = diffKnownEntities(knowledge, 'buildings', interestedBuildings, 'networkId', BUILDING_DYNAMIC);
   snapshot.drops = diffKnownEntities(knowledge, 'drops', world.drops.filter((entity) => withinInterest(entity, anchor)), 'id', { x: round1, y: round1 }, {
     serverOnly: new Set(['life']),
@@ -705,7 +848,10 @@ function networkWorldSnapshot(room, clientId) {
   snapshot.acidPools = diffKnownEntities(knowledge, 'acidPools', world.acidPools.filter((entity) => withinInterest(entity, anchor)), 'id', { x: round1, y: round1 }, {
     staticAfterSpawn: true
   });
-  snapshot.players = diffKnownEntities(knowledge, 'players', [...room.players.values()], 'id', PLAYER_DYNAMIC, { serverOnly: PLAYER_SERVER_ONLY });
+  snapshot.players = diffKnownEntities(knowledge, 'players', [...room.players.values()], 'id', PLAYER_DYNAMIC, {
+    serverOnly: PLAYER_SERVER_ONLY,
+    extra: (player) => player.id === clientId ? privatePlayerSnapshot(player) : null
+  });
 
   // Map structures: per-client add/remove plus per-structure state revisions.
   const knownMap = knowledge.mapStructures || (knowledge.mapStructures = new Map());
@@ -792,6 +938,14 @@ function registerClient(room, ws, packet) {
 
 function startWave(room) {
   const world = room.latestWorld;
+  if (world.gameOver) return;
+  for (const player of room.players.values()) {
+    if (!player.downed && !player.eliminated) continue;
+    player.x = 980 + Math.random() * 36 - 18;
+    player.y = 850 + Math.random() * 24 - 12;
+    revivePlayer(player, 0.45);
+    queueEvent(room, { kind: 'waveReturn', wave: world.wave + 1 }, player.id);
+  }
   world.wave += 1;
   world.waveActive = true;
   world.zombiesKilled = 0;
@@ -836,7 +990,18 @@ function startBossPreparation(room, seconds = 35) {
     world.trader = null;
   } else {
     world.supplyDrop = null;
-    world.trader = { id: `trader-wave-${world.wave + 1}`, x: 760, y: 790, interactionRadius: 78 };
+    const ammoDeals = GameContent.ammoPacks
+      .map((pack) => pack.id)
+      .sort(() => Math.random() - 0.5)
+      .slice(0, Math.random() < 0.55 ? 2 : 3);
+    world.trader = {
+      id: `trader-wave-${world.wave + 1}`,
+      x: 760,
+      y: 790,
+      interactionRadius: 78,
+      ammoDeals,
+      stock: { wood: 3, metal: 3, ammo: 3, repairs: 2, parts: 1, small: 2, medium: 2, large: 1, full: 1 }
+    };
   }
 }
 
@@ -863,8 +1028,9 @@ function spawnZombie(room) {
   const type = enemyTypes[typeKey] || enemyTypes.normal;
   const plan = world.currentWavePlan || wavePlan(world.wave, Math.max(1, room.players.size));
   const eliteScale = (type.isBoss || type.isMiniBoss) ? 1 + world.wave * 0.015 : 1;
-  const health = Math.floor(type.health * plan.healthScale * eliteScale);
-  const shieldHealth = type.shieldHealth ? Math.floor(type.shieldHealth * plan.healthScale) : 0;
+  const partyScale = bossPartyHealthScale(Math.max(1, room.players.size), type);
+  const health = Math.floor(type.health * plan.healthScale * eliteScale * partyScale);
+  const shieldHealth = type.shieldHealth ? Math.floor(type.shieldHealth * plan.healthScale * partyScale) : 0;
   world.zombies.push({
     ...type,
     type: typeKey,
@@ -1037,15 +1203,19 @@ function getTargets(zombie, context, now, includeStructures = true) {
 }
 
 function damagePlayer(player, amount, now = nowMs()) {
-  if (!player || player.downed) return;
+  if (!player || player.downed || player.eliminated) return;
   if (now < (player.invulnerableUntil || 0)) return;
   const scaled = amount * (Number.isFinite(player.armorMultiplier) ? player.armorMultiplier : 1);
-  player.health = Math.max(0, (player.health || 100) - scaled);
+  const currentHealth = Number.isFinite(Number(player.health)) ? Number(player.health) : 100;
+  player.health = Math.max(0, currentHealth - scaled);
 }
 
 function healPlayer(player, amount) {
-  if (!player || player.downed || !(amount > 0)) return;
-  player.health = Math.min(player.maxHealth || 100, (player.health || 0) + amount);
+  if (!player || player.downed || player.eliminated || !(amount > 0)) return 0;
+  const maxHealth = Number.isFinite(Number(player.maxHealth)) ? Number(player.maxHealth) : 100;
+  const currentHealth = Number.isFinite(Number(player.health)) ? Number(player.health) : 0;
+  player.health = Math.min(maxHealth, currentHealth + amount);
+  return player.health - currentHealth;
 }
 
 function damageZombie(zombie, amount) {
@@ -1061,6 +1231,140 @@ function damageZombie(zombie, amount) {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function xpToNext(level) {
+  return Math.floor(80 + Math.pow(level, 1.32) * 45);
+}
+
+function initialWeapons() {
+  return GameContent.weaponTypes.map((weapon, index) => ({
+    id: weapon.id,
+    owned: index === 0,
+    upgradeLevel: 0,
+    currentAmmo: index === 0 ? weapon.maxAmmo : 0
+  }));
+}
+
+function weaponMaxAmmo(weaponId, level = 0, deepPockets = 0) {
+  const definition = WEAPON_DEFINITIONS.get(weaponId);
+  if (!definition) return 0;
+  let maxAmmo = definition.maxAmmo;
+  for (let index = 0; index < clamp(Math.floor(level), 0, 5); index += 1) {
+    maxAmmo += Math.max(1, Math.ceil(maxAmmo * 0.12));
+  }
+  for (let index = 0; index < Math.max(0, Math.floor(deepPockets)); index += 1) {
+    maxAmmo += Math.max(1, Math.floor(maxAmmo * 0.2));
+  }
+  return maxAmmo;
+}
+
+function initializePlayerProgression(player, skinId) {
+  if (player.progressionInitialized) return player;
+  const skin = GameContent.skins.find((entry) => entry.id === skinId) || GameContent.skins[0];
+  const starterWood = skin?.perk?.type === 'starterPack' ? 5 : 0;
+  const starterMetal = skin?.perk?.type === 'starterPack' ? 5 : 0;
+  const starterCash = skin?.perk?.type === 'cash' ? 40 : 0;
+  Object.assign(player, {
+    progressionInitialized: true,
+    money: starterCash,
+    wood: 12 + starterWood,
+    metal: 8 + starterMetal,
+    reserveAmmo: 60,
+    rareTurretParts: 0,
+    xp: 0,
+    xpToNext: xpToNext(1),
+    level: 1,
+    skillPoints: 0,
+    skillLevels: { ...EMPTY_SKILLS },
+    runUpgradeCounts: {},
+    upgrades: { autoLoot: false, autoRefill: false, turretSpeed: false },
+    milestoneUpgradeCredits: 0,
+    lifePurchases: 0,
+    weapons: initialWeapons(),
+    potionExpiries: {},
+    nextEmergencyReloadAt: 0
+  });
+  return player;
+}
+
+function playerSkinPerk(player, type) {
+  const skin = GameContent.skins.find((entry) => entry.id === player.skinId);
+  return skin?.perk?.type === type;
+}
+
+function refreshPlayerDerivedStats(player, options = {}) {
+  initializePlayerProgression(player, player.skinId || 'shopper');
+  const previousMax = Number.isFinite(Number(player.maxHealth)) ? Number(player.maxHealth) : 100;
+  const skills = player.skillLevels || EMPTY_SKILLS;
+  const upgrades = player.runUpgradeCounts || {};
+  const maxHealth = 100 + (skills.maxHealth || 0) * 20 + (upgrades.vitality || 0) * 25;
+  player.baseMaxHealth = maxHealth;
+  player.maxHealth = maxHealth;
+  if (options.healIncrease && maxHealth > previousMax) {
+    const currentHealth = Number.isFinite(Number(player.health)) ? Number(player.health) : previousMax;
+    player.health = Math.min(maxHealth, currentHealth + maxHealth - previousMax);
+  } else {
+    const currentHealth = Number.isFinite(Number(player.health)) ? Number(player.health) : maxHealth;
+    player.health = clamp(currentHealth, 0, maxHealth);
+  }
+  const now = nowMs();
+  const potions = player.potionExpiries || {};
+  player.damageMultiplier = 1 + (skills.bulletDamage || 0) * 0.1 + (upgrades.caliber || 0) * 0.12
+    + (playerSkinPerk(player, 'bossDamage') ? 0.03 : 0);
+  player.fireRateMultiplier = Math.pow(0.9, upgrades.rapidFire || 0) * (potions.fireRate > now ? 0.5 : 1);
+  player.armorMultiplier = 1 - (potions.armor > now ? 0.35 : 0) - (playerSkinPerk(player, 'acidGuard') ? 0.04 : 0);
+  player.critChance = potions.crit > now ? 0.18 : 0;
+  player.lifesteal = potions.lifesteal > now;
+  player.pickupRadius = (player.upgrades?.autoLoot ? 300 : 30) + (skills.pickupRange || 0) * 25;
+  player.moveSpeedMultiplier = Math.pow(1.05, skills.moveSpeed || 0) * (playerSkinPerk(player, 'moveSpeed') ? 1.03 : 1);
+  player.reloadSpeedMultiplier = Math.pow(0.92, skills.reloadSpeed || 0);
+  player.resourceMultiplier = 1 + (skills.resourceMultiplier || 0) * 0.1 + (upgrades.salvage || 0) * 0.15
+    + (potions.resource > now ? 0.75 : 0) + (potions.loot > now ? 1 : 0)
+    + (playerSkinPerk(player, 'cashMultiplier') ? 0.03 : 0);
+  return player;
+}
+
+function canAffordPlayer(player, cost = {}) {
+  return (!cost.money || player.money >= cost.money)
+    && (!cost.wood || player.wood >= cost.wood)
+    && (!cost.metal || player.metal >= cost.metal)
+    && (!cost.parts || player.rareTurretParts >= cost.parts);
+}
+
+function spendPlayerCost(player, cost = {}) {
+  if (!canAffordPlayer(player, cost)) return false;
+  player.money -= cost.money || 0;
+  player.wood -= cost.wood || 0;
+  player.metal -= cost.metal || 0;
+  player.rareTurretParts -= cost.parts || 0;
+  return true;
+}
+
+function grantPlayerResources(player, resources = {}, useMultiplier = false) {
+  const multiplier = useMultiplier ? Math.max(1, Number(player.resourceMultiplier) || 1) : 1;
+  if (resources.money) player.money += Math.max(0, Math.floor(resources.money * multiplier));
+  if (resources.wood) player.wood += Math.max(0, Math.round(resources.wood * multiplier));
+  if (resources.metal) player.metal += Math.max(0, Math.round(resources.metal * multiplier));
+  if (resources.ammo) player.reserveAmmo += Math.max(0, Math.floor(resources.ammo));
+  if (resources.parts) player.rareTurretParts += Math.max(0, Math.floor(resources.parts));
+}
+
+function grantPlayerXp(player, amount) {
+  player.xp += Math.max(0, Math.floor(amount || 0));
+  let levels = 0;
+  while (player.xp >= player.xpToNext) {
+    player.xp -= player.xpToNext;
+    player.level += 1;
+    player.skillPoints += 1;
+    player.xpToNext = xpToNext(player.level);
+    levels += 1;
+  }
+  if (levels) {
+    healPlayer(player, levels * 15);
+    refreshPlayerDerivedStats(player);
+  }
+  return levels;
 }
 
 function sanitizePlayerState(previous, incoming, id, now) {
@@ -1088,39 +1392,23 @@ function sanitizePlayerState(previous, incoming, id, now) {
       y = previous.y;
     }
   }
-  const weapons = Array.isArray(incoming.weapons)
-    ? incoming.weapons.slice(0, 12).map((weapon) => ({
-      id: String(weapon?.id || '').slice(0, 32),
-      owned: Boolean(weapon?.owned),
-      upgradeLevel: clamp(Math.floor(Number(weapon?.upgradeLevel) || 0), 0, 5)
-    }))
-    : previous.weapons;
-  const upgrades = incoming.upgrades && typeof incoming.upgrades === 'object'
-    ? { autoRefill: Boolean(incoming.upgrades.autoRefill), turretSpeed: Boolean(incoming.upgrades.turretSpeed), autoLoot: Boolean(incoming.upgrades.autoLoot) }
-    : (previous.upgrades || { autoRefill: false, turretSpeed: false, autoLoot: false });
-  const maxHealth = clamp(Number(incoming.maxHealth ?? previous.maxHealth) || 100, 1, 1000);
-  const numberOr = (value, fallback, min, max) => (Number.isFinite(Number(value)) ? clamp(Number(value), min, max) : fallback);
-  return {
+  const upgrades = {
+    autoRefill: Boolean(previous.upgrades?.autoRefill),
+    turretSpeed: Boolean(previous.upgrades?.turretSpeed),
+    autoLoot: Boolean(previous.upgrades?.autoLoot)
+  };
+  const player = {
     ...previous,
     id,
     seq: Number.isFinite(seq) ? Math.max(seq, previous.seq || 0) : (previous.seq || 0),
     upgrades,
-    damageMultiplier: numberOr(incoming.damageMultiplier, previous.damageMultiplier ?? 1, 1, 4),
-    fireRateMultiplier: numberOr(incoming.fireRateMultiplier, previous.fireRateMultiplier ?? 1, 0.25, 1),
-    armorMultiplier: numberOr(incoming.armorMultiplier, previous.armorMultiplier ?? 1, 0.5, 1),
-    critChance: numberOr(incoming.critChance, previous.critChance ?? 0, 0, 0.5),
-    pickupRadius: numberOr(incoming.pickupRadius, previous.pickupRadius ?? 30, 30, 340),
-    lifesteal: incoming.lifesteal === undefined ? Boolean(previous.lifesteal) : Boolean(incoming.lifesteal),
     wave: clamp(Math.floor(Number(incoming.wave ?? previous.wave) || 0), 0, 9999),
     name: String(incoming.name ?? previous.name ?? 'Shopper').slice(0, 24),
     skinId: String(incoming.skinId ?? previous.skinId ?? 'shopper').slice(0, 32),
     x,
     y,
     angle: Number.isFinite(Number(incoming.angle)) ? Number(incoming.angle) : (previous.angle || 0),
-    level: clamp(Math.floor(Number(incoming.level ?? previous.level) || 1), 1, 999),
-    weapons,
-    health: Math.min(maxHealth, previous.health ?? clamp(Number(incoming.health) || 100, 0, 1000)),
-    maxHealth,
+    health: previous.health ?? 100,
     downed: Boolean(previous.downed),
     downedAt: previous.downedAt || 0,
     respawnAt: previous.respawnAt || 0,
@@ -1130,9 +1418,14 @@ function sanitizePlayerState(previous, incoming, id, now) {
     lastReviveTick: previous.lastReviveTick || 0,
     invulnerableUntil: previous.invulnerableUntil || 0,
     emergencyRespawns: previous.emergencyRespawns || 0,
+    lifePurchases: Math.max(0, Math.floor(Number(previous.lifePurchases) || 0)),
+    eliminated: Boolean(previous.eliminated),
     disconnectedAt: 0,
     lastSeen: now
   };
+  initializePlayerProgression(player, player.skinId);
+  refreshPlayerDerivedStats(player);
+  return player;
 }
 
 function spawnBossMinion(world, typeKey, x, y, scale = 0.75) {
@@ -1315,7 +1608,7 @@ function tryBossDodge(world, z, bullet, now) {
 }
 
 function pushBullet(world, x, y, angle, speed, damage, options = {}) {
-  world.bullets.push({
+  const bullet = {
     id: `b-${nextBulletId++}`,
     x,
     y,
@@ -1329,10 +1622,15 @@ function pushBullet(world, x, y, angle, speed, damage, options = {}) {
     spitter: options.spitter,
     acid: options.acid,
     ownerId: options.ownerId,
+    shotId: options.shotId,
+    pelletIndex: options.pelletIndex,
+    weaponId: options.weaponId,
     pierce: Math.max(0, Math.floor(options.pierce || 0)),
     life: options.life || 240,
     hitIds: []
-  });
+  };
+  world.bullets.push(bullet);
+  return bullet;
 }
 
 function spawnRemoteShot(room, player, weapon) {
@@ -1340,23 +1638,41 @@ function spawnRemoteShot(room, player, weapon) {
   const shooter = room.players.get(player.id);
   const type = weaponTypes[weapon.id];
   const ownedWeapon = shooter?.weapons?.find((entry) => entry.id === weapon.id && entry.owned);
-  if (!shooter || !type || !ownedWeapon || !world.waveActive || world.wave < (type.requiredWave || 0)) return;
+  const shotId = cleanId(weapon.shotId, 80) || `${player.id}:server:${nextEventId}`;
+  const reject = (reason) => {
+    queueEvent(room, { kind: 'shotRejected', shotId, shooterId: player.id, reason }, player.id);
+    if (PERF_DEBUG) console.debug(`[shot:${shotId}] rejected: ${reason}`);
+    return false;
+  };
+  if (!shooter || !type || !ownedWeapon || !world.waveActive || world.wave < (type.requiredWave || 0)) {
+    return reject('Shot was not valid for the current player or wave.');
+  }
   const now = nowMs();
+  const maxAmmo = weaponMaxAmmo(weapon.id, ownedWeapon.upgradeLevel, shooter.runUpgradeCounts?.deepPockets || 0);
+  if (!Number.isFinite(ownedWeapon.currentAmmo)) ownedWeapon.currentAmmo = maxAmmo;
+  const infiniteAmmo = (shooter.potionExpiries?.infiniteAmmo || 0) > now;
+  if (!infiniteAmmo && ownedWeapon.currentAmmo <= 0) return reject('Magazine is empty.');
+  for (const [id, acceptedAt] of room.acceptedShotIds) {
+    if (now - acceptedAt > 10000) room.acceptedShotIds.delete(id);
+  }
+  if (room.acceptedShotIds.has(shotId)) return false;
   const level = clamp(Math.floor(Number(ownedWeapon.upgradeLevel) || 0), 0, 5);
   const fireRateMultiplier = clamp(Number(shooter.fireRateMultiplier) || 1, 0.25, 1);
   const cooldown = type.fireRate * Math.pow(0.92, level) * fireRateMultiplier;
   const cooldownKey = `${player.id}:${weapon.id}`;
   // The client is the real rate limiter; only reject clearly impossible bursts (frame timing makes legit shots jittery).
   const gate = room.weaponCooldowns.get(cooldownKey) || { last: 0, windowStart: now, count: 0 };
-  if (now - gate.last < cooldown * 0.55) return;
+  if (now - gate.last < cooldown * 0.55) return reject('Shot arrived faster than the weapon cooldown.');
   if (now - gate.windowStart > 1000) {
     gate.windowStart = now;
     gate.count = 0;
   }
-  if (gate.count >= Math.ceil(1000 / cooldown) * 1.35 + 2) return;
+  if (gate.count >= Math.ceil(1000 / cooldown) * 1.35 + 2) return reject('Shot rate exceeded the allowed burst window.');
   gate.count += 1;
   gate.last = now;
   room.weaponCooldowns.set(cooldownKey, gate);
+  room.acceptedShotIds.set(shotId, now);
+  if (!infiniteAmmo) ownedWeapon.currentAmmo = Math.max(0, ownedWeapon.currentAmmo - 1);
   const requestedAngle = Number(weapon.angle);
   const angle = Number.isFinite(requestedAngle) ? requestedAngle : (Number.isFinite(shooter.angle) ? shooter.angle : 0);
   const originX = shooter.x + Math.cos(angle) * 15;
@@ -1364,19 +1680,24 @@ function spawnRemoteShot(room, player, weapon) {
   const pellets = type.pellets || 0;
   let damage = type.damage * Math.pow(1.18, level) * clamp(Number(shooter.damageMultiplier) || 1, 1, 4);
   if (Math.random() < clamp(Number(shooter.critChance) || 0, 0, 0.5)) damage *= 2;
-  const fireOne = (spread) => pushBullet(world, originX, originY, angle + spread, type.speed, damage, {
+  const fireOne = (spread, pelletIndex) => pushBullet(world, originX, originY, angle + spread, type.speed, damage, {
     explosive: type.explosive,
     pierce: type.pierce,
     size: type.bulletSize || 4,
-    ownerId: player.id
+    ownerId: player.id,
+    shotId,
+    pelletIndex,
+    weaponId: weapon.id
   });
   if (pellets) {
-    for (let i = 0; i < pellets; i++) fireOne((Math.random() - 0.5) * 0.4);
+    for (let i = 0; i < pellets; i++) fireOne((Math.random() - 0.5) * 0.4, i);
   } else {
-    fireOne(0);
+    fireOne(0, 0);
   }
+  if (PERF_DEBUG) console.debug(`[shot:${shotId}] accepted with ${pellets || 1} projectile(s)`);
   queueEvent(room, {
     kind: 'shot',
+    shotId,
     shooterId: player.id,
     weaponId: weapon.id,
     x: round1(originX),
@@ -1385,8 +1706,10 @@ function spawnRemoteShot(room, player, weapon) {
     speed: type.speed,
     pellets,
     bulletSize: type.bulletSize || 4,
-    explosive: Boolean(type.explosive)
-  }, null, player.id);
+    explosive: Boolean(type.explosive),
+    clientShotTime: Number.isFinite(Number(weapon.clientShotTime)) ? Number(weapon.clientShotTime) : null
+  });
+  return true;
 }
 
 function getShelterBreachPlan(world, zombie, target) {
@@ -1605,11 +1928,14 @@ function updateZombies(room, dt) {
     const nearbyTraps = room.spatial.traps.queryRadius(z.x, z.y, 100);
     for (const trap of nearbyTraps) {
       if (z.health <= 0) break;
-      if (trap.consumed) continue;
-      if (distance(z.x, z.y, trap.x, trap.y) < trap.radius) {
+      if (trap.consumed || (trap.usesRemaining || 0) <= 0) continue;
+      if (now - (trap.lastTriggeredAt || 0) < (trap.triggerCooldown || 700)) continue;
+      if (Math.abs(z.x - trap.x) <= trap.radius && Math.abs(z.y - trap.y) <= trap.radius) {
+        trap.lastTriggeredAt = now;
+        trap.usesRemaining = Math.max(0, (trap.usesRemaining || trap.maxUses || 10) - 1);
         z.lastHitBy = trap.ownerId || z.lastHitBy || null;
         damageZombie(z, trap.damage || 250);
-        if (trap.oneTimeUse) {
+        if (trap.usesRemaining <= 0) {
           trap.consumed = true;
           const trapIndex = world.traps.indexOf(trap);
           if (trapIndex >= 0) world.traps.splice(trapIndex, 1);
@@ -1661,6 +1987,7 @@ function spawnSplitChildren(world, zombie) {
 function updateBullets(room, dt) {
   const world = room.latestWorld;
   const now = nowMs();
+  let collisionTotalMs = 0;
   for (let i = world.bullets.length - 1; i >= 0; i--) {
     const b = world.bullets[i];
     const previousX = b.x;
@@ -1672,6 +1999,8 @@ function updateBullets(room, dt) {
       world.bullets.splice(i, 1);
       continue;
     }
+    const collisionStartedAt = performance.now();
+    try {
     const hitMapWall = querySegment(room.spatial.mapStructures, previousX, previousY, b.x, b.y, 420).some((structure) =>
       WorldMap.structureNearSegment(structure, previousX, previousY, b.x, b.y, b.size || 4) &&
       WorldMap.segmentHitsStructure(structure, previousX, previousY, b.x, b.y, b.size || 4));
@@ -1735,10 +2064,10 @@ function updateBullets(room, dt) {
             }
           } else {
             damageZombie(z, b.damage);
-            if (!b.fromTurret && b.ownerId) {
-              const owner = room.players.get(b.ownerId);
-              if (owner && owner.lifesteal) healPlayer(owner, b.damage * 0.08);
-            }
+          }
+          if (!b.fromTurret && b.ownerId) {
+            const owner = room.players.get(b.ownerId);
+            if (owner && owner.lifesteal) healPlayer(owner, Math.min(12, b.damage * 0.08));
           }
           if (b.pierce > 0 && !b.explosive) {
             b.pierce--;
@@ -1750,7 +2079,11 @@ function updateBullets(room, dt) {
         }
       }
     }
+    } finally {
+      collisionTotalMs += performance.now() - collisionStartedAt;
+    }
   }
+  recordStageDuration(room, 'collisions', collisionTotalMs);
 }
 
 function updateSentries(room) {
@@ -1915,6 +2248,10 @@ function collectNearbyDrops(room) {
       if (!collector) continue;
       const amount = drop.type === 'ammo' ? 24 : drop.type === 'money' ? 8 : drop.type === 'medkit' ? 30 : 1;
       if (drop.type === 'medkit') healPlayer(collector, amount);
+      else if (drop.type === 'money') grantPlayerResources(collector, { money: amount }, true);
+      else if (drop.type === 'wood') grantPlayerResources(collector, { wood: amount }, true);
+      else if (drop.type === 'metal') grantPlayerResources(collector, { metal: amount }, true);
+      else if (drop.type === 'ammo') grantPlayerResources(collector, { ammo: amount });
       queueEvent(room, { kind: 'loot', playerId: collector.id, type: drop.type, amount, x: round1(drop.x), y: round1(drop.y) }, collector.id);
       world.drops.splice(i, 1);
     }
@@ -1925,17 +2262,28 @@ function collectNearbyDrops(room) {
 function recordKillReward(room, zombie) {
   const world = room.latestWorld;
   if (zombie.isBoss) world.bossDefeats = (world.bossDefeats || 0) + 1;
+  const ownerId = zombie.lastHitBy || null;
+  const money = Math.max(1, Math.floor((zombie.reward || 0) * 0.55));
+  const xp = zombie.xp || 0;
+  for (const player of room.players.values()) {
+    const share = !ownerId || player.id === ownerId ? 1 : 0.5;
+    grantPlayerResources(player, {
+      money: Math.max(1, Math.floor(money * share)),
+      parts: player.id === ownerId && zombie.isBoss ? 1 : 0
+    }, true);
+    grantPlayerXp(player, Math.max(1, Math.floor(xp * share)));
+  }
   queueEvent(room, {
     kind: 'killReward',
     zombieId: zombie.id,
     zombieType: zombie.type,
     boss: Boolean(zombie.isBoss),
     miniBoss: Boolean(zombie.isMiniBoss),
-    ownerId: zombie.lastHitBy || null,
+    ownerId,
     x: round1(zombie.x),
     y: round1(zombie.y),
-    money: Math.max(1, Math.floor((zombie.reward || 0) * 0.55)),
-    xp: zombie.xp || 0,
+    money,
+    xp,
     parts: zombie.isBoss ? 1 : 0
   });
 }
@@ -1974,6 +2322,7 @@ function updateWaveState(room) {
   const world = room.latestWorld;
   const now = nowMs();
   if (!room.gameStarted) return;
+  if (world.gameOver) return;
   if (!room.players.size) return;
   if (world.wave === 0 && !world.waveActive && !world.preparationActive) {
     startWave(room);
@@ -1993,6 +2342,17 @@ function updateWaveState(room) {
   }
   if (world.zombiesKilled >= world.totalZombiesInWave && world.zombies.length === 0) {
     world.waveActive = false;
+    const plan = world.currentWavePlan || wavePlan(world.wave, Math.max(1, room.players.size));
+    const reward = plan.waveReward;
+    const teamScale = 1 + Math.max(0, room.players.size - 1) * 0.65;
+    for (const player of room.players.values()) {
+      grantPlayerResources(player, {
+        money: Math.floor(reward.money * teamScale),
+        wood: Math.max(1, Math.round(reward.wood * teamScale)),
+        metal: Math.max(1, Math.round(reward.metal * teamScale))
+      }, true);
+      if (world.wave % 5 === 0) player.milestoneUpgradeCredits = (player.milestoneUpgradeCredits || 0) + 1;
+    }
     const bossPrep = (world.wave + 1) % 10 === 0;
     if (bossPrep) {
       startBossPreparation(room, 35);
@@ -2006,6 +2366,7 @@ function updateWaveState(room) {
 function revivePlayer(player, healthPercent = 0.45) {
   player.health = Math.max(1, Math.ceil((player.maxHealth || 100) * healthPercent));
   player.downed = false;
+  player.eliminated = false;
   player.downedAt = 0;
   player.respawnAt = 0;
   player.giveUpAt = 0;
@@ -2016,14 +2377,19 @@ function revivePlayer(player, healthPercent = 0.45) {
 }
 
 function updatePlayerLifeStates(room, now) {
-  const activeCount = [...room.players.values()].filter((player) => !player.downed && (player.health ?? 100) > 0).length;
   for (const player of room.players.values()) {
     if ((player.health ?? 100) <= 0 && !player.downed) {
       player.health = 0;
       player.downed = true;
+      player.eliminated = false;
       player.downedAt = now;
-      player.respawnAt = now + (room.players.size > 1 ? 15000 : 6000);
-      player.giveUpAt = now + (room.players.size > 1 ? 5000 : 3000);
+      if ((player.emergencyRespawns || 0) < emergencyReviveLimit(player)) {
+        player.respawnAt = now + EMERGENCY_RESPAWN_DELAY_MS;
+        player.giveUpAt = 0;
+      } else {
+        player.respawnAt = 0;
+        player.giveUpAt = now + FINAL_REVIVE_WINDOW_MS;
+      }
       player.reviveProgress = 0;
       player.reviverId = null;
       player.lastReviveTick = 0;
@@ -2033,9 +2399,23 @@ function updatePlayerLifeStates(room, now) {
       player.reviveProgress = Math.max(0, (player.reviveProgress || 0) - 180);
       if (player.reviveProgress === 0) player.reviverId = null;
     }
-    if (now >= player.respawnAt || (activeCount === 0 && now - player.downedAt >= 6000)) {
-      emergencyRespawn(room, player);
+    if (!player.eliminated && (player.emergencyRespawns || 0) >= emergencyReviveLimit(player)
+      && player.giveUpAt > 0 && now >= player.giveUpAt) {
+      player.eliminated = true;
+      player.reviveProgress = 0;
+      player.reviverId = null;
+      queueEvent(room, { kind: 'playerEliminated', playerId: player.id }, null);
     }
+  }
+  const players = [...room.players.values()];
+  if (room.gameStarted && !room.latestWorld.gameOver && players.length && players.every((player) => player.eliminated)) {
+    const world = room.latestWorld;
+    world.gameOver = true;
+    world.waveActive = false;
+    world.preparationActive = false;
+    world.zombies = [];
+    world.bullets = [];
+    queueEvent(room, { kind: 'gameOver', wave: world.wave });
   }
 }
 
@@ -2046,12 +2426,20 @@ function worldScrapPlayerTurrets(room, world, playerId) {
 }
 
 function emergencyRespawn(room, player) {
+  if (!player?.downed || player.eliminated || (player.emergencyRespawns || 0) >= emergencyReviveLimit(player)) return false;
   worldScrapPlayerTurrets(room, room.latestWorld, player.id);
   player.emergencyRespawns = (player.emergencyRespawns || 0) + 1;
+  player.money = Math.floor((player.money || 0) * 0.8);
   player.x = 980;
   player.y = 850;
   revivePlayer(player, 0.45);
-  queueEvent(room, { kind: 'respawned', emergency: true }, player.id);
+  queueEvent(room, {
+    kind: 'respawned',
+    emergency: true,
+    remaining: Math.max(0, emergencyReviveLimit(player) - player.emergencyRespawns),
+    limit: emergencyReviveLimit(player)
+  }, player.id);
+  return true;
 }
 
 function updateDayNight(world, now) {
@@ -2068,6 +2456,16 @@ function tickRoom(room) {
   room.snapshotAccumulator += dt;
   room.latestWorld.serverTime = now;
   updateDayNight(room.latestWorld, now);
+  if (now >= room.nextPerfPublishAt) {
+    room.nextPerfPublishAt = now + 500;
+    room.reportedPerf = {
+      tickMs: round2(room.tickEma || 0),
+      zombieAiMs: round2(room.stageEma.zombies || 0),
+      collisionMs: round2(room.stageEma.collisions || 0),
+      projectileMs: round2(Math.max(0, (room.stageEma.bullets || 0) - (room.stageEma.collisions || 0))),
+      serializationMs: round2(room.stageEma.serialization || 0)
+    };
+  }
 
   for (const [id, player] of room.players) {
     const idleLimit = player.disconnectedAt ? 6000 : 15000;
@@ -2156,6 +2554,59 @@ function cleanId(value, max = 48) {
 function findByNetworkId(list, networkId) {
   if (!networkId) return null;
   return list.find((entry) => entry.networkId === networkId || entry.id === networkId) || null;
+}
+
+function turretUpgradeCost(level) {
+  return { money: 80 + level * 80, wood: 2 + level, metal: 3 + level * 2 };
+}
+
+function trapUpgradeCost(level) {
+  return { money: 60 + level * 60, wood: 2 + level, metal: 2 + level * 2 };
+}
+
+function turretRepairCost(sentry) {
+  if (!sentry?.maxHealth || sentry.health >= sentry.maxHealth) return null;
+  const missing = 1 - sentry.health / sentry.maxHealth;
+  return { wood: Math.max(1, Math.ceil(missing * 4)), metal: Math.max(1, Math.ceil(missing * 5)) };
+}
+
+function wallRepairCost(wall) {
+  if (!wall?.maxHealth || wall.health >= wall.maxHealth) return null;
+  const missing = 1 - wall.health / wall.maxHealth;
+  return {
+    wood: Math.max(1, Math.ceil(missing * 5)),
+    metal: wall.wallStage >= 2 ? Math.max(1, Math.ceil(missing * 4)) : 0
+  };
+}
+
+function repairAllCost(world, player) {
+  const defenses = [...world.sentries, ...world.walls, ...world.buildings];
+  const missing = defenses.reduce((total, defense) => total + Math.max(0, (defense.maxHealth || 0) - (defense.health || 0)), 0);
+  const discount = playerSkinPerk(player, 'repairDiscount') ? 0.95 : 1;
+  return {
+    money: Math.ceil(missing / 28 * discount),
+    wood: Math.ceil(missing / 95 * discount),
+    metal: Math.ceil(missing / 125 * discount)
+  };
+}
+
+function repairAllStructures(world) {
+  for (const entity of [...world.sentries, ...world.walls, ...world.buildings]) {
+    if (entity.maxHealth) entity.health = entity.maxHealth;
+  }
+}
+
+function weaponUpgradeCost(level) {
+  return { money: 650 + level * 650, metal: 10 + level * 7, parts: level >= 2 ? 1 : 0 };
+}
+
+function techTierUpgradeCost(tier) {
+  return { money: 1800 * tier, wood: 25 * tier, metal: 30 * tier, parts: tier };
+}
+
+function rejectPurchase(room, clientId, action, reason) {
+  rejectAction(room, clientId, action, action, reason);
+  return false;
 }
 
 function handleAction(room, packet) {
@@ -2248,16 +2699,98 @@ function handleActionUnsafe(room, packet) {
     }
     return;
   }
+  if (PERF_DEBUG && kind === 'debugSetSentry') {
+    const sentry = findByNetworkId(world.sentries, cleanId(action.networkId, 64));
+    if (!sentry) return;
+    if (Number.isFinite(Number(action.ammo))) sentry.ammo = clamp(Math.floor(Number(action.ammo)), 0, sentry.maxAmmo || 0);
+    if (Number.isFinite(Number(action.health))) sentry.health = clamp(Number(action.health), 0, sentry.maxHealth || 0);
+    return;
+  }
+  if (PERF_DEBUG && kind === 'debugSetPlayer' && player) {
+    if (Number.isFinite(Number(action.x))) player.x = Number(action.x);
+    if (Number.isFinite(Number(action.y))) player.y = Number(action.y);
+    if (Number.isFinite(Number(action.health))) {
+      player.health = clamp(Number(action.health), 0, player.maxHealth || 100);
+    }
+    if (Number.isFinite(Number(action.emergencyRespawns))) {
+      player.emergencyRespawns = clamp(Math.floor(Number(action.emergencyRespawns)), 0, emergencyReviveLimit(player));
+    }
+    if (action.downed) {
+      player.health = 0;
+      player.downed = true;
+      player.eliminated = false;
+      player.downedAt = now;
+      player.reviveProgress = 0;
+      player.reviverId = null;
+      if (player.emergencyRespawns < emergencyReviveLimit(player)) {
+        player.respawnAt = now + clamp(Math.floor(Number(action.respawnDelayMs) || EMERGENCY_RESPAWN_DELAY_MS), 50, EMERGENCY_RESPAWN_DELAY_MS);
+        player.giveUpAt = 0;
+      } else {
+        player.respawnAt = 0;
+        player.giveUpAt = now + clamp(Math.floor(Number(action.finalWindowMs) || FINAL_REVIVE_WINDOW_MS), 100, FINAL_REVIVE_WINDOW_MS);
+      }
+    }
+    return;
+  }
+  if (PERF_DEBUG && kind === 'debugBuildStation' && clientId === room.hostId && player) {
+    const stationId = cleanId(action.stationId, 32);
+    if (world.buildings.some((building) => building.id === stationId)) return;
+    const definition = BUILDING_DEFINITIONS.get(stationId);
+    if (!definition) return;
+    const station = sanitizeBuildEntity('building', {
+      id: stationId,
+      x: Number(action.x) || player.x,
+      y: Number(action.y) || player.y,
+      networkId: `debug-${stationId}`
+    }, clientId, player);
+    world.buildings.push(station);
+    room.structuresRevision += 1;
+    return;
+  }
+  if (PERF_DEBUG && kind === 'debugSpawnBoss' && clientId === room.hostId) {
+    world.zombies = [];
+    world.bullets = [];
+    world.wave = Math.max(10, clamp(Math.floor(Number(action.wave) || 10), 10, 999));
+    world.currentWavePlan = wavePlan(world.wave, Math.max(1, room.players.size));
+    world.bossesToSpawn = 1;
+    world.miniBossesToSpawn = 0;
+    world.escortsToSpawn = 0;
+    world.totalZombiesInWave = 1;
+    world.zombiesKilled = 0;
+    world.waveActive = true;
+    spawnZombie(room);
+    return;
+  }
+  if (PERF_DEBUG && kind === 'debugStartNextWave' && clientId === room.hostId) {
+    world.gameOver = false;
+    startWave(room);
+    return;
+  }
+  if (PERF_DEBUG && kind === 'debugGrant' && player) {
+    grantPlayerResources(player, {
+      money: clamp(Math.floor(Number(action.money) || 0), 0, 100000),
+      wood: clamp(Math.floor(Number(action.wood) || 0), 0, 10000),
+      metal: clamp(Math.floor(Number(action.metal) || 0), 0, 10000),
+      ammo: clamp(Math.floor(Number(action.ammo) || 0), 0, 10000),
+      parts: clamp(Math.floor(Number(action.parts) || 0), 0, 1000)
+    });
+    player.skillPoints += clamp(Math.floor(Number(action.skillPoints) || 0), 0, 100);
+    player.milestoneUpgradeCredits += clamp(Math.floor(Number(action.milestoneUpgradeCredits) || 0), 0, 20);
+    grantPlayerXp(player, clamp(Math.floor(Number(action.xp) || 0), 0, 100000));
+    return;
+  }
   if (kind === 'startGame') {
-    if (clientId && clientId !== room.hostId) return;
+    if (!clientId || clientId !== room.hostId) return rejectAction(room, clientId, kind, null, 'Only the room host can start the run.');
+    if (room.gameStarted) return;
     room.gameStarted = true;
     world.gameStarted = true;
+    world.gameOver = false;
     broadcast(room, { type: 'startGame', id: 'server', room: room.code, hostId: room.hostId });
     announceRoom(room);
     return;
   }
   if (kind === 'build') {
-    if (!action.entity || typeof action.entity !== 'object' || Array.isArray(action.entity)) return;
+    if (!player || !action.entity || typeof action.entity !== 'object' || Array.isArray(action.entity)) return;
     const buildKind = cleanId(action.buildKind, 16);
     const target = buildKind === 'turret'
       ? world.sentries
@@ -2271,14 +2804,27 @@ function handleActionUnsafe(room, packet) {
     const networkId = cleanId(action.entity.networkId, 64);
     if (!target) return;
     if (networkId && target.some((entry) => entry.networkId === networkId)) return;
+    const definition = canonicalBuildDefinition(buildKind, action.entity);
+    if (!definition) return rejectAction(room, clientId, kind, networkId, 'That build recipe does not exist.');
+    const requiredTier = Math.max(1, Number(definition.techLevel) || 1);
+    if (requiredTier > (world.techTier || 1) || requiredTier > (world.workbenchLevel || 1)) {
+      return rejectAction(room, clientId, kind, networkId, `Requires Tech and Workbench Tier ${requiredTier}.`);
+    }
+    if (definition.requiredBuilding && !buildingOnline(world, definition.requiredBuilding)) {
+      const station = BUILDING_DEFINITIONS.get(definition.requiredBuilding);
+      return rejectAction(room, clientId, kind, networkId, `Build ${station?.name || 'the required support station'} first.`);
+    }
     const entity = sanitizeBuildEntity(buildKind, {
       ...action.entity,
       x: action.x ?? action.entity.x,
       y: action.y ?? action.entity.y
-    }, clientId);
+    }, clientId, player);
     if (!validateBuildPlacement(buildKind, entity, world)) {
       queueEvent(room, { kind: 'buildRejected', buildKind, networkId: entity.networkId, reason: 'The server could not place that here.' }, clientId);
       return;
+    }
+    if (!spendPlayerCost(player, definition.cost || {})) {
+      return rejectAction(room, clientId, kind, entity.networkId, 'Not enough resources for that build.');
     }
     target.push(entity);
     room.structuresRevision += 1;
@@ -2286,13 +2832,18 @@ function handleActionUnsafe(room, packet) {
   }
   if (kind === 'shot') {
     if (!action.weapon || typeof action.weapon !== 'object') return;
-    spawnRemoteShot(room, { id: clientId }, { id: cleanId(action.weapon.id, 32), angle: Number(action.angle) });
+    spawnRemoteShot(room, { id: clientId }, {
+      id: cleanId(action.weapon.id, 32),
+      angle: Number(action.angle),
+      shotId: cleanId(action.shotId, 80),
+      clientShotTime: Number(action.clientShotTime)
+    });
     return;
   }
   if (kind === 'revive') {
     const reviver = player;
     const target = room.players.get(cleanId(action.targetId));
-    if (!reviver || !target || reviver.downed || !target.downed) return;
+    if (!reviver || !target || reviver.downed || target.eliminated || !target.downed) return;
     if (distance(reviver.x, reviver.y, target.x, target.y) > 82) return;
     const continued = target.reviverId === clientId && target.lastReviveTick && now - target.lastReviveTick <= 420;
     target.reviverId = clientId;
@@ -2302,15 +2853,98 @@ function handleActionUnsafe(room, packet) {
     return;
   }
   if (kind === 'requestRespawn') {
-    if (!player || !player.downed || now < (player.giveUpAt || player.respawnAt)) return;
+    if (!player || !player.downed || player.eliminated || (player.emergencyRespawns || 0) >= emergencyReviveLimit(player)) return;
+    if (!player.respawnAt || now < player.respawnAt) return;
     emergencyRespawn(room, player);
     return;
   }
-  if (kind === 'heal') {
+  if (kind === 'buySkill') {
     if (!player) return;
-    const amount = clamp(Number(action.amount) || 0, 0, 250);
-    if (amount > 0) healPlayer(player, amount);
+    const skillId = cleanId(action.skillId, 32);
+    const cap = SKILL_CAPS.get(skillId);
+    const current = Number(player.skillLevels?.[skillId]) || 0;
+    if (!cap || current >= cap) return rejectPurchase(room, clientId, kind, 'That skill is already maxed.');
+    if (player.skillPoints <= 0) return rejectPurchase(room, clientId, kind, 'No skill points available.');
+    player.skillPoints -= 1;
+    player.skillLevels[skillId] = current + 1;
+    refreshPlayerDerivedStats(player, { healIncrease: true });
+    queueEvent(room, { kind: 'progressionNotice', message: `${GameContent.skills.find((skill) => skill.id === skillId)?.name || 'Skill'} upgraded.` }, clientId);
     return;
+  }
+  if (kind === 'buyUtilityUpgrade') {
+    if (!player) return;
+    const upgradeId = cleanId(action.upgradeId, 32);
+    const definition = UTILITY_UPGRADE_DEFINITIONS.get(upgradeId);
+    if (!definition) return rejectPurchase(room, clientId, kind, 'That workbench upgrade does not exist.');
+    if (player.upgrades?.[upgradeId]) return rejectPurchase(room, clientId, kind, 'That workbench upgrade is already installed.');
+    if (!spendPlayerCost(player, definition.cost)) return rejectPurchase(room, clientId, kind, 'Not enough resources for that workbench upgrade.');
+    player.upgrades ||= { autoLoot: false, autoRefill: false, turretSpeed: false };
+    player.upgrades[upgradeId] = true;
+    refreshPlayerDerivedStats(player);
+    queueEvent(room, { kind: 'progressionNotice', message: `${definition.name} installed.` }, clientId);
+    return;
+  }
+  if (kind === 'buyWeapon') {
+    if (!player) return;
+    const weaponId = cleanId(action.weaponId, 32);
+    const definition = WEAPON_DEFINITIONS.get(weaponId);
+    const owned = player.weapons.find((weapon) => weapon.id === weaponId);
+    if (!definition || !owned || owned.owned) return rejectPurchase(room, clientId, kind, 'That weapon cannot be purchased.');
+    if (world.wave < (definition.requiredWave || 0)) return rejectPurchase(room, clientId, kind, `Unlocks at wave ${definition.requiredWave}.`);
+    if (!spendPlayerCost(player, { money: definition.cost || 0 })) return rejectPurchase(room, clientId, kind, 'Not enough cash.');
+    owned.owned = true;
+    owned.currentAmmo = weaponMaxAmmo(weaponId, owned.upgradeLevel, player.runUpgradeCounts?.deepPockets || 0);
+    player.reserveAmmo += definition.ammoCost || definition.maxAmmo * 2;
+    return;
+  }
+  if (kind === 'upgradeWeapon') {
+    if (!player) return;
+    const weaponId = cleanId(action.weaponId, 32);
+    const owned = player.weapons.find((weapon) => weapon.id === weaponId);
+    const level = Number(owned?.upgradeLevel) || 0;
+    if (!owned?.owned || level >= 5) return rejectPurchase(room, clientId, kind, 'That weapon cannot be upgraded.');
+    if (!spendPlayerCost(player, weaponUpgradeCost(level))) return rejectPurchase(room, clientId, kind, 'Not enough resources for the weapon upgrade.');
+    const oldMax = weaponMaxAmmo(weaponId, level, player.runUpgradeCounts?.deepPockets || 0);
+    owned.upgradeLevel = level + 1;
+    const newMax = weaponMaxAmmo(weaponId, level + 1, player.runUpgradeCounts?.deepPockets || 0);
+    owned.currentAmmo = Math.min(newMax, (owned.currentAmmo || 0) + newMax - oldMax);
+    return;
+  }
+  if (kind === 'reloadWeapon') {
+    if (!player) return;
+    const weaponId = cleanId(action.weaponId, 32);
+    const definition = WEAPON_DEFINITIONS.get(weaponId);
+    const owned = player.weapons.find((weapon) => weapon.id === weaponId && weapon.owned);
+    if (!definition || !owned) return rejectPurchase(room, clientId, kind, 'Weapon is not owned.');
+    const maxAmmo = weaponMaxAmmo(weaponId, owned.upgradeLevel, player.runUpgradeCounts?.deepPockets || 0);
+    const currentAmmo = clamp(Math.floor(Number(owned.currentAmmo) || 0), 0, maxAmmo);
+    if (currentAmmo >= maxAmmo) return;
+    if (definition.ammoCost) {
+      if (player.reserveAmmo < definition.ammoCost) return rejectPurchase(room, clientId, kind, 'Not enough reserve ammo.');
+      player.reserveAmmo -= definition.ammoCost;
+      owned.currentAmmo = maxAmmo;
+      return;
+    }
+    const transfer = Math.min(maxAmmo - currentAmmo, player.reserveAmmo);
+    if (transfer <= 0) return rejectPurchase(room, clientId, kind, 'No reserve ammo.');
+    player.reserveAmmo -= transfer;
+    owned.currentAmmo = currentAmmo + transfer;
+    return;
+  }
+  if (kind === 'emergencyReload') {
+    if (!player || !playerSkinPerk(player, 'emergencyReload')) return;
+    if (now < (player.nextEmergencyReloadAt || 0)) return rejectPurchase(room, clientId, kind, 'Emergency reload is cooling down.');
+    const weaponId = cleanId(action.weaponId, 32);
+    const owned = player.weapons.find((weapon) => weapon.id === weaponId && weapon.owned);
+    if (!owned) return rejectPurchase(room, clientId, kind, 'Weapon is not owned.');
+    const maxAmmo = weaponMaxAmmo(weaponId, owned.upgradeLevel, player.runUpgradeCounts?.deepPockets || 0);
+    if ((owned.currentAmmo || 0) >= maxAmmo) return;
+    owned.currentAmmo = maxAmmo;
+    player.nextEmergencyReloadAt = now + 40000;
+    return;
+  }
+  if (kind === 'heal') {
+    return rejectPurchase(room, clientId, kind, 'Healing must come from a server-validated item.');
   }
   if (kind === 'toggleDoor') {
     const structure = world.mapStructures.find((entry) => entry.id === cleanId(action.structureId, 64));
@@ -2338,12 +2972,111 @@ function handleActionUnsafe(room, packet) {
     if (distance(player.x, player.y, drop.x, drop.y) > (drop.interactionRadius || 72) + 16) return;
     drop.collected = true;
     drop.collectedBy = clientId;
+    grantPlayerResources(player, drop.rewards || {});
     queueEvent(room, { kind: 'supplyCollected', playerId: clientId, rewards: drop.rewards });
+    return;
+  }
+  if (kind === 'buyAmmoPack') {
+    if (!player) return;
+    const packId = cleanId(action.packId, 24);
+    const source = cleanId(action.source, 16) || 'shop';
+    const pack = GameContent.ammoPacks.find((entry) => entry.id === packId);
+    if (!pack || !['shop', 'workbench', 'trader'].includes(source)) return rejectPurchase(room, clientId, kind, 'Ammo pack not found.');
+    const traderPurchase = source === 'trader';
+    if (traderPurchase) {
+      const trader = world.trader;
+      if (!world.preparationActive || !trader || !trader.ammoDeals?.includes(packId) || (trader.stock?.[packId] || 0) <= 0) {
+        return rejectPurchase(room, clientId, kind, 'That trader stock is unavailable.');
+      }
+      if (distance(player.x, player.y, trader.x, trader.y) > (trader.interactionRadius || 78) + 30) {
+        return rejectPurchase(room, clientId, kind, 'Move closer to the trader.');
+      }
+    }
+    const cost = { ...(pack.cost || {}) };
+    if (traderPurchase && cost.money) cost.money = Math.max(1, Math.floor(cost.money * 0.72));
+    if (!spendPlayerCost(player, cost)) return rejectPurchase(room, clientId, kind, 'Not enough resources for ammo.');
+    player.reserveAmmo += pack.ammo || 0;
+    if (pack.refillWeapons) {
+      for (const weapon of player.weapons) {
+        if (weapon.owned) weapon.currentAmmo = weaponMaxAmmo(weapon.id, weapon.upgradeLevel, player.runUpgradeCounts?.deepPockets || 0);
+      }
+    }
+    if (traderPurchase) world.trader.stock[packId] -= 1;
+    return;
+  }
+  if (kind === 'buyTraderItem') {
+    if (!player || !world.preparationActive || !world.trader) return rejectPurchase(room, clientId, kind, 'The trader is not available.');
+    const itemId = cleanId(action.itemId, 24);
+    const item = TRADER_ITEMS[itemId];
+    if (!item || (world.trader.stock?.[itemId] || 0) <= 0) return rejectPurchase(room, clientId, kind, 'That item is sold out.');
+    if (distance(player.x, player.y, world.trader.x, world.trader.y) > (world.trader.interactionRadius || 78) + 30) {
+      return rejectPurchase(room, clientId, kind, 'Move closer to the trader.');
+    }
+    if (!spendPlayerCost(player, item.cost)) return rejectPurchase(room, clientId, kind, 'Not enough cash.');
+    world.trader.stock[itemId] -= 1;
+    if (item.reward) grantPlayerResources(player, item.reward);
+    if (item.repairAll) repairAllStructures(world);
+    return;
+  }
+  if (kind === 'buyPotion') {
+    if (!player) return;
+    const recipe = GameContent.potionRecipes.find((entry) => entry.id === cleanId(action.recipeId, 32));
+    const station = world.buildings.find((entry) => entry.id === 'potionHut');
+    if (!recipe || !station || distance(player.x, player.y, station.x, station.y) > (station.interactionRadius || 90) + 35) {
+      return rejectPurchase(room, clientId, kind, 'Use a nearby Potion Hut.');
+    }
+    if (recipe.type === 'instantHeal' && player.health >= player.maxHealth) {
+      return rejectPurchase(room, clientId, kind, 'Health is already full.');
+    }
+    if (!spendPlayerCost(player, recipe.cost)) return rejectPurchase(room, clientId, kind, 'Not enough resources for that potion.');
+    if (recipe.type === 'instantHeal') {
+      const healed = healPlayer(player, recipe.multiplier || 0);
+      queueEvent(room, { kind: 'healed', amount: Math.round(healed), source: recipe.name }, clientId);
+    } else player.potionExpiries[recipe.type] = now + recipe.duration;
+    refreshPlayerDerivedStats(player);
+    return;
+  }
+  if (kind === 'buyLife') {
+    if (!player || player.downed || player.eliminated) return rejectPurchase(room, clientId, kind, 'You cannot buy a life while downed.');
+    if ((world.techTier || 1) < 3 || (world.workbenchLevel || 1) < 3) {
+      return rejectPurchase(room, clientId, kind, 'Life Contracts unlock at Tech III and Workbench Level 3.');
+    }
+    const price = lifePurchaseCost(player);
+    if (!spendPlayerCost(player, { money: price })) return rejectPurchase(room, clientId, kind, 'Not enough cash for another Life Contract.');
+    player.lifePurchases = (player.lifePurchases || 0) + 1;
+    queueEvent(room, {
+      kind: 'progressionNotice',
+      message: `Life Contract purchased. Emergency revive limit: ${emergencyReviveLimit(player)}.`
+    }, clientId);
+    return;
+  }
+  if (kind === 'buyAmmoForge') {
+    if (!player) return;
+    const option = AMMO_FORGE_OPTIONS[cleanId(action.optionId, 24)];
+    const station = world.buildings.find((entry) => entry.id === 'ammoForge');
+    if (!option || !station || distance(player.x, player.y, station.x, station.y) > (station.interactionRadius || 90) + 35) {
+      return rejectPurchase(room, clientId, kind, 'Use a nearby Ammo Forge.');
+    }
+    if (!spendPlayerCost(player, option.cost)) return rejectPurchase(room, clientId, kind, 'Not enough resources for the forge.');
+    grantPlayerResources(player, option);
+    return;
+  }
+  if (kind === 'upgradeWorkbench') {
+    if (!player) return;
+    const current = world.workbenchLevel || 1;
+    const next = GameContent.workbenchLevels[current];
+    if (!next) return rejectPurchase(room, clientId, kind, 'Workbench is already maxed.');
+    if ((world.techTier || 1) < next.level) return rejectPurchase(room, clientId, kind, `Unlock Tech Tier ${next.level} first.`);
+    if (!spendPlayerCost(player, next.cost)) return rejectPurchase(room, clientId, kind, 'Not enough resources for the workbench upgrade.');
+    world.workbenchLevel = next.level;
     return;
   }
   if (kind === 'upgradeTechTier') {
     const requested = clamp(Math.floor(Number(action.tier) || 0), 1, 4);
-    if (requested === (world.techTier || 1) + 1) world.techTier = requested;
+    const current = world.techTier || 1;
+    if (!player || requested !== current + 1) return rejectPurchase(room, clientId, kind, 'Invalid tech tier request.');
+    if (!spendPlayerCost(player, techTierUpgradeCost(current))) return rejectPurchase(room, clientId, kind, 'Not enough resources for the tech tier.');
+    world.techTier = requested;
     return;
   }
   if (kind === 'refillTurret') {
@@ -2352,6 +3085,7 @@ function handleActionUnsafe(room, packet) {
     if (!player || !sentry) return rejectAction(room, clientId, kind, networkId, 'That turret is gone.');
     if (distance(player.x, player.y, sentry.x, sentry.y) > 70) return rejectAction(room, clientId, kind, networkId, 'Move closer to refill.');
     if (sentry.ammo >= sentry.maxAmmo) return rejectAction(room, clientId, kind, networkId, 'Turret already full.');
+    if (!spendPlayerCost(player, { wood: 1, metal: 1 })) return rejectAction(room, clientId, kind, networkId, 'Need 1 wood and 1 metal.');
     sentry.ammo = sentry.maxAmmo;
     return;
   }
@@ -2362,7 +3096,10 @@ function handleActionUnsafe(room, packet) {
     if (!player || !sentry || !['damage', 'fireRate', 'range', 'ammo'].includes(stat)) return rejectAction(room, clientId, kind, networkId, 'That turret is gone.');
     sentry.upgradeLevels = sentry.upgradeLevels && typeof sentry.upgradeLevels === 'object' ? sentry.upgradeLevels : { damage: 0, fireRate: 0, range: 0, ammo: 0 };
     const level = Number(sentry.upgradeLevels[stat]) || 0;
-    if (level >= 10) return rejectAction(room, clientId, kind, networkId, 'Turret upgrade maxed.');
+    const hasAdvancedBench = world.buildings.some((building) => building.id === 'advancedTurretBench');
+    const cap = (world.workbenchLevel || 1) * 2 + (hasAdvancedBench ? 2 : 0);
+    if (level >= cap) return rejectAction(room, clientId, kind, networkId, 'Turret upgrade maxed for this bench.');
+    if (!spendPlayerCost(player, turretUpgradeCost(level))) return rejectAction(room, clientId, kind, networkId, 'Not enough resources for the turret upgrade.');
     sentry.upgradeLevels[stat] = level + 1;
     if (stat === 'damage') sentry.damage = (sentry.damage || 20) * 1.2;
     if (stat === 'fireRate') sentry.fireRate = (sentry.fireRate || 200) * 0.88;
@@ -2373,20 +3110,48 @@ function handleActionUnsafe(room, packet) {
     }
     return;
   }
+  if (kind === 'upgradeTrap') {
+    const networkId = cleanId(action.networkId, 64);
+    const stat = cleanId(action.stat, 16);
+    const trap = findByNetworkId(world.traps, networkId);
+    if (!player || !trap || !['damage', 'radius', 'uses'].includes(stat)) {
+      return rejectAction(room, clientId, kind, networkId, 'That trap is gone.');
+    }
+    trap.upgradeLevels = trap.upgradeLevels && typeof trap.upgradeLevels === 'object'
+      ? trap.upgradeLevels
+      : { damage: 0, radius: 0, uses: 0 };
+    const level = Number(trap.upgradeLevels[stat]) || 0;
+    const cap = (world.workbenchLevel || 1) + (buildingOnline(world, 'trapBench') ? 2 : 0);
+    if (level >= cap) return rejectAction(room, clientId, kind, networkId, 'Trap upgrade maxed for this bench.');
+    if (!spendPlayerCost(player, trapUpgradeCost(level))) {
+      return rejectAction(room, clientId, kind, networkId, 'Not enough resources for the trap upgrade.');
+    }
+    trap.upgradeLevels[stat] = level + 1;
+    if (stat === 'damage') trap.damage = (trap.damage || 250) * 1.2;
+    if (stat === 'radius') trap.radius = (trap.radius || 20) + 4;
+    if (stat === 'uses') {
+      trap.maxUses = (trap.maxUses || 10) + 5;
+      trap.usesRemaining = Math.min(trap.maxUses, (trap.usesRemaining || 0) + 5);
+    }
+    return;
+  }
   if (kind === 'repairStructure') {
     const networkId = cleanId(action.networkId, 64);
     const structureKind = cleanId(action.structureKind, 16);
     const list = structureKind === 'turret' ? world.sentries : structureKind === 'wall' ? world.walls : structureKind === 'building' ? world.buildings : null;
     const entity = list ? findByNetworkId(list, networkId) : null;
     if (!player || !entity) return rejectAction(room, clientId, kind, networkId, 'That defense is gone.');
+    const cost = structureKind === 'turret' ? turretRepairCost(entity) : structureKind === 'wall' ? wallRepairCost(entity) : null;
+    if (!cost) return rejectAction(room, clientId, kind, networkId, 'That defense is already repaired.');
+    if (!spendPlayerCost(player, cost)) return rejectAction(room, clientId, kind, networkId, 'Not enough resources to repair it.');
     entity.health = entity.maxHealth || entity.health;
     return;
   }
   if (kind === 'repairAll') {
     if (!player) return;
-    for (const entity of [...world.sentries, ...world.walls, ...world.buildings]) {
-      if (entity.maxHealth) entity.health = entity.maxHealth;
-    }
+    const cost = repairAllCost(world, player);
+    if (!spendPlayerCost(player, cost)) return rejectAction(room, clientId, kind, 'all', 'Not enough resources for crew repairs.');
+    repairAllStructures(world);
     return;
   }
   if (kind === 'upgradeWall') {
@@ -2396,6 +3161,10 @@ function handleActionUnsafe(room, packet) {
     if (!player || !wall) return rejectAction(room, clientId, kind, networkId, 'That wall is gone.');
     if (!Number.isFinite(stage) || stage !== (wall.wallStage || 0) + 1 || !WALL_STAGES[stage]) return rejectAction(room, clientId, kind, networkId, 'Wall cannot be upgraded further.');
     const next = WALL_STAGES[stage];
+    if (next.techLevel > (world.workbenchLevel || 1) || next.techLevel > (world.techTier || 1)) {
+      return rejectAction(room, clientId, kind, networkId, `Requires Tech and Workbench Tier ${next.techLevel}.`);
+    }
+    if (!spendPlayerCost(player, next.upgradeCost || {})) return rejectAction(room, clientId, kind, networkId, 'Not enough resources for the wall upgrade.');
     const ratio = wall.maxHealth ? wall.health / wall.maxHealth : 1;
     wall.name = next.name;
     wall.color = next.color;
@@ -2412,9 +3181,20 @@ function handleActionUnsafe(room, packet) {
   if (kind === 'runUpgrade') {
     if (!player) return;
     const id = cleanId(action.id, 24);
+    if (!RUN_UPGRADE_IDS.has(id) || (player.milestoneUpgradeCredits || 0) <= 0) {
+      return rejectPurchase(room, clientId, kind, 'No milestone upgrade choice is available.');
+    }
+    player.milestoneUpgradeCredits -= 1;
+    player.runUpgradeCounts[id] = (player.runUpgradeCounts[id] || 0) + 1;
     const ownedSentries = world.sentries.filter((entry) => entry.ownerId === clientId);
     const ownedWalls = world.walls.filter((entry) => entry.ownerId === clientId);
-    if (id === 'turretCore') {
+    if (id === 'vitality') {
+      refreshPlayerDerivedStats(player);
+      const healed = healPlayer(player, 25);
+      queueEvent(room, { kind: 'healed', amount: Math.round(healed), source: 'Emergency Rations' }, clientId);
+    } else if (id === 'caliber' || id === 'rapidFire' || id === 'salvage') {
+      refreshPlayerDerivedStats(player);
+    } else if (id === 'turretCore') {
       for (const sentry of ownedSentries) {
         sentry.damage = (sentry.damage || 20) * 1.15;
         sentry.fireRate = (sentry.fireRate || 200) * 0.87;
@@ -2429,6 +3209,15 @@ function handleActionUnsafe(room, packet) {
     } else if (id === 'fieldRepair') {
       for (const defense of [...ownedSentries, ...ownedWalls]) {
         defense.health = Math.min(defense.maxHealth || defense.health, (defense.health || 0) + (defense.maxHealth || 0) * 0.4);
+      }
+    } else if (id === 'deepPockets') {
+      player.reserveAmmo += 80;
+      const count = player.runUpgradeCounts.deepPockets || 0;
+      for (const weapon of player.weapons) {
+        if (!weapon.owned) continue;
+        const previousMax = weaponMaxAmmo(weapon.id, weapon.upgradeLevel, count - 1);
+        const nextMax = weaponMaxAmmo(weapon.id, weapon.upgradeLevel, count);
+        weapon.currentAmmo = Math.min(nextMax, (weapon.currentAmmo || 0) + nextMax - previousMax);
       }
     }
     return;

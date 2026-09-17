@@ -61,11 +61,12 @@ function foldZombies(snapshots) {
   const joiner = await connect('smoke-joiner', false);
   host.socket.send(JSON.stringify({ type: 'action', id: 'smoke-host', room, action: { kind: 'startGame' } }));
   await new Promise((resolve) => setTimeout(resolve, 700));
+  const shotId = `smoke-host:${Date.now()}`;
   host.socket.send(JSON.stringify({
     type: 'action',
     id: 'smoke-host',
     room,
-    action: { kind: 'shot', weapon: { id: 'pistol' }, angle: 0, clientTime: Date.now() }
+    action: { kind: 'shot', weapon: { id: 'pistol' }, angle: 0, shotId, clientShotTime: Date.now() }
   }));
   await new Promise((resolve) => setTimeout(resolve, 3500));
 
@@ -76,9 +77,9 @@ function foldZombies(snapshots) {
   const joinStarted = joiner.snapshots.some((snapshot) => snapshot.gameStarted === true);
   if (!hostStarted || !joinStarted) throw new Error('Shared game did not start');
   if (hostWorld.serverTime <= host.snapshots[0].serverTime) throw new Error('Server world clock did not advance');
-  const shotSynced = joiner.events.some((event) => event.kind === 'shot' && event.shooterId === 'smoke-host');
+  const shotSynced = joiner.events.filter((event) => event.kind === 'shot' && event.shotId === shotId).length === 1;
   if (!shotSynced) throw new Error('Server-validated shot event did not reach the second client');
-  if (host.events.some((event) => event.kind === 'shot' && event.shooterId === 'smoke-host')) throw new Error('Shooter received its own shot event');
+  if (host.events.filter((event) => event.kind === 'shot' && event.shotId === shotId).length !== 1) throw new Error('Shooter did not receive exactly one authoritative shot acknowledgement');
 
   const hostZombies = foldZombies(host.snapshots);
   const joinZombies = foldZombies(joiner.snapshots);

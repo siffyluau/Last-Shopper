@@ -36,6 +36,7 @@
             this.pingMs = 0;
             this.snapshotTimes = [];
             this.incomingByteSamples = [];
+            this.outgoingByteSamples = [];
             this.incomingEventCounts = Object.create(null);
             this.metricsStartedAt = performance.now();
         }
@@ -167,6 +168,9 @@
             }
             if (packet.type === 'world') {
                 this.snapshotTimes.push(performance.now());
+                for (const event of packet.world?.events || []) {
+                    if (event?.kind === 'shot') this.recordIncomingEvent('shotEvent');
+                }
                 if (this.serverAuthoritative || !this.isHost) this.onWorld(packet.world);
                 return;
             }
@@ -202,7 +206,9 @@
         sendPacket(packet) {
             if (this.channel) this.channel.postMessage(packet);
             if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-                this.socket.send(JSON.stringify(packet));
+                const payload = JSON.stringify(packet);
+                this.outgoingByteSamples.push({ at: performance.now(), bytes: payload.length });
+                this.socket.send(payload);
             }
         }
 
@@ -216,21 +222,24 @@
             this.incomingEventCounts = Object.create(null);
             this.snapshotTimes.length = 0;
             this.incomingByteSamples.length = 0;
+            this.outgoingByteSamples.length = 0;
         }
 
         getMetrics() {
             const cutoff = performance.now() - 1000;
             while (this.snapshotTimes.length && this.snapshotTimes[0] < cutoff) this.snapshotTimes.shift();
             while (this.incomingByteSamples.length && this.incomingByteSamples[0].at < cutoff) this.incomingByteSamples.shift();
+            while (this.outgoingByteSamples.length && this.outgoingByteSamples[0].at < cutoff) this.outgoingByteSamples.shift();
             const elapsedSeconds = Math.max(0.001, (performance.now() - this.metricsStartedAt) / 1000);
             const eventRates = {};
-            for (const name of ['worldSnapshot', 'playerState', 'zombieUpdate', 'projectileUpdate', 'gameState', 'serverControl', 'action', 'pong', 'hello']) {
+            for (const name of ['worldSnapshot', 'playerState', 'zombieUpdate', 'projectileUpdate', 'gameState', 'serverControl', 'action', 'pong', 'hello', 'shotEvent']) {
                 eventRates[name] = (this.incomingEventCounts[name] || 0) / elapsedSeconds;
             }
             return {
                 pingMs: this.pingMs,
                 snapshotRate: this.snapshotTimes.length,
                 incomingBytesPerSecond: this.incomingByteSamples.reduce((sum, sample) => sum + sample.bytes, 0),
+                outgoingBytesPerSecond: this.outgoingByteSamples.reduce((sum, sample) => sum + sample.bytes, 0),
                 eventRates
             };
         }
@@ -268,6 +277,7 @@
             this.pingMs = 0;
             this.snapshotTimes.length = 0;
             this.incomingByteSamples.length = 0;
+            this.outgoingByteSamples.length = 0;
             this.incomingEventCounts = Object.create(null);
             this.metricsStartedAt = performance.now();
             this.lastLoadoutSignature = null;

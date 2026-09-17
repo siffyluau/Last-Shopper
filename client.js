@@ -44,6 +44,8 @@
         const workbenchContent = document.getElementById('workbench-content');
         const placingItemHint = document.getElementById('placing-item-hint');
         const placingItemText = document.getElementById('placing-item-text');
+        const placingItemHelp = document.getElementById('placing-item-help');
+        const cancelPlacementButton = document.getElementById('cancel-placement-button');
         const intermissionTimer = document.getElementById('intermission-timer'); 
         const prepEventLabel = document.getElementById('prep-event-label');
         const prepCountdown = document.getElementById('prep-countdown');
@@ -105,6 +107,7 @@
             zombies: [],
             bullets: [],
             predictedProjectiles: [],
+            localShotSequence: 0,
             explosions: [],
             particles: [],
             sentries: [],
@@ -171,7 +174,9 @@
                 sampleStartedAt: performance.now(),
                 lastFrameAt: 0,
                 frameTimes: [],
-                reconciliation: []
+                reconciliation: [],
+                stageMs: {},
+                frameStages: {}
             },
             team: {
                 playerCount: 1
@@ -215,6 +220,9 @@
                 respawnAt: 0,
                 giveUpAt: 0,
                 reviveProgress: 0,
+                emergencyRespawns: 0,
+                lifePurchases: 0,
+                eliminated: false,
                 skillLevels: {
                     maxHealth: 0,
                     moveSpeed: 0,
@@ -322,11 +330,7 @@
                 turretSpeed: false
             },
             
-            workbenchUpgrades: [
-                { id: 'autoLoot', name: 'Sentry Auto-Loot', description: 'Automatically collect drops from all sources in a large radius.', cost: { money: 15000, wood: 100, metal: 100 } },
-                { id: 'autoRefill', name: 'Sentry Auto-Refill', description: 'Your turrets will automatically refill their ammo for free when empty.', cost: { money: 20000, wood: 150, metal: 150 } },
-                { id: 'turretSpeed', name: 'Sentry Speed Boost', description: 'Increases the firing speed of all your turrets by 50%.', cost: { money: 10000, wood: 50, metal: 50 } }
-            ],
+            workbenchUpgrades: window.LastShopperContent.utilityUpgrades,
             
             activePotions: {
                 loot: 0,
@@ -401,8 +405,10 @@
                     }
                     if (e.key === 'F7' && this.performanceDebug) {
                         e.preventDefault();
-                        this.multiplayer?.sendAction({ kind: 'debugPopulate', zombies: 240, projectiles: 40, sentries: 24 });
+                        const zombies = e.shiftKey ? 50 : 240;
+                        this.multiplayer?.sendAction({ kind: 'debugPopulate', zombies, projectiles: 0, sentries: 24 });
                         this.resetPerformanceMetrics();
+                        this.showWaveStatus?.(`PERF LOAD: ${zombies} ZOMBIES`, 1200);
                         return;
                     }
                     if (e.key === 'Escape' && this.zombieIndexOpen) {
@@ -536,6 +542,11 @@
                 
                 restartButton.onclick = () => {
                     gameOverModal.classList.add('hidden');
+                    gameOverModal.classList.remove('flex');
+                    if (this.multiplayer?.serverAuthoritative) {
+                        this.leaveToLobby();
+                        return;
+                    }
                     this.resetGame();
                     this.start();
                 };
@@ -662,8 +673,8 @@
                     name: this.metaProgression.playerName || 'The Shopper',
                     skinId: this.selectedSkinId || 'shopper',
                     level: 1, xp: 0, xpToNext: progression.xpToNext(1), skillPoints: 0,
-                    downed: false, downedAt: 0, respawnAt: 0, giveUpAt: 0, reviveProgress: 0, reviverId: null,
-                    emergencyRespawns: 0,
+                    downed: false, eliminated: false, downedAt: 0, respawnAt: 0, giveUpAt: 0, reviveProgress: 0, reviverId: null,
+                    emergencyRespawns: 0, lifePurchases: 0,
                     skillLevels: {
                         maxHealth: 0, moveSpeed: 0, reloadSpeed: 0,
                         bulletDamage: 0, pickupRange: 0, resourceMultiplier: 0
@@ -700,9 +711,14 @@
             gameLoop: function(timestamp) {
                 if (this.gameOver || !this.gameStarted) return;
                 this.updatePerformanceMetrics(timestamp);
-                
+
+                const frameWorkStartedAt = performance.now();
+                if (this.performanceDebug) this.performanceStats.frameStages = {};
                 this.update();
+                const renderStartedAt = performance.now();
                 this.draw();
+                this.addPerformanceStage('render', performance.now() - renderStartedAt);
+                this.commitPerformanceFrame(performance.now() - frameWorkStartedAt);
                 
                 this.lastFrameTime = timestamp;
                 requestAnimationFrame(this.gameLoop.bind(this));
@@ -726,6 +742,15 @@
                 const network = this.multiplayer?.getMetrics?.() || {};
                 const report = this.getPerformanceReport();
                 const events = network.eventRates || {};
+                const stages = report.stageMs || {};
+                const server = this.serverPerformance || {};
+                const authoritativeShotKeys = new Set(this.bullets
+                    .filter((bullet) => bullet.shotId)
+                    .map((bullet) => `${bullet.shotId}:${bullet.pelletIndex || 0}`));
+                const duplicateShotVisuals = this.predictedProjectiles.reduce((count, projectile) => {
+                    const key = `${projectile.shotId || ''}:${projectile.pelletIndex || 0}`;
+                    return count + (projectile.shotId && authoritativeShotKeys.has(key) ? 1 : 0);
+                }, 0);
                 const rendered = this.zombies.length + this.bullets.length + this.remotePlayers.length
                     + this.sentries.length + this.walls.length + this.traps.length + this.buildings.length;
                 this.performanceOverlay.textContent = [
@@ -735,9 +760,15 @@
                     `Frame p50/p95    ${report.p50.toFixed(1)} / ${report.p95.toFixed(1)} ms`,
                     `Frame p99/worst  ${report.p99.toFixed(1)} / ${report.worst.toFixed(1)} ms`,
                     `Long >16/33/50   ${report.long16} / ${report.long33} / ${report.long50}`,
+                    `Work total/render ${Number(stages.total || 0).toFixed(2)} / ${Number(stages.render || 0).toFixed(2)} ms`,
+                    `Zombie/projectile ${Number(stages.zombieUpdate || 0).toFixed(2)} / ${Number(stages.projectileUpdate || 0).toFixed(2)} ms`,
+                    `Collision/interp   ${Number(stages.collision || 0).toFixed(2)} / ${Number(stages.interpolation || 0).toFixed(2)} ms`,
+                    `UI (DOM)           ${Number(stages.ui || 0).toFixed(2)} ms`,
                     `Ping             ${(network.pingMs || 0).toFixed(0)} ms`,
                     `Snapshots        ${network.snapshotRate || 0}/s`,
                     `Inbound          ${((network.incomingBytesPerSecond || 0) / 1024).toFixed(1)} KB/s`,
+                    `Outbound         ${((network.outgoingBytesPerSecond || 0) / 1024).toFixed(1)} KB/s`,
+                    `Shot events      ${(events.shotEvent || 0).toFixed(2)}/s`,
                     `Interpolation    ${(this.networkInterpolationDelay || 0).toFixed(0)} ms`,
                     `Reconcile        ${report.correctionsPerSecond.toFixed(2)}/s avg ${report.averageCorrection.toFixed(1)} max ${report.maxCorrection.toFixed(1)} px`,
                     `worldSnapshot    ${(events.worldSnapshot || 0).toFixed(2)}/s`,
@@ -747,8 +778,39 @@
                     `gameState        ${(events.gameState || 0).toFixed(2)}/s`,
                     `server/action    ${(events.serverControl || 0).toFixed(2)} / ${(events.action || 0).toFixed(2)}/s`,
                     `Rendered entities ${rendered}`,
-                    `Zombies/Bullets  ${this.zombies.length}/${this.bullets.length}`
+                    `Zombies/Bullets  ${this.zombies.length}/${this.bullets.length} (+${this.predictedProjectiles.length} predicted)`,
+                    `Shot visual overlap ${duplicateShotVisuals}`,
+                    `SERVER tick/AI    ${Number(server.tickMs || 0).toFixed(2)} / ${Number(server.zombieAiMs || 0).toFixed(2)} ms`,
+                    `SERVER proj/coll  ${Number(server.projectileMs || 0).toFixed(2)} / ${Number(server.collisionMs || 0).toFixed(2)} ms`,
+                    `SERVER serialize  ${Number(server.serializationMs || 0).toFixed(2)} ms`
                 ].join('\n');
+            },
+
+            addPerformanceStage: function(name, elapsed) {
+                if (!this.performanceDebug || !Number.isFinite(elapsed)) return;
+                const frameStages = this.performanceStats.frameStages || (this.performanceStats.frameStages = {});
+                frameStages[name] = (frameStages[name] || 0) + elapsed;
+            },
+
+            measurePerformanceStage: function(name, callback) {
+                if (!this.performanceDebug) return callback();
+                const startedAt = performance.now();
+                try {
+                    return callback();
+                } finally {
+                    this.addPerformanceStage(name, performance.now() - startedAt);
+                }
+            },
+
+            commitPerformanceFrame: function(totalMs) {
+                if (!this.performanceDebug) return;
+                this.addPerformanceStage('total', totalMs);
+                const current = this.performanceStats.frameStages || {};
+                const stageMs = this.performanceStats.stageMs || (this.performanceStats.stageMs = {});
+                for (const name of ['render', 'zombieUpdate', 'projectileUpdate', 'collision', 'interpolation', 'ui', 'total']) {
+                    const sample = current[name] || 0;
+                    stageMs[name] = stageMs[name] === undefined ? sample : stageMs[name] * 0.85 + sample * 0.15;
+                }
             },
 
             resetPerformanceMetrics: function() {
@@ -760,6 +822,8 @@
                 this.performanceStats.lastFrameAt = 0;
                 this.performanceStats.frameTimes = [];
                 this.performanceStats.reconciliation = [];
+                this.performanceStats.stageMs = {};
+                this.performanceStats.frameStages = {};
                 this.multiplayer?.resetMetrics?.();
             },
 
@@ -781,6 +845,7 @@
                     long16: frames.filter((value) => value > 16.7).length,
                     long33: frames.filter((value) => value > 33).length,
                     long50: frames.filter((value) => value > 50).length,
+                    stageMs: { ...(stats.stageMs || {}) },
                     correctionsPerSecond: corrections.length / elapsedSeconds,
                     averageCorrection: corrections.length ? correctionTotal / corrections.length : 0,
                     maxCorrection: corrections.reduce((max, sample) => Math.max(max, sample.distance), 0)
@@ -834,8 +899,8 @@
                     if (this.updateLocalWorldEvents) this.updateLocalWorldEvents();
                     if (!this.waitingForReward) {
                         if (this.updateLocalDomainEvent) this.updateLocalDomainEvent();
-                        this.updateZombies(); 
-                        this.updateBullets();
+                        this.measurePerformanceStage('zombieUpdate', () => this.updateZombies());
+                        this.measurePerformanceStage('projectileUpdate', () => this.updateBullets());
                         this.updateSentries();
                         this.updateDrops();
                         this.updateAcidPools();
@@ -844,8 +909,10 @@
                         this.updateHealParticles(); 
                     }
                 }
-                if (this.advanceNetworkInterpolation) this.advanceNetworkInterpolation();
-                this.updatePredictedProjectiles();
+                if (this.advanceNetworkInterpolation) {
+                    this.measurePerformanceStage('interpolation', () => this.advanceNetworkInterpolation());
+                }
+                this.measurePerformanceStage('projectileUpdate', () => this.updatePredictedProjectiles());
                 this.updateExplosions();
                 this.updateParticles();
                 this.updateCamera();
@@ -853,7 +920,7 @@
                 const now = performance.now();
                 if (!this.lastHudUpdate || now - this.lastHudUpdate >= 80) {
                     this.lastHudUpdate = now;
-                    this.updateHUD();
+                    this.measurePerformanceStage('ui', () => this.updateHUD());
                 }
                 
                 if (this.player.health <= 0 && !this.gameOver) {
@@ -917,7 +984,7 @@
                 this.player.x += moveX * speed;
                 this.player.y += moveY * speed;
                 if (this.resolvePlayerEnvironmentCollision) {
-                    this.resolvePlayerEnvironmentCollision(previousX, previousY);
+                    this.measurePerformanceStage('collision', () => this.resolvePlayerEnvironmentCollision(previousX, previousY));
                 }
                 
                 if (this.updateMouseWorld) this.updateMouseWorld();
@@ -1096,10 +1163,14 @@
                     if (z.health > 0) {
                         for (let t_idx = this.traps.length - 1; t_idx >= 0; t_idx--) {
                             const trap = this.traps[t_idx];
-                            if (this.dist(z.x, z.y, trap.x, trap.y) < trap.radius) {
+                            if ((trap.usesRemaining || 0) <= 0) continue;
+                            if (now - (trap.lastTriggeredAt || 0) < (trap.triggerCooldown || 700)) continue;
+                            if (Math.abs(z.x - trap.x) <= trap.radius && Math.abs(z.y - trap.y) <= trap.radius) {
+                                trap.lastTriggeredAt = now;
+                                trap.usesRemaining = Math.max(0, (trap.usesRemaining || trap.maxUses || 10) - 1);
                                 this.damageZombie(z, trap.damage);
                                 this.createSpark(z.x, z.y, trap.color, 15);
-                                if (trap.oneTimeUse) {
+                                if (trap.usesRemaining <= 0) {
                                     this.traps.splice(t_idx, 1);
                                 }
                             }
@@ -1170,6 +1241,8 @@
                         this.bullets.splice(i, 1);
                         continue;
                     }
+                    const collisionStartedAt = this.performanceDebug ? performance.now() : 0;
+                    try {
                     if (window.LastShopperWorld && (this.mapStructures || []).some((structure) =>
                         window.LastShopperWorld.segmentHitsStructure(
                             structure,
@@ -1242,9 +1315,9 @@
                                     this.addCameraShake(8);
                                 } else {
                                     this.damageZombie(z, b.damage);
-                                    if (!b.fromTurret && this.activePotions.lifesteal > performance.now()) {
-                                        this.player.health = Math.min(this.player.maxHealth, this.player.health + b.damage * 0.08);
-                                    }
+                                }
+                                if (!b.fromTurret && this.activePotions.lifesteal > performance.now()) {
+                                    this.player.health = Math.min(this.player.maxHealth, this.player.health + Math.min(12, b.damage * 0.08));
                                 }
                                 if (b.pierce > 0 && !b.explosive) {
                                     b.pierce--;
@@ -1255,6 +1328,9 @@
                                 break;
                             }
                         }
+                    }
+                    } finally {
+                        if (collisionStartedAt) this.addPerformanceStage('collision', performance.now() - collisionStartedAt);
                     }
                 }
             },
@@ -1886,27 +1962,32 @@
                     ctx.fillStyle = `rgba(${t.color[0]}, ${t.color[1]}, ${t.color[2]}, 0.5)`;
                     ctx.strokeStyle = `rgb(${t.color[0]}, ${t.color[1]}, ${t.color[2]})`;
                     ctx.lineWidth = 2;
-                    ctx.beginPath();
-                    ctx.arc(t.x, t.y, t.radius, 0, Math.PI * 2);
-                    ctx.fill();
-                    ctx.stroke();
+                    ctx.fillRect(t.x - t.radius, t.y - t.radius, t.radius * 2, t.radius * 2);
+                    ctx.strokeRect(t.x - t.radius, t.y - t.radius, t.radius * 2, t.radius * 2);
 
                     ctx.fillStyle = `rgb(${t.color[0]}, ${t.color[1]}, ${t.color[2]})`;
-                    for(let a = 0; a < Math.PI * 2; a += Math.PI / 4) {
-                        ctx.beginPath();
-                        ctx.moveTo(t.x, t.y);
-                        ctx.lineTo(t.x + Math.cos(a) * t.radius * 0.7, t.y + Math.sin(a) * t.radius * 0.7);
-                        ctx.stroke();
-                    }
+                    ctx.beginPath();
+                    ctx.moveTo(t.x - t.radius * 0.65, t.y);
+                    ctx.lineTo(t.x + t.radius * 0.65, t.y);
+                    ctx.moveTo(t.x, t.y - t.radius * 0.65);
+                    ctx.lineTo(t.x, t.y + t.radius * 0.65);
+                    ctx.stroke();
+                    const uses = Math.max(0, t.usesRemaining ?? t.maxUses ?? 10);
+                    const maxUses = Math.max(1, t.maxUses || 10);
+                    ctx.fillStyle = '#111827';
+                    ctx.fillRect(t.x - t.radius, t.y + t.radius + 5, t.radius * 2, 5);
+                    ctx.fillStyle = uses > maxUses * 0.3 ? '#22c55e' : '#ef4444';
+                    ctx.fillRect(t.x - t.radius, t.y + t.radius + 5, t.radius * 2 * (uses / maxUses), 5);
+                    ctx.fillStyle = '#fff7ed';
+                    ctx.font = '800 9px "Chakra Petch"';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(`${uses} USES`, t.x, t.y - t.radius - 6);
                 }
             },
 
             drawBullets: function() {
-                const serverMode = Boolean(this.multiplayer?.serverAuthoritative);
-                const frameNow = performance.now();
                 for (const b of this.bullets) {
                     if (this.isOnScreen && !this.isOnScreen(b.x, b.y, 80)) continue;
-                    if (serverMode && !b.fromTurret && !b.fromZombie && b.ownerId === this.localPlayerId && frameNow - (b.networkCreatedAt || 0) < 160) continue;
                     if (b.acid) { 
                         ctx.fillStyle = '#96F93C';
                         ctx.shadowColor = 'white';
@@ -2052,15 +2133,13 @@
                 ctx.fillStyle = valid ? `rgba(${t.color[0]}, ${t.color[1]}, ${t.color[2]}, 0.5)` : 'rgba(239, 68, 68, 0.5)';
                 ctx.strokeStyle = valid ? `rgb(${t.color[0]}, ${t.color[1]}, ${t.color[2]})` : '#ef4444';
                 ctx.lineWidth = 2;
-                ctx.beginPath();
-                ctx.arc(this.mouse.worldX, this.mouse.worldY, t.radius, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.stroke();
+                ctx.fillRect(this.mouse.worldX - t.radius, this.mouse.worldY - t.radius, t.radius * 2, t.radius * 2);
+                ctx.strokeRect(this.mouse.worldX - t.radius, this.mouse.worldY - t.radius, t.radius * 2, t.radius * 2);
             },
             
             // --- ACTION FUNCTIONS ---
 
-            spawnPredictedShot: function(weapon, angle, origin = null) {
+            spawnPredictedShot: function(weapon, angle, origin = null, shotId = null, shooterId = null) {
                 if (!this.multiplayer?.serverAuthoritative) return;
                 const pelletCount = weapon.pellets ? Math.min(6, weapon.pellets) : 1;
                 const createdAt = performance.now();
@@ -2069,6 +2148,9 @@
                     const x = origin?.x ?? (this.player.x + Math.cos(angle) * 15);
                     const y = origin?.y ?? (this.player.y + Math.sin(angle) * 15);
                     this.predictedProjectiles.push({
+                        shotId,
+                        pelletIndex: i,
+                        shooterId: shooterId || this.localPlayerId,
                         x,
                         y,
                         previousX: x,
@@ -2130,9 +2212,13 @@
                 }
                 
                 const angle = this.player.angle;
+                const shotId = this.multiplayer?.serverAuthoritative
+                    ? `${this.localPlayerId}:${++this.localShotSequence}`
+                    : null;
                 this.addCameraShake(weapon.pellets ? 3 : 2);
-                this.spawnPredictedShot(weapon, angle);
-                if (this.broadcastShotAction) this.broadcastShotAction(weapon, angle);
+                this.spawnPredictedShot(weapon, angle, null, shotId, this.localPlayerId);
+                if (this.performanceDebug && shotId) console.debug(`[shot:${shotId}] predicted`);
+                if (this.broadcastShotAction) this.broadcastShotAction(weapon, angle, shotId);
                 if (this.multiplayer?.serverAuthoritative) return;
                 
                 if (weapon.pellets) {
@@ -2205,6 +2291,9 @@
                         weapon.currentAmmo = weapon.maxAmmo;
                         this.player.reserveAmmo -= weapon.ammoCost;
                         weapon.isReloading = false;
+                        if (this.multiplayer?.serverAuthoritative) {
+                            this.multiplayer.sendAction({ kind: 'reloadWeapon', weaponId: weapon.id });
+                        }
                         this.updateHUD();
                     }, reloadDuration);
                     return;
@@ -2221,6 +2310,9 @@
                     weapon.currentAmmo += ammoToReload;
                     this.player.reserveAmmo -= ammoToReload;
                     weapon.isReloading = false;
+                    if (this.multiplayer?.serverAuthoritative) {
+                        this.multiplayer.sendAction({ kind: 'reloadWeapon', weaponId: weapon.id });
+                    }
                     this.updateHUD();
                 }, reloadDuration);
             },
@@ -2282,7 +2374,11 @@
                 if (!weapon) return;
 
                 if (weapon.owned || this.wave < (weapon.requiredWave || 0) || this.player.money < weapon.cost) return;
-                
+                if (this.multiplayer?.serverAuthoritative) {
+                    this.multiplayer.sendAction({ kind: 'buyWeapon', weaponId: weapon.id });
+                    return;
+                }
+
                 this.player.money -= weapon.cost;
                 this.playSfx?.('buy');
                 weapon.owned = true;
@@ -2551,7 +2647,12 @@
 
                 const upgrade = this.workbenchUpgrades.find(u => u.id === id);
                 if (!upgrade) return;
-                
+
+                if (this.multiplayer?.serverAuthoritative) {
+                    this.multiplayer.sendAction({ kind: 'buyUtilityUpgrade', upgradeId: id });
+                    return;
+                }
+
                 const cost = upgrade.cost;
                 if (this.player.money >= cost.money && this.player.wood >= cost.wood && this.player.metal >= cost.metal) {
                     this.player.money -= cost.money;
@@ -2873,9 +2974,11 @@
                 this.camera.shakeIntensity = Math.max(this.camera.shakeIntensity, intensity);
             },
             
-            triggerGameOver: function() {
+            triggerGameOver: function(authoritative = false) {
                 this.gameOver = true;
-                this.gameStarted = false;
+                this.gameStarted = Boolean(authoritative);
+                downedOverlay.classList.add('hidden');
+                downedOverlay.classList.remove('flex');
                 if (this.spawnInterval) clearInterval(this.spawnInterval);
                 this.toggleCrafting(false);
                 this.toggleShop(false);
@@ -2893,8 +2996,9 @@
                 this.waveEndTimeout = null;
                 this.intermissionTimerInterval = null;
                 
-                document.getElementById('game-over-wave').textContent = `You survived ${this.wave - 1} waves!`;
+                document.getElementById('game-over-wave').textContent = `Your team survived ${Math.max(0, this.wave - (this.waveActive ? 1 : 0))} waves!`;
                 document.getElementById('game-over-money').textContent = `Money earned: ${this.player.money}`;
+                restartButton.textContent = authoritative ? 'Return to Lobby' : 'Play Again';
                 
                 gameOverModal.classList.remove('hidden');
                 gameOverModal.classList.add('flex');

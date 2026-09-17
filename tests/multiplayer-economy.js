@@ -26,7 +26,7 @@ async function waitForServer() {
 function connectPlayer(id, x, y, wantsHost) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(roomUrl);
-    const client = { id, socket, snapshots: [], events: [], sentries: new Map(), bullets: [], players: new Map(), full: 0, seq: 1, x, y };
+    const client = { id, socket, snapshots: [], events: [], sentries: new Map(), bullets: [], players: new Map(), world: {}, started: false, full: 0, seq: 1, x, y };
     const timeout = setTimeout(() => reject(new Error(`${id} timed out`)), 4000);
     socket.on('message', (raw) => {
       const packet = JSON.parse(raw);
@@ -35,9 +35,13 @@ function connectPlayer(id, x, y, wantsHost) {
         clearTimeout(timeout);
         resolve(client);
       }
+      if (packet.type === 'startGame') client.started = true;
       if (packet.type !== 'world') return;
       const world = packet.world;
       client.snapshots.push(world);
+      for (const field of ['gameStarted', 'wave', 'waveActive', 'techTier', 'workbenchLevel']) {
+        if (world[field] !== undefined) client.world[field] = world[field];
+      }
       if (world.full) {
         client.full += 1;
         client.sentries.clear();
@@ -84,8 +88,41 @@ async function run() {
     const joiner = await connectPlayer('econ-joiner', 1150, 720, false);
     const stateTimer = setInterval(() => { host.sendState(); joiner.sendState(); }, 100);
     await delay(200);
+
+    // Only the server-recognized room host may start gameplay.
+    joiner.action({ kind: 'startGame' });
+    await delay(180);
+    assert(!host.started && !joiner.started && !host.world.gameStarted, 'joiner was able to start the room');
     host.action({ kind: 'startGame' });
     await delay(200);
+    assert(host.started && joiner.started && host.world.gameStarted, 'authoritative host start did not reach both clients');
+    results.hostOnlyStart = 'ok';
+
+    // Private resources and skill progression are server-owned and only sent to their owner.
+    host.action({ kind: 'debugGrant', money: 20000, wood: 250, metal: 250, ammo: 500, parts: 30, skillPoints: 2, milestoneUpgradeCredits: 1 });
+    await delay(180);
+    let hostState = host.players.get('econ-host');
+    assert(hostState.money >= 20000 && hostState.skillPoints === 2, `private progression grant did not sync: ${JSON.stringify(hostState)}`);
+    assert(joiner.players.get('econ-host')?.money === undefined, 'host private economy leaked to joiner');
+    host.sendState({ upgrades: { autoLoot: true, autoRefill: true, turretSpeed: true } });
+    await delay(180);
+    hostState = host.players.get('econ-host');
+    assert(!hostState.upgrades.autoLoot && !hostState.upgrades.autoRefill && !hostState.upgrades.turretSpeed, 'client forged utility upgrades were trusted');
+    host.action({ kind: 'buySkill', skillId: 'maxHealth' });
+    await delay(180);
+    hostState = host.players.get('econ-host');
+    assert(hostState.skillPoints === 1 && hostState.skillLevels.maxHealth === 1, 'skill point purchase did not persist');
+    assert(hostState.maxHealth === 120 && hostState.health === 120, `max-health skill did not apply: ${hostState.health}/${hostState.maxHealth}`);
+    const moneyBeforeUtility = hostState.money;
+    host.action({ kind: 'buyUtilityUpgrade', upgradeId: 'autoLoot' });
+    await delay(180);
+    hostState = host.players.get('econ-host');
+    assert(hostState.upgrades.autoLoot && hostState.money === moneyBeforeUtility - 15000, 'utility upgrade was not charged and synced by the server');
+    host.action({ kind: 'runUpgrade', id: 'caliber' });
+    await delay(180);
+    hostState = host.players.get('econ-host');
+    assert(hostState.runUpgradeCounts.caliber === 1 && hostState.milestoneUpgradeCredits === 0, 'run upgrade was not server-owned');
+    results.progression = 'ok';
 
     // 1. Kill rewards: one event per client, credited to the host via debugKillAll.
     host.action({ kind: 'debugPopulate', zombies: 2, projectiles: 0, sentries: 0 });
@@ -105,15 +142,18 @@ async function run() {
     assert(joiner.events.some((event) => event.kind === 'waveCleared'), 'joiner missing waveCleared');
     results.waveCleared = 'ok';
 
-    // 3. Build a turret, refill from near and far, upgrade twice.
+    // 3. Build a canonical turret, refill from near and far, upgrade twice.
     const networkId = 'turret-econ-host-test';
     host.action({
       kind: 'build', buildKind: 'turret',
-      entity: { networkId, x: 1300, y: 450, radius: 15, damage: 28, fireRate: 170, range: 260, speed: 10, health: 180, maxHealth: 180, ammo: 40, maxAmmo: 120, ownerId: 'econ-host', ownerName: 'H' }
+      entity: { name: 'Auto Turret', networkId, x: 1300, y: 450, radius: 15, damage: 9999, fireRate: 1, range: 260, speed: 10, health: 180, maxHealth: 180, ammo: 40, maxAmmo: 120, ownerId: 'econ-host', ownerName: 'H' }
     });
     await delay(300);
     let sentry = host.sentries.get(networkId);
-    assert(sentry && sentry.ammo === 40, `turret not built or wrong ammo: ${JSON.stringify(sentry)}`);
+    assert(sentry && sentry.ammo === 120, `turret not built from canonical data: ${JSON.stringify(sentry)}`);
+    assert(Math.abs(sentry.damage - 28) < 0.1, `client forged turret damage was trusted: ${sentry.damage}`);
+    host.action({ kind: 'debugSetSentry', networkId, ammo: 40 });
+    await delay(160);
     joiner.action({ kind: 'refillTurret', networkId });
     await delay(300);
     assert(joiner.events.some((event) => event.kind === 'actionRejected' && event.action === 'refillTurret'), 'far refill was not rejected');
@@ -132,26 +172,46 @@ async function run() {
     assert(host.events.some((event) => event.kind === 'actionRejected' && event.action === 'upgradeWall'), 'missing wall rejection');
     results.turretActions = 'ok';
 
-    // 4. Build rejection refunds via event (inside the shop rectangle).
+    // 4. Weapon, tech, and bench purchases are committed by the server.
+    const moneyBeforeWeapon = host.players.get('econ-host').money;
+    host.action({ kind: 'buyWeapon', weaponId: 'shotgun' });
+    await delay(180);
+    hostState = host.players.get('econ-host');
+    const shotgun = hostState.weapons.find((weapon) => weapon.id === 'shotgun');
+    assert(shotgun?.owned && shotgun.currentAmmo === 8, 'weapon purchase did not sync');
+    assert(hostState.money === moneyBeforeWeapon - 170, 'weapon cost was not charged exactly once');
+    host.action({ kind: 'upgradeTechTier', tier: 2 });
+    await delay(180);
+    assert(host.world.techTier === 2, `tech tier did not update: ${host.world.techTier}`);
+    host.action({ kind: 'upgradeWorkbench' });
+    await delay(180);
+    assert(host.world.workbenchLevel === 2 && joiner.world.workbenchLevel === 2, 'workbench tier did not sync to the room');
+    results.purchases = 'ok';
+
+    // 5. Build rejection is reported without charging the authoritative economy.
+    const woodBeforeRejectedBuild = host.players.get('econ-host').wood;
     host.action({ kind: 'build', buildKind: 'wall', entity: { networkId: 'wall-bad', x: 980, y: 615, radius: 25, health: 240, maxHealth: 240, ownerId: 'econ-host' } });
     await delay(250);
     assert(host.events.some((event) => event.kind === 'buildRejected' && event.networkId === 'wall-bad'), 'missing buildRejected');
+    assert(host.players.get('econ-host').wood === woodBeforeRejectedBuild, 'rejected build charged resources');
     results.buildRejected = 'ok';
 
-    // 5. Bullets are spawn-once deltas; a shot only produces an event for the other client.
+    // 6. Bullets are spawn-once deltas and preserve the client shot id for reconciliation.
     host.action({ kind: 'debugPopulate', zombies: 1, projectiles: 0, sentries: 0 });
     await delay(200);
-    host.action({ kind: 'shot', weapon: { id: 'pistol' }, angle: 0 });
+    const shotId = 'econ-host:1';
+    host.action({ kind: 'shot', weapon: { id: 'pistol' }, angle: 0, shotId, clientShotTime: Date.now() });
     await delay(400);
     const fullBullets = host.bullets.filter((bullet) => bullet.vx !== undefined);
     const idOnly = host.bullets.filter((bullet) => bullet.vx === undefined && Object.keys(bullet).length === 1);
     assert(fullBullets.length >= 1, 'no full bullet record seen');
+    assert(fullBullets.filter((bullet) => bullet.shotId === shotId).length === 1, 'shot id did not map to exactly one authoritative pistol projectile');
     assert(idOnly.length >= 1, 'no id-only bullet delta seen');
-    assert(joiner.events.some((event) => event.kind === 'shot' && event.shooterId === 'econ-host'), 'joiner missing shot event');
-    assert(!host.events.some((event) => event.kind === 'shot'), 'host received its own shot event');
+    assert(joiner.events.filter((event) => event.kind === 'shot' && event.shotId === shotId).length === 1, 'joiner missing or duplicated shot event');
+    assert(host.events.filter((event) => event.kind === 'shot' && event.shotId === shotId).length === 1, 'shooter missing or duplicated authoritative shot acknowledgement');
     results.bullets = 'ok';
 
-    // 6. Snapshot hygiene and size.
+    // 7. Snapshot hygiene and size.
     host.action({ kind: 'debugKillAll' });
     await delay(1500);
     const last = host.snapshots.at(-1);
@@ -163,7 +223,11 @@ async function run() {
     assert(!('lastSeen' in (last.players?.[0] || {})), 'players still carry lastSeen');
     results.idleSnapshotBytes = idleBytes;
 
-    // 7. Reconnect with the same id keeps the player and yields a full snapshot.
+    // 8. Reconnect with the same id keeps private progression and yields a full snapshot.
+    joiner.action({ kind: 'debugGrant', skillPoints: 1 });
+    await delay(120);
+    joiner.action({ kind: 'buySkill', skillId: 'moveSpeed' });
+    await delay(180);
     const beforeFull = joiner.full;
     joiner.socket.close();
     await delay(300);
@@ -171,11 +235,12 @@ async function run() {
     await delay(400);
     assert(rejoined.full >= 1, 'rejoin did not get a full snapshot');
     assert(rejoined.players.has('econ-host') && rejoined.players.has('econ-joiner'), 'rejoin lost players');
+    assert(rejoined.players.get('econ-joiner')?.skillLevels?.moveSpeed === 1, 'rejoin lost private skill progression');
     assert(host.players.has('econ-joiner'), 'host lost the joiner during reconnect');
     results.reconnect = 'ok';
     rejoined.socket.close();
 
-    // 8. Malformed packets do not crash the server.
+    // 9. Malformed packets do not crash the server.
     host.socket.send(JSON.stringify({ type: 'action', id: 'econ-host', action: { kind: 'build', entity: 'x' } }));
     host.socket.send(JSON.stringify({ type: 'state', id: 'econ-host', state: { x: 'NaN', y: {}, weapons: 'q', upgrades: 5, maxHealth: -3 } }));
     host.socket.send(JSON.stringify({ type: 'action', id: 'econ-host', action: { kind: 'upgradeTurret', networkId: {}, stat: [] } }));
